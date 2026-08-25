@@ -286,8 +286,18 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
       sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY ship_by_date, load_inches DESC"
     cursor.execute(sql, tuple(args))
-    return {'status': 'success',
-            'candidates': [serialize_row(r) for r in cursor.fetchall()]}
+    rows = [serialize_row(r) for r in cursor.fetchall()]
+    # Feed freshness for the always-on Orders chip — age computed
+    # SERVER-side (GETDATE) so browser clocks can't skew it.
+    cursor.execute("""
+        SELECT MAX(nx_last_updated) AS feed_last_updated,
+               DATEDIFF(minute, MAX(nx_last_updated), GETDATE()) AS feed_age_minutes
+        FROM dbo.sales_orders_due
+    """)
+    f = cursor.fetchone() or {}
+    return {'status': 'success', 'candidates': rows,
+            'feed_last_updated': make_serializable(f.get('feed_last_updated')),
+            'feed_age_minutes': f.get('feed_age_minutes')}
   except Exception as e:
     return {'status': 'error', 'message': f'Candidate load error: {e}'}
   finally:
@@ -577,7 +587,7 @@ def ship_plan_snooze_line(plan_date, order, sku, to_date):
       conn.rollback()
       return {'status': 'error',
               'message': 'No open balance left in the feed — nothing to '
-                         'snooze forward. Refresh the plan.'}
+              'snooze forward. Refresh the plan.'}
     agg = _aggregate(rows)
     _ensure_header(cursor, to_date, actor)
     _insert_line_and_source(cursor, to_date, order, sku, rows, agg,
@@ -616,7 +626,7 @@ def ship_plan_recalc_line(plan_date, order, sku):
     if not rows:
       return {'status': 'error',
               'message': 'No open balance in the feed — this line likely '
-                         'shipped. Remove it rather than refreshing.'}
+              'shipped. Remove it rather than refreshing.'}
     agg = _aggregate(rows)
 
     cursor.execute("""
@@ -870,7 +880,7 @@ def ship_plan_upsert_special_customer(customer_code, customer_name,
       verb = 'added'
     _log_event(cursor, date.today(), None, None, 'ParamChange',
                new_value=f'special customer {code} {verb} '
-                         f'x{surcharge_value} active={bool(is_active)}',
+               f'x{surcharge_value} active={bool(is_active)}',
                actor=actor)
     conn.commit()
     return {'status': 'success'}
