@@ -202,9 +202,14 @@ class ship_plan(ship_planTemplate):
     full = h >= 60                       # room for captions + headroom text
     top = 18 if full else 0
     bot = 16 if full else 0
-    y0, y1 = top, h - bot
-    bh = y1 - y0
-    rad = max(4, min(9, bh // 3))
+    # The BAR keeps meter proportions no matter the canvas height — extra
+    # height becomes breathing room around a ~32px meter, never a thicker
+    # slab (2026-08-25: at height 110 the old math drew a 76px brick).
+    bh = min(h - top - bot, 32)
+    y_off = max(0, (h - (top + bh + bot)) // 2)
+    y0 = y_off + top
+    y1 = y0 + bh
+    rad = max(4, min(10, bh // 3))
     mid = (y0 + y1) / 2
 
     def rrect(x0, x1, round_right=True, round_left=True):
