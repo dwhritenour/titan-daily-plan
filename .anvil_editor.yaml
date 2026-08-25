@@ -3,7 +3,12 @@ unique_ids:
     standard-page.html: QCFA63TLIYWVOGPUU2J42Q2YNAIX2Q7P
     theme.css: DFY2OYSF6UWFODVASC5TL655PMG7PYEQ
   forms:
-    Form1: PIQOUJ64BNYUCQWBUBC4ITVBWGHIV6LD
+    ship_plan: '1787664033047.88638167871735'
+    ship_plan.ShipPlanCandidateRow: '1787664042168.0034883675678857307'
+    ship_plan.ShipPlanLineRow: '1787664050457.9924833923128128'
+    ship_plan.ShipPlanParamsPanel: '1787664056833.30892416189296157'
   modules: {}
   scripts: {}
-  server_modules: {}
+  server_modules:
+    daily_ship_plan: '1787664623550535807975063.2075'
+    db_config: '1787664724217840339488662.1838'

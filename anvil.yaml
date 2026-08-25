@@ -8,8 +8,24 @@ runtime_options:
   legacy_features: {bootstrap3: true, class_names: true}
   server_spec: {base: python310-minimal}
   version: 3
+secrets:
+  NEXUS_DATABASE:
+    type: secret
+    value: {BQADJ4QSVTTRO7VT: 32ioKJUEHcII0J1eGqQ/r/D46sic3hxI0DtBu3hX4XrAYiaZjIpxfP2Qrd7Lf4aYqHJvTQyo7dmdgvH/lruw0LKPLHYmY0hPbUJmfXBBRfCQCVa1FqV54VoXmSiVj/Qm5uHd/g==}
+  NEXUS_PASSWORD:
+    type: secret
+    value: {BQADJ4QSVTTRO7VT: myoLghJR9GCHxegoaJK/6YGMLJn7mHucy1BkgxGly9paq3M0nyjzh/8QxraLbt69ZHDkvlS3EA0+wl8n2RT56P2H54gXekQcoECLSkUZNYQ+2ZOUb3zhWcfrtOwiT1qaWFgLuR56Yuc1qXw=}
+  NEXUS_SERVER:
+    type: secret
+    value: {BQADJ4QSVTTRO7VT: WaPms1i3nZOwPWCSUJfL4brqfZ/8ckEXWsURQjIg/vkKA/LghpFHmJI4RpeqcB2p5JBptz8xcqENTG0Sg7ztjtaLouYBU9mdtau3MoIJjkfSERdxAJ0VdYdNPoRzQY04cv91vVt9CJQyiRsM}
+  NEXUS_USERNAME:
+    type: secret
+    value: {BQADJ4QSVTTRO7VT: 7whoFX0DeaMuoI/GfIn/O5k2yJqlLegZWymiklf87qmxo072T/kXw2rBSRfp0n3u69cja52TCSzsCwCUCHJh4MgtgOPTvaLccWspawROYGpdBlX+asubSkZGNwFdmOXDXP8xXLgHfBo=}
 services:
 - client_config: {enable_v2: true}
   server_config: {}
   source: /runtime/services/tables.yml
-startup_form: Form1
+- client_config: {}
+  server_config: {}
+  source: /runtime/services/anvil/secrets.yml
+startup_form: ship_plan

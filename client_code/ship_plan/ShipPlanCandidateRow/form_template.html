@@ -1,0 +1,12 @@
+<anvil-form container="ColumnPanel" prop:col_widths='"{\"CRCORD\":6,\"CRCWHT\":20,\"CRCQTY\":5,\"CRCSHP\":7,\"CRCLOD\":8,\"CRCFLG\":8,\"CRCACT\":6}"'>
+  <anvil-component type="Label" name="lbl_order" prop:bold="true" container:grid_position="CROW01,CRCORD"></anvil-component>
+  <anvil-component type="ColumnPanel" name="pnl_what" container:grid_position="CROW01,CRCWHT">
+    <anvil-component type="Label" name="lbl_what" prop:bold="true" container:grid_position="CWROW01,CWCOL01"></anvil-component>
+    <anvil-component type="Label" name="lbl_sub" prop:font_size="13" prop:foreground="#595959" container:grid_position="CWROW02,CWCOL02"></anvil-component>
+  </anvil-component>
+  <anvil-component type="Label" name="lbl_qty" prop:align="right" container:grid_position="CROW01,CRCQTY"></anvil-component>
+  <anvil-component type="Label" name="lbl_shipby" container:grid_position="CROW01,CRCSHP"></anvil-component>
+  <anvil-component type="Label" name="lbl_load" prop:align="right" prop:bold="true" container:grid_position="CROW01,CRCLOD"></anvil-component>
+  <anvil-component type="Label" name="lbl_flags" container:grid_position="CROW01,CRCFLG"></anvil-component>
+  <anvil-component type="Button" name="btn_add" prop:text="+" prop:role="outlined-button" container:grid_position="CROW01,CRCACT"></anvil-component>
+</anvil-form>
