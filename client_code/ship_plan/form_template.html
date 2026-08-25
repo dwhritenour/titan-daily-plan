@@ -1,57 +1,47 @@
 <anvil-form container="HtmlTemplate" prop:html="@theme:standard-page.html">
   <anvil-component type="ColumnPanel" name="content_panel" container:slot="default">
     <!-- Header row -->
-    <anvil-component type="FlowPanel" name="flow_header" prop:align="left" prop:vertical_align="center" container:grid_position="HDRROW,HDRCOL" container:full_width_row="true">
-      <anvil-component type="DatePicker" name="dp_plan_date" prop:pick_time="false"></anvil-component>
-      <anvil-component type="Label" name="lbl_plan_status" prop:bold="true"></anvil-component>
-      <anvil-component type="Button" name="btn_publish" prop:text="Publish" prop:role="elevated-button"></anvil-component>
-      <anvil-component type="Link" name="lk_history" prop:text="History"></anvil-component>
-      <anvil-component type="Link" name="lk_params" prop:text="Parameters"></anvil-component>
+    <anvil-component type="ColumnPanel" name="oc_header" prop:role="outlined-card" container:grid_position="PYRLDT,YCVAIH" container:full_width_row="true">
+      <anvil-component type="FlowPanel" name="flow_header" prop:align="left" prop:vertical_align="center" container:grid_position="RXXQJB,BSMAWY" container:full_width_row="true">
+        <anvil-component type="DatePicker" name="dp_plan_date" prop:pick_time="false"></anvil-component>
+        <anvil-component type="Label" name="lbl_plan_status" prop:bold="true"></anvil-component>
+        <anvil-component type="Button" name="btn_publish" prop:text="Publish" prop:role="elevated-button"></anvil-component>
+        <anvil-component type="Link" name="lk_history" prop:text="History"></anvil-component>
+        <anvil-component type="Link" name="lk_params" prop:text="Parameters"></anvil-component>
+      </anvil-component>
+    </anvil-component>
+    <anvil-component type="ColumnPanel" name="oc_capacity" prop:role="outlined-card" container:grid_position="LYNGOP,YRRSCO" container:full_width_row="true">
+      <anvil-component type="Label" name="lbl_capacity_line" prop:bold="true" prop:font_size="16" container:grid_position="RJWMZB,DAHJIG" container:full_width_row="true"></anvil-component>
+      <anvil-component type="Label" name="lbl_snapshot_warn" prop:visible="false" prop:foreground="#a16207" prop:background="#FCF3D9" prop:align="left" container:grid_position="FGIWNL,YWZCCE"></anvil-component>
+      <anvil-component type="Label" name="lbl_crew" prop:font_size="13" prop:foreground="#595959" container:grid_position="OYZWKZ,CKQPCJ" container:full_width_row="true"></anvil-component>
+      <anvil-component type="Canvas" name="cv_capacity" prop:height="28" container:grid_position="JEUKMY,BBKFRT" container:full_width_row="true"></anvil-component>
+      <anvil-component type="Link" name="lk_overrides" prop:text="Mark absent / trainee…" container:grid_position="XPPZFN,VOBQAF" container:full_width_row="true"></anvil-component>
     </anvil-component>
     <!-- Capacity card -->
-    <anvil-component type="ColumnPanel" name="oc_capacity" container:grid_position="CAPROW,CAPCOL" container:full_width_row="true">
-      <anvil-component type="Label" name="lbl_capacity_line" container:grid_position="CAPA01,CAPB01" container:full_width_row="true"></anvil-component>
-      <anvil-component type="Canvas" name="cv_capacity" prop:height="28" container:grid_position="CAPA02,CAPB02"></anvil-component>
-      <anvil-component type="Label" name="lbl_crew" prop:font_size="13" prop:foreground="#595959" container:grid_position="CAPA03,CAPB03" container:full_width_row="true"></anvil-component>
-      <anvil-component type="Label" name="lbl_snapshot_warn" prop:visible="false" prop:foreground="#a16207" prop:background="#FCF3D9" prop:align="left" container:grid_position="CAPA04,CAPB04" container:full_width_row="true"></anvil-component>
-      <anvil-component type="Link" name="lk_overrides" prop:text="Mark absent / trainee…" container:grid_position="CAPA05,CAPB05" container:full_width_row="true"></anvil-component>
+    <anvil-component type="ColumnPanel" name="oc_filters" prop:role="outlined-card" container:grid_position="CAPROW,CAPCOL" container:full_width_row="true">
+      <anvil-component type="FlowPanel" name="flow_filters" prop:align="left" prop:vertical_align="center" container:grid_position="MRALAW,ETZAZP" container:full_width_row="true">
+        <anvil-component type="TextBox" name="tb_search" prop:placeholder="order / SKU / ship-to"></anvil-component>
+        <anvil-component type="DropDown" name="dd_bucket" prop:include_placeholder="true" prop:placeholder="All product"></anvil-component>
+        <anvil-component type="CheckBox" name="cb_due_window" prop:text="Due within horizon" prop:checked="true"></anvil-component>
+        <anvil-component type="CheckBox" name="cb_special_only" prop:text="Special only"></anvil-component>
+        <anvil-component type="CheckBox" name="cb_defaulted_only" prop:text="Unclassified ⚠"></anvil-component>
+        <anvil-component type="Label" name="lbl_feed_note" prop:font_size="13" prop:foreground="#595959" prop:visible="false"></anvil-component>
+      </anvil-component>
     </anvil-component>
     <!-- Filter row -->
-    <anvil-component type="FlowPanel" name="flow_filters" prop:align="left" prop:vertical_align="center" container:grid_position="FLTROW,FLTCOL" container:full_width_row="true">
-      <anvil-component type="TextBox" name="tb_search" prop:placeholder="order / SKU / ship-to"></anvil-component>
-      <anvil-component type="DropDown" name="dd_bucket" prop:include_placeholder="true" prop:placeholder="All product"></anvil-component>
-      <anvil-component type="CheckBox" name="cb_due_window" prop:text="Due within horizon" prop:checked="true"></anvil-component>
-      <anvil-component type="CheckBox" name="cb_special_only" prop:text="Special only"></anvil-component>
-      <anvil-component type="CheckBox" name="cb_defaulted_only" prop:text="Unclassified ⚠"></anvil-component>
-      <anvil-component type="Label" name="lbl_feed_note" prop:font_size="13" prop:foreground="#595959" prop:visible="false"></anvil-component>
-    </anvil-component>
     <!-- Two-pane body: candidates (60) / plan (40) -->
-    <anvil-component type="ColumnPanel" name="pnl_body" prop:col_widths='"{\"LFTCOL\":36,\"RGTCOL\":24}"' container:grid_position="BDYROW,BDYCOL" container:full_width_row="true">
-      <anvil-component type="ColumnPanel" name="pnl_candidates" container:grid_position="BODROW,LFTCOL" container:full_width_row="true">
-        <anvil-component type="Label" name="lbl_candidates_header" prop:text="UP NEXT — CANDIDATES" container:grid_position="CANA01,CANB01"></anvil-component>
-        <anvil-component type="FlowPanel" name="flow_candidates_caption" prop:align="left" container:grid_position="CANA02,CANB02">
-          <anvil-component type="Label" name="lbl_cap_order" prop:text="Order" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_cap_item" prop:text="Item" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_cap_qty" prop:text="Qty" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_cap_shipby" prop:text="Ship By" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_cap_load" prop:text="Load" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_cap_flags" prop:text="Flags" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_cap_actions" prop:text="" prop:font_size="13" prop:foreground="#595959"></anvil-component>
+    <anvil-component type="ColumnPanel" name="pnl_body" prop:col_widths='"{\"LFTCOL\":30,\"RGTCOL\":30}"' prop:role="outlined-card" container:grid_position="BDYROW,BDYCOL" container:full_width_row="true">
+      <anvil-component type="ColumnPanel" name="pnl_candidates" prop:role="outlined-card" container:grid_position="BODROW,LFTCOL" container:full_width_row="true">
+        <anvil-component type="Label" name="lbl_candidates_header" prop:text="UP NEXT — CANDIDATES" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:bold="true" container:grid_position="CANA01,CANB01" container:full_width_row="true"></anvil-component>
+        <anvil-component type="DataGrid" name="dg_candidates" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="true" prop:columns='[{"id":"order","title":"Order","data_key":"order","width":90},{"id":"item","title":"Item","data_key":"item"},{"id":"qty","title":"Qty","data_key":"qty","width":60},{"id":"ship_by","title":"Ship By","data_key":"ship_by","width":110},{"id":"load","title":"Load","data_key":"load","width":90},{"id":"flags","title":"Flags","data_key":"flags","width":70},{"id":"add","title":"Add","data_key":"add","width":"80"}]' container:grid_position="CANA02,CANB02" container:full_width_row="true">
+          <anvil-component type="RepeatingPanel" name="rp_candidates" prop:item_template="Titan_Daily_Plan.ship_plan.ShipPlanCandidateRow" prop:margin='["0",null,"0",null]'></anvil-component>
         </anvil-component>
-        <anvil-component type="RepeatingPanel" name="rp_candidates" prop:item_template="Titan_Daily_Plan.ship_plan.ShipPlanCandidateRow" container:grid_position="CANA03,CANB03"></anvil-component>
       </anvil-component>
-      <anvil-component type="ColumnPanel" name="pnl_plan" container:grid_position="BODROW,RGTCOL">
-        <anvil-component type="Label" name="lbl_plan_header" prop:text="THIS DAY'S PLAN" container:grid_position="PLNA01,PLNB01"></anvil-component>
-        <anvil-component type="FlowPanel" name="flow_plan_caption" prop:align="left" container:grid_position="PLNA02,PLNB02">
-          <anvil-component type="Label" name="lbl_pcap_order" prop:text="Order" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_pcap_item" prop:text="Item" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_pcap_qty" prop:text="Qty" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_pcap_shipby" prop:text="Ship By" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_pcap_load" prop:text="Load" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_pcap_status" prop:text="Status" prop:font_size="13" prop:foreground="#595959"></anvil-component>
-          <anvil-component type="Label" name="lbl_pcap_actions" prop:text="" prop:font_size="13" prop:foreground="#595959"></anvil-component>
+      <anvil-component type="ColumnPanel" name="pnl_plan" prop:role="outlined-card" container:grid_position="BODROW,RGTCOL">
+        <anvil-component type="Label" name="lbl_plan_header" prop:text="THIS DAY'S PLAN" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="PLNA01,PLNB01"></anvil-component>
+        <anvil-component type="DataGrid" name="dg_plan_lines" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="true" prop:columns='[{"id":"order","title":"Order","data_key":"order","width":90},{"id":"item","title":"Item","data_key":"item"},{"id":"qty","title":"Qty","data_key":"qty","width":60},{"id":"ship_by","title":"Ship By","data_key":"ship_by","width":110},{"id":"load","title":"Load","data_key":"load","width":90},{"id":"status","title":"Status","data_key":"status","width":110},{"id":"actions","title":"","data_key":"actions","width":130}]' container:grid_position="PLNA02,PLNB02" container:full_width_row="true">
+          <anvil-component type="RepeatingPanel" name="rp_plan_lines" prop:item_template="Titan_Daily_Plan.ship_plan.ShipPlanLineRow"></anvil-component>
         </anvil-component>
-        <anvil-component type="RepeatingPanel" name="rp_plan_lines" prop:item_template="Titan_Daily_Plan.ship_plan.ShipPlanLineRow" container:grid_position="PLNA03,PLNB03"></anvil-component>
         <anvil-component type="CheckBox" name="cb_show_removed" prop:text="Show removed" prop:font_size="13" container:grid_position="PLNA04,PLNB04"></anvil-component>
       </anvil-component>
     </anvil-component>
