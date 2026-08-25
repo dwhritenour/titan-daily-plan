@@ -1,14 +1,14 @@
-<anvil-form container="DataRowPanel" prop:auto_display_data="false">
+<anvil-form container="DataRowPanel" prop:auto_display_data="false" prop:margin='["10",null,null,null]'>
   <anvil-component type="Label" name="lbl_order" prop:bold="false" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" container:column="order"></anvil-component>
   <anvil-component type="ColumnPanel" name="pnl_what" prop:spacing='{"margin":["0",null,"0",null]}' container:column="item">
-    <anvil-component type="Label" name="lbl_what" prop:bold="false" prop:spacing='{"margin":["0",null,"0",null],"padding":[-2,null,"0",null]}' container:grid_position="LWROW01,LWCOL01"></anvil-component>
-    <anvil-component type="Label" name="lbl_sub" prop:font_size="13" prop:foreground="#595959" prop:spacing='{"margin":["0",null,null,null],"padding":["0",null,null,null]}' container:grid_position="LWROW02,LWCOL02"></anvil-component>
-    <anvil-component type="Link" name="lk_drift" prop:font_size="13" prop:foreground="#B45309" prop:visible="false" container:grid_position="LWROW03,LWCOL03"></anvil-component>
+    <anvil-component type="Label" name="lbl_what" prop:bold="false" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" container:grid_position="LWROW01,LWCOL01"></anvil-component>
+    <anvil-component type="Label" name="lbl_sub" prop:font_size="10" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="LWROW02,LWCOL02"></anvil-component>
+    <anvil-component type="Link" name="lk_drift" prop:font_size="10" prop:foreground="#B45309" prop:visible="false" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="LWROW03,LWCOL03"></anvil-component>
   </anvil-component>
-  <anvil-component type="Label" name="lbl_qty" prop:align="right" container:column="qty"></anvil-component>
-  <anvil-component type="Label" name="lbl_shipby" container:column="ship_by"></anvil-component>
-  <anvil-component type="Label" name="lbl_load" prop:align="right" prop:bold="true" container:column="load"></anvil-component>
-  <anvil-component type="Label" name="lbl_status" container:column="status"></anvil-component>
+  <anvil-component type="Label" name="lbl_qty" prop:align="left" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" container:column="qty"></anvil-component>
+  <anvil-component type="Label" name="lbl_shipby" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" container:column="ship_by"></anvil-component>
+  <anvil-component type="Label" name="lbl_load" prop:align="left" prop:bold="false" prop:font_size="12" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:column="load"></anvil-component>
+  <anvil-component type="Label" name="lbl_status" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" container:column="status"></anvil-component>
   <anvil-component type="FlowPanel" name="flow_row_actions" prop:align="right" prop:vertical_align="center" container:column="actions">
     <anvil-component type="Button" name="btn_refresh" prop:text="↻" prop:role="outlined-button"></anvil-component>
     <anvil-component type="Button" name="btn_snooze" prop:text="⏰" prop:role="outlined-button"></anvil-component>

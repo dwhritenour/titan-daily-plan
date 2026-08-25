@@ -11,7 +11,7 @@
       </anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_capacity" prop:role="outlined-card" container:grid_position="LYNGOP,YRRSCO" container:full_width_row="true">
-      <anvil-component type="Label" name="lbl_capacity_line" prop:bold="true" prop:font_size="16" container:grid_position="RJWMZB,DAHJIG" container:full_width_row="true"></anvil-component>
+      <anvil-component type="Label" name="lbl_capacity_line" prop:bold="true" prop:font_size="20" container:grid_position="RJWMZB,DAHJIG" container:full_width_row="true"></anvil-component>
       <anvil-component type="Label" name="lbl_snapshot_warn" prop:visible="false" prop:foreground="#a16207" prop:background="#FCF3D9" prop:align="left" container:grid_position="FGIWNL,YWZCCE"></anvil-component>
       <anvil-component type="Label" name="lbl_crew" prop:font_size="13" prop:foreground="#595959" container:grid_position="OYZWKZ,CKQPCJ" container:full_width_row="true"></anvil-component>
       <anvil-component type="Canvas" name="cv_capacity" prop:height="28" container:grid_position="JEUKMY,BBKFRT" container:full_width_row="true"></anvil-component>
@@ -21,7 +21,7 @@
     <anvil-component type="ColumnPanel" name="oc_filters" prop:role="outlined-card" container:grid_position="CAPROW,CAPCOL" container:full_width_row="true">
       <anvil-component type="FlowPanel" name="flow_filters" prop:align="left" prop:vertical_align="center" container:grid_position="MRALAW,ETZAZP" container:full_width_row="true">
         <anvil-component type="TextBox" name="tb_search" prop:placeholder="order / SKU / ship-to"></anvil-component>
-        <anvil-component type="DropDown" name="dd_bucket" prop:include_placeholder="true" prop:placeholder="All product"></anvil-component>
+        <anvil-component type="DropDown" name="dd_bucket" prop:include_placeholder="true" prop:placeholder="All product" container:width="173.5"></anvil-component>
         <anvil-component type="CheckBox" name="cb_due_window" prop:text="Due within horizon" prop:checked="true"></anvil-component>
         <anvil-component type="CheckBox" name="cb_special_only" prop:text="Special only"></anvil-component>
         <anvil-component type="CheckBox" name="cb_defaulted_only" prop:text="Unclassified ⚠"></anvil-component>
@@ -38,14 +38,15 @@
         </anvil-component>
       </anvil-component>
       <anvil-component type="ColumnPanel" name="pnl_plan" prop:role="outlined-card" container:grid_position="BODROW,RGTCOL">
-        <anvil-component type="Label" name="lbl_plan_header" prop:text="THIS DAY'S PLAN" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="PLNA01,PLNB01"></anvil-component>
-        <anvil-component type="DataGrid" name="dg_plan_lines" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="true" prop:columns='[{"id":"order","title":"Order","data_key":"order","width":90},{"id":"item","title":"Item","data_key":"item"},{"id":"qty","title":"Qty","data_key":"qty","width":60},{"id":"ship_by","title":"Ship By","data_key":"ship_by","width":110},{"id":"load","title":"Load","data_key":"load","width":90},{"id":"status","title":"Status","data_key":"status","width":110},{"id":"actions","title":"","data_key":"actions","width":130}]' container:grid_position="PLNA02,PLNB02" container:full_width_row="true">
+        <anvil-component type="Label" name="lbl_plan_header" prop:text="THIS DAY'S PLAN" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="PLNA01,PLNB01" container:full_width_row="true"></anvil-component>
+        <anvil-component type="DataGrid" name="dg_plan_lines" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="true" prop:columns='[{"id":"order","title":"Order","data_key":"order","width":90},{"id":"item","title":"Item","data_key":"item"},{"id":"qty","title":"Qty","data_key":"qty","width":60},{"id":"ship_by","title":"Ship By","data_key":"ship_by","width":110},{"id":"load","title":"Load","data_key":"load","width":90},{"id":"status","title":"Status","data_key":"status","width":110},{"id":"actions","title":"Actions","data_key":"actions","width":130}]' container:grid_position="PLNA02,PLNB02" container:full_width_row="true">
           <anvil-component type="RepeatingPanel" name="rp_plan_lines" prop:item_template="Titan_Daily_Plan.ship_plan.ShipPlanLineRow"></anvil-component>
         </anvil-component>
-        <anvil-component type="CheckBox" name="cb_show_removed" prop:text="Show removed" prop:font_size="13" container:grid_position="PLNA04,PLNB04"></anvil-component>
+        <anvil-component type="CheckBox" name="cb_show_removed" prop:text="Show removed" prop:font_size="13" container:grid_position="PLNA04,PLNB04" container:full_width_row="true"></anvil-component>
       </anvil-component>
     </anvil-component>
     <!-- Read-only refresh tick -->
     <anvil-component type="Timer" name="timer_drift" prop:interval="300" container:grid_position="TMRROW,TMRCOL"></anvil-component>
   </anvil-component>
+  <anvil-component type="Label" name="label_1" prop:text="Titan Daily Plan Board" prop:bold="true" prop:font_size="22" container:slot="title"></anvil-component>
 </anvil-form>
