@@ -1,12 +1,12 @@
-<anvil-form container="DataRowPanel" prop:auto_display_data="false" prop:margin='["10",null,null,null]'>
-  <anvil-component type="Label" name="lbl_order" prop:bold="false" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" container:column="order"></anvil-component>
-  <anvil-component type="ColumnPanel" name="pnl_what" prop:spacing='{"margin":["0",null,"0",null]}' container:column="item">
+<anvil-form container="DataRowPanel" prop:auto_display_data="false" prop:margin='["0",null,null,null]'>
+  <anvil-component type="Label" name="lbl_order" prop:bold="false" prop:spacing='{"margin":["4",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" container:column="order"></anvil-component>
+  <anvil-component type="ColumnPanel" name="pnl_what" prop:spacing='{"margin":["4",null,"0",null]}' container:column="item">
     <anvil-component type="Label" name="lbl_what" prop:bold="false" prop:font_size="12" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="CWROW01,CWCOL01"></anvil-component>
     <anvil-component type="Label" name="lbl_sub" prop:font_size="10" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:align="left" container:grid_position="CWROW02,CWCOL02"></anvil-component>
   </anvil-component>
-  <anvil-component type="Label" name="lbl_qty" prop:align="left" prop:font_size="12" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:column="qty"></anvil-component>
-  <anvil-component type="Label" name="lbl_shipby" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" prop:align="left" container:column="ship_by"></anvil-component>
-  <anvil-component type="Label" name="lbl_load" prop:align="left" prop:bold="false" prop:font_size="12" prop:spacing='{"margin":["0",null,"0",null],"padding":["00",null,"0",null]}' container:column="load"></anvil-component>
-  <anvil-component type="Label" name="lbl_flags" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" prop:align="left" container:column="flags"></anvil-component>
-  <anvil-component type="Button" name="btn_add" prop:text="+" prop:role="elevated-button" prop:spacing='{"margin":[null,null,null,null]}' prop:align="left" container:column="add"></anvil-component>
+  <anvil-component type="Label" name="lbl_qty" prop:align="center" prop:font_size="12" prop:spacing='{"margin":["4",null,"0",null],"padding":["0",null,"0",null]}' container:column="qty"></anvil-component>
+  <anvil-component type="Label" name="lbl_shipby" prop:spacing='{"margin":["4",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" prop:align="center" container:column="ship_by"></anvil-component>
+  <anvil-component type="Label" name="lbl_load" prop:align="left" prop:bold="false" prop:font_size="12" prop:spacing='{"margin":["4",null,"0",null],"padding":["00",null,"0",null]}' container:column="load"></anvil-component>
+  <anvil-component type="Label" name="lbl_flags" prop:spacing='{"margin":["4",null,"0",null],"padding":["0",null,"0",null]}' prop:font_size="12" prop:align="left" container:column="flags"></anvil-component>
+  <anvil-component type="Link" name="btn_add" prop:text="+" prop:font_size="12" prop:bold="true" prop:spacing='{"margin":["4",null,"0",null],"padding":["0",null,"0",null]}' prop:align="center" container:column="add"></anvil-component>
 </anvil-form>
