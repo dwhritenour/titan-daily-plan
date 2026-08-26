@@ -110,3 +110,5 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
       if on_priority:
         self.btn_priority.set_event_handler(
           'click', lambda **e: on_priority(self.item))
+
+ 

@@ -65,6 +65,35 @@ class ship_plan(ship_planTemplate):
     self._capacity = None
     self._lines = []
 
+    # --- click-bounce shield (2026-08-26 tape) ---------------------
+    # Recorded pointer hardware emitting DUPLICATE press events
+    # 35-50ms apart at normal clicking speed (a hand can't click that
+    # fast). Harmless on buttons; fatal on native dropdowns, which
+    # TOGGLE per press — the echo shuts the picker 40ms after the real
+    # click opens it ("takes three clicks"). Swallow any mouse press
+    # arriving <80ms after the previous one, document-wide. Touch taps
+    # pass through untouched. Pure JS, no CSS — theme standard intact.
+    try:
+      from anvil.js import window as _w
+      _w.eval("""
+        (function(){
+          if (window.__bounceShield) return; window.__bounceShield = 1;
+          var last = {};
+          ['pointerdown','mousedown','mouseup','click'].forEach(function(t){
+            document.addEventListener(t, function(e){
+              if (e.pointerType === 'touch') return;
+              var now = performance.now();
+              if (last[t] !== undefined && now - last[t] < 80) {
+                e.stopImmediatePropagation(); e.preventDefault(); return;
+              }
+              last[t] = now;
+            }, true);
+          });
+        })();
+      """)
+    except Exception:
+      pass          # shield is best-effort; the app runs fine without it
+
     self.dp_plan_date.date = self._next_business_day()
     self.load_day()
 
