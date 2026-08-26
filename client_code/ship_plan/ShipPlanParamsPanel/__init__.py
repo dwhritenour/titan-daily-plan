@@ -59,8 +59,15 @@ class ShipPlanParamsPanel(ShipPlanParamsPanelTemplate):
       rows = r['parameters']
     for p in rows:
       row = FlowPanel(spacing='small')
-      row.add_component(Label(text=p['param_code'], bold=True, width=220))
-      tb = TextBox(text=p['param_value'], width=110)
+      tb = TextBox(text=p['param_value'], width=200)
+      # FAT TARGETS (2026-08-26 tape): clicks on the label / row gutter
+      # were dying silently — the 110px box was the only live pixel.
+      # The param name is a Link that focuses its box, and the box is
+      # wide enough to hit without aiming.
+      lk = Link(text=p['param_code'], bold=True, width=220)
+      lk.set_event_handler('click',
+                           (lambda box: lambda **e: box.focus())(tb))
+      row.add_component(lk)
       row.add_component(tb)
       btn = Button(text='Save', role='outlined-button')
 
@@ -107,7 +114,7 @@ class ShipPlanParamsPanel(ShipPlanParamsPanelTemplate):
     tb_name = TextBox(text=(c['customer_name'] if c else ''),
                       placeholder='name', width=200)
     tb_val = TextBox(text=(str(c['surcharge_value']) if c else '1.5'),
-                     width=70)
+                     width=100)
     cb_active = CheckBox(text='active',
                          checked=(bool(c['is_active']) if c else True))
     btn = Button(text='Save' if c else 'Add', role='outlined-button')
@@ -161,7 +168,7 @@ class ShipPlanParamsPanel(ShipPlanParamsPanelTemplate):
 
     dd = DropDown(items=self.OVERRIDE_TYPES, width=130)
     dd.selected_value = o.get('override_type') or '(snapshot)'
-    tb_factor = TextBox(width=60)
+    tb_factor = TextBox(width=100)
     if o.get('capacity_factor') is not None:
       tb_factor.text = f"{float(o['capacity_factor']):g}"
     btn = Button(text='Save', role='outlined-button')
