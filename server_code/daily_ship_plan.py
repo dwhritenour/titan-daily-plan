@@ -339,7 +339,7 @@ def _capacity_for(cursor, plan_date):
   cap_override = params.get('DAILY_CAP_OVERRIDE_IN', '') or None
 
   cursor.execute("""
-      SELECT r.employee_id, o.capacity_factor
+      SELECT r.employee_id, r.default_capacity_factor, o.capacity_factor
       FROM dbo.em_assembler_roster r
       LEFT JOIN dbo.pc_assembler_day_override o
              ON o.employee_id = r.employee_id AND o.override_date = %s
@@ -348,9 +348,18 @@ def _capacity_for(cursor, plan_date):
   rows = cursor.fetchall()
   roster_count = len(rows)
   overrides = sum(1 for r in rows if r['capacity_factor'] is not None)
-  effective_crew = sum(
-    float(r['capacity_factor']) if r['capacity_factor'] is not None else 1.0
-    for r in rows)
+
+  def _credit(r):
+    # day override > standing factor (trainee, 034) > full assembler
+    if r['capacity_factor'] is not None:
+      return float(r['capacity_factor'])
+    if r.get('default_capacity_factor') is not None:
+      return float(r['default_capacity_factor'])
+    return 1.0
+  effective_crew = sum(_credit(r) for r in rows)
+  trainees = sum(1 for r in rows
+                 if r['capacity_factor'] is None
+                 and r.get('default_capacity_factor') is not None)
 
   variable_minutes = (effective_crew
                       * (hours * 60.0 - weights['BASE_OVERHEAD'] * 60.0 / 5.0)
@@ -370,7 +379,8 @@ def _capacity_for(cursor, plan_date):
     'capacity_inches_effective': round(effective_cap, 1),
     'is_estimate': True,
     'capacity_detail': (f"ESTIMATE: {effective_crew:g} crew (roster, "
-                        f"{overrides} override) x {hours:g}h / {eff:g} - base"),
+                        f"{overrides} override, {trainees} trainee) "
+                        f"x {hours:g}h / {eff:g} - base"),
   }
 
 
