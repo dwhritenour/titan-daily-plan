@@ -162,7 +162,13 @@ class ShipPlanParamsPanel(ShipPlanParamsPanelTemplate):
   def _override_row(self, o):
     row = FlowPanel(spacing='small')
     snap = o.get('snapshot_status') or 'no record'
-    row.add_component(Label(text=o['full_name'], bold=True, width=190))
+    name = o['full_name']
+    dcf = o.get('default_capacity_factor')
+    if dcf is not None:
+      # standing trainee factor (034) — shown so the crew number is
+      # never a mystery; the day override below still out-votes it.
+      name += f"  · TRAINEE {float(dcf):g}"
+    row.add_component(Label(text=name, bold=True, width=190))
     row.add_component(Label(text=f"shift {o.get('shift', 1)} · {snap}",
                             foreground='#898781', width=160))
 

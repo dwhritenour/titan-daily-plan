@@ -1209,6 +1209,7 @@ def ship_plan_get_overrides(for_date):
         SELECT r.employee_id,
                COALESCE(s.full_name, 'emp ' + r.employee_id) AS full_name,
                r.shift, s.status AS snapshot_status,
+               r.default_capacity_factor,
                o.override_type, o.capacity_factor, o.note
         FROM dbo.em_assembler_roster r
         LEFT JOIN dbo.em_assembler_status_daily s

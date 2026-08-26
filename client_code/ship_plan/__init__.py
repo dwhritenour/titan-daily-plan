@@ -501,7 +501,7 @@ class ship_plan(ship_planTemplate):
                        selected_value=item.get('tier') or 'Next')
     dd_reason = DropDown(
       items=[('— no reason set —', '')] +
-      [(x['description'], x['reason_code']) for x in self._reasons],
+            [(x['description'], x['reason_code']) for x in self._reasons],
       selected_value=item.get('priority_reason') or '')
     pnl = ColumnPanel()
     pnl.add_component(Label(text='Tier', bold=True))
