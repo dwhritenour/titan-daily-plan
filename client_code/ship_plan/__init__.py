@@ -83,16 +83,26 @@ class ship_plan(ship_planTemplate):
     return self.dp_plan_date.date or self._next_business_day()
 
   def load_day(self):
-    result = anvil.server.call('ship_plan_get_plan', self.plan_date)
+    """ONE server round trip for the whole day (plan + candidates).
+    Every Anvil call pays ~1s of transport before its query runs, so the
+    old two sequential calls were most of the after-dialog lag."""
+    result = anvil.server.call(
+      'ship_plan_get_day', self.plan_date,
+      search=self.tb_search.text or None,
+      bucket=self.dd_bucket.selected_value,
+      due_within_days=self._horizon_days if self.cb_due_window.checked else None,
+      special_only=self.cb_special_only.checked,
+      defaulted_only=self.cb_defaulted_only.checked)
     if result.get('status') != 'success':
       alert(f"Error loading plan: {result.get('message', 'Unknown error')}")
       return
-    self._capacity = result['capacity']
-    self._render_header(result.get('header'))
-    self._render_capacity(result['planned_inches'],
-                          result.get('stretch_inches', 0))
-    self._render_lines(result['lines'])
-    self.refresh_candidates()
+    plan = result['plan']
+    self._capacity = plan['capacity']
+    self._render_header(plan.get('header'))
+    self._render_capacity(plan['planned_inches'],
+                          plan.get('stretch_inches', 0))
+    self._render_lines(plan['lines'])
+    self._render_candidates(result['candidates'])
 
   def refresh_candidates(self, **event_args):
     result = anvil.server.call(
@@ -105,6 +115,9 @@ class ship_plan(ship_planTemplate):
     if result.get('status') != 'success':
       alert(f"Error loading candidates: {result.get('message')}")
       return
+    self._render_candidates(result)
+
+  def _render_candidates(self, result):
     items = result['candidates']
     for it in items:
       it['on_add'] = self._add_line if self.is_pc else None
@@ -596,7 +609,7 @@ class ship_plan(ship_planTemplate):
   def _timer_tick(self, **event_args):
     """READ-ONLY refresh: drift badges + the bar's planned total only.
     Never calls recalc (drift rule)."""
-    result = anvil.server.call('ship_plan_get_plan', self.plan_date)
+    result = anvil.server.call_s('ship_plan_get_plan', self.plan_date)
     if result.get('status') != 'success':
       return
     self._capacity = result['capacity']

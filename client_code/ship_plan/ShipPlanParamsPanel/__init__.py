@@ -35,21 +35,29 @@ class ShipPlanParamsPanel(ShipPlanParamsPanelTemplate):
       comp.visible = not only_overrides
 
     self.lbl_override_date.text = f"Overrides for {override_date}"
+    # ONE bundle call (was three sequential calls = three seconds of
+    # frozen spinner; every Anvil call pays ~1s transport).
+    data = anvil.server.call('ship_plan_get_params_bundle', override_date)
+    if data.get('status') != 'success':
+      alert(data.get('message', 'Parameter load failed'))
+      data = {}
     if not only_overrides:
-      self._load_params()
-      self._load_customers()
-    self._load_overrides()
+      self._load_params(data.get('parameters'))
+      self._load_customers(data.get('customers'))
+    self._load_overrides(data.get('overrides'))
 
   # =================================================================
   # 1. Plan parameters
   # =================================================================
-  def _load_params(self):
+  def _load_params(self, rows=None):
     self.pnl_params.clear()
-    r = anvil.server.call('ship_plan_get_parameters')
-    if r.get('status') != 'success':
-      alert(r.get('message', 'Parameter load failed'))
-      return
-    for p in r['parameters']:
+    if rows is None:                 # section-only refresh after a save
+      r = anvil.server.call('ship_plan_get_parameters')
+      if r.get('status') != 'success':
+        alert(r.get('message', 'Parameter load failed'))
+        return
+      rows = r['parameters']
+    for p in rows:
       row = FlowPanel(spacing='small')
       row.add_component(Label(text=p['param_code'], bold=True, width=220))
       tb = TextBox(text=p['param_value'], width=110)
@@ -75,13 +83,15 @@ class ShipPlanParamsPanel(ShipPlanParamsPanelTemplate):
   # =================================================================
   # 2. Special customers
   # =================================================================
-  def _load_customers(self):
+  def _load_customers(self, rows=None):
     self.pnl_customers.clear()
-    r = anvil.server.call('ship_plan_get_special_customers')
-    if r.get('status') != 'success':
-      alert(r.get('message', 'Customer load failed'))
-      return
-    for c in r['customers']:
+    if rows is None:                 # section-only refresh after a save
+      r = anvil.server.call('ship_plan_get_special_customers')
+      if r.get('status') != 'success':
+        alert(r.get('message', 'Customer load failed'))
+        return
+      rows = r['customers']
+    for c in rows:
       self.pnl_customers.add_component(self._customer_row(c))
     self.pnl_customers.add_component(self._customer_row(None))  # blank = add
     self.pnl_customers.add_component(Label(
@@ -125,13 +135,15 @@ class ShipPlanParamsPanel(ShipPlanParamsPanelTemplate):
   # =================================================================
   # 3. Day overrides
   # =================================================================
-  def _load_overrides(self):
+  def _load_overrides(self, rows=None):
     self.pnl_overrides.clear()
-    r = anvil.server.call('ship_plan_get_overrides', self.override_date)
-    if r.get('status') != 'success':
-      alert(r.get('message', 'Override load failed'))
-      return
-    for o in r['overrides']:
+    if rows is None:                 # section-only refresh after a save
+      r = anvil.server.call('ship_plan_get_overrides', self.override_date)
+      if r.get('status') != 'success':
+        alert(r.get('message', 'Override load failed'))
+        return
+      rows = r['overrides']
+    for o in rows:
       self.pnl_overrides.add_component(self._override_row(o))
     self.pnl_overrides.add_component(Label(
       text=('"(snapshot)" = the 08:45 Paychex feed decides. An override '

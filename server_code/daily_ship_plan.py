@@ -47,6 +47,9 @@ Created: August 2026
 """
 
 import anvil.server
+import threading
+import os
+import time
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
@@ -78,8 +81,151 @@ def serialize_row(row):
   return {key: make_serializable(val) for key, val in row.items()}
 
 
+# ---------------------------------------------------------------------
+# Connection pool + cached secrets (perf, 2026-08-26)
+#
+# MEASURED from the running app: WS transport is ~100ms, but every call
+# cost ~900ms — the rest was 4 anvil.secrets fetches + a fresh WAN login
+# to SQL Server, paid per call because connections were opened/closed
+# per call. A thread-LOCAL cache didn't help (each call runs on a fresh
+# thread), so this is a real pool: module-level, lock-guarded, any
+# thread can reuse a parked connection. Module state only survives if
+# the process does — ship_plan_debug_stats() proves whether it does.
+# ---------------------------------------------------------------------
+_process_t0 = time.time()
+_stats = {'gets': 0, 'pool_hits': 0, 'pool_misses': 0, 'connects': 0}
+_secret_cache = {}
+_pool = []                       # parked, clean connections
+_pool_lock = threading.Lock()
+_POOL_MAX = 4
+
+
+def _secret(name):
+  """anvil.secrets.get_secret is a platform RPC — fetch each secret once
+  per process, not four times per call."""
+  if name not in _secret_cache:
+    _secret_cache[name] = anvil.secrets.get_secret(name)
+  return _secret_cache[name]
+
+
+def _connect():
+  import pymssql
+  _stats['connects'] += 1
+  _t = time.time()
+  conn = pymssql.connect(
+    server=_secret('NEXUS_SERVER'),
+    user=_secret('NEXUS_USERNAME'),
+    password=_secret('NEXUS_PASSWORD'),
+    database=_secret('NEXUS_DATABASE'),
+    port='1433',
+    as_dict=True)
+  _stats['last_connect_ms'] = int((time.time() - _t) * 1000)
+  return conn
+
+
+class _PooledConnection:
+  """Wraps a pooled pymssql connection so existing call sites work
+  UNCHANGED: close() parks the connection back in the pool instead of
+  closing the socket. Every call path already ends in commit-or-rollback
+  before close, so parked connections are clean."""
+  __slots__ = ('_real',)
+
+  def __init__(self, real):
+    self._real = real
+
+  def cursor(self):
+    return self._real.cursor()
+
+  def commit(self):
+    self._real.commit()
+
+  def rollback(self):
+    self._real.rollback()
+
+  def close(self):
+    real, self._real = self._real, None
+    if real is None:
+      return
+    with _pool_lock:
+      if len(_pool) < _POOL_MAX:
+        _pool.append(real)
+        return
+    try:
+      real.close()
+    except Exception:
+      pass
+
+
 def get_connection():
-  return db_config.get_nexus_connection()
+  _stats['gets'] += 1
+  while True:
+    with _pool_lock:
+      real = _pool.pop() if _pool else None
+    if real is None:
+      break
+    try:                          # cheap ping; discard dead connections
+      cur = real.cursor()
+      # AS ok is load-bearing: as_dict=True raises ColumnsWithoutNames-
+      # Error on a nameless column, which silently killed every pooled
+      # connection until 2026-08-26's probe caught it.
+      cur.execute("SELECT 1 AS ok")
+      cur.fetchall()
+      real.rollback()             # clear the ping's implicit transaction
+      _stats['pool_hits'] += 1
+      return _PooledConnection(real)
+    except Exception as e:
+      _stats['last_ping_err'] = repr(e)[:160]
+      try:
+        real.close()
+      except Exception:
+        pass
+  _stats['pool_misses'] += 1
+  return _PooledConnection(_connect())
+
+
+@anvil.server.callable
+def ship_plan_debug_probe():
+  """Times each stage of the DB leg inside ONE call: WAN login, three
+  query round trips on the same socket. With last_ping_err from
+  cross-call pool attempts, this pins where the ~1s/call actually goes
+  and whether parked sockets are killed at call boundaries."""
+  out = {'status': 'success', 'pid': os.getpid()}
+  t0 = time.time()
+  conn = _connect()
+  out['connect_ms'] = int((time.time() - t0) * 1000)
+  cur = conn.cursor()
+  t1 = time.time()
+  cur.execute("SELECT 1 AS x")
+  cur.fetchall()
+  out['query1_ms'] = int((time.time() - t1) * 1000)
+  t2 = time.time()
+  cur.execute("SELECT COUNT(*) AS n FROM dbo.pc_priority_reasons")
+  cur.fetchall()
+  out['query2_ms'] = int((time.time() - t2) * 1000)
+  t3 = time.time()
+  cur.execute("SELECT 1 AS x")
+  cur.fetchall()
+  out['query3_ms'] = int((time.time() - t3) * 1000)
+  try:
+    conn.close()
+  except Exception:
+    pass
+  out['stats'] = dict(_stats)
+  return out
+
+
+@anvil.server.callable
+def ship_plan_debug_stats():
+  """Perf forensics: if pid is stable and process_age_s grows across
+  calls, the persistent server is real and the pool can work. If pid
+  changes every call, the process is being respawned and no in-process
+  cache can help. Harmless to leave in; PC-only info."""
+  return {'status': 'success',
+          'pid': os.getpid(),
+          'process_age_s': round(time.time() - _process_t0, 1),
+          'pool_size': len(_pool),
+          'secrets_cached': len(_secret_cache),
+          'stats': dict(_stats)}
 
 
 def _current_actor():
@@ -957,6 +1103,42 @@ def ship_plan_publish(plan_date):
 # =============================================================================
 # PARAMETERS / OVERRIDES / SPECIAL CUSTOMERS / EVENTS
 # =============================================================================
+
+@anvil.server.callable
+def ship_plan_get_day(plan_date, search=None, bucket=None,
+                      due_within_days=None, special_only=False,
+                      defaulted_only=False):
+  """Plan + candidates in ONE round trip. Anvil charges ~1s of transport
+  per call regardless of query size, so the form's load path (and every
+  dialog-close reload) pays it once, not twice."""
+  plan = ship_plan_get_plan(plan_date)
+  if plan.get('status') != 'success':
+    return plan
+  cands = ship_plan_get_candidates(search=search, bucket=bucket,
+                                   due_within_days=due_within_days,
+                                   special_only=special_only,
+                                   defaulted_only=defaulted_only)
+  if cands.get('status') != 'success':
+    return cands
+  return {'status': 'success', 'plan': plan, 'candidates': cands}
+
+
+@anvil.server.callable
+def ship_plan_get_params_bundle(override_date=None):
+  """Everything the Parameters panel shows, in ONE round trip (it used
+  to make three sequential calls — three seconds of frozen spinner)."""
+  p = ship_plan_get_parameters()
+  if p.get('status') != 'success':
+    return p
+  c = ship_plan_get_special_customers()
+  if c.get('status') != 'success':
+    return c
+  o = ship_plan_get_overrides(override_date)
+  if o.get('status') != 'success':
+    return o
+  return {'status': 'success', 'parameters': p['parameters'],
+          'customers': c['customers'], 'overrides': o['overrides']}
+
 
 @anvil.server.callable
 def ship_plan_get_parameters():
