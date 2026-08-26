@@ -15,11 +15,20 @@ STATUS_COLORS = {
   'Confirmed': ('#E8F5E9', '#1B5E20'),   # Wk-3
 }
 
+# A PLANNED line's chip shows its TIER instead — the word 'Planned' says
+# less than Must / Next / Stretch does. Word + color, never color alone.
+TIER_COLORS = {
+  'Must':    ('#1565C0', '#FFFFFF'),   # strong blue / white — commands the eye
+  'Next':    ('#E3F2FD', '#1565C0'),   # pale blue / medium blue
+  'Stretch': ('#F0EFEA', '#52514E'),   # warm gray — "if capacity permits"
+}
+
 
 class ShipPlanLineRow(ShipPlanLineRowTemplate):
   """One plan line. Designer components: lbl_order, lbl_what, lbl_sub,
   lbl_qty, lbl_shipby, lbl_load, lbl_status, lk_drift,
-  btn_refresh, btn_snooze, btn_remove.
+  btn_refresh, btn_snooze, btn_remove
+  (+ btn_priority '★' — hand-added in the designer, hasattr-guarded).
 
   DRIFT RULE: lk_drift only DISPLAYS the planned-vs-live gap. Clicking it
   runs the same explicit Refresh as btn_refresh — nothing re-totals
@@ -35,6 +44,8 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     sub = item.get('shipto_code') or ''
     if float(item.get('surcharge_minutes') or 0) > 0.5:
       sub += f"  · +{float(item['surcharge_minutes']):,.0f} min surcharge"
+    if item.get('reason_desc'):
+      sub += f"  · {item['reason_desc']}"
     self.lbl_sub.text = sub
     self.lbl_qty.text = f"{float(item['qty_planned']):g}"
     self.lbl_shipby.text = (item.get('ship_by_date') or '')[:10]
@@ -46,6 +57,11 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     if status == 'Snoozed' and item.get('snooze_to_date'):
       chip_text = f"→ {item['snooze_to_date'][:10]}"
     bg, fg = STATUS_COLORS.get(status, STATUS_COLORS['Planned'])
+    if status == 'Planned':
+      tier = item.get('tier') or 'Next'
+      bg, fg = TIER_COLORS.get(tier, TIER_COLORS['Next'])
+      chip_text = {'Must': 'MUST TODAY', 'Next': 'NEXT',
+                   'Stretch': 'STRETCH'}.get(tier, tier.upper())
     self.lbl_status.text = chip_text
     self.lbl_status.background = bg
     self.lbl_status.foreground = fg
@@ -85,3 +101,12 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     if on_remove:
       self.btn_remove.set_event_handler('click',
                                         lambda **e: on_remove(self.item))
+
+    # btn_priority ('★') is hand-added in the designer — guarded so this
+    # code runs clean before Dave adds it.
+    on_priority = item.get('on_priority')
+    if hasattr(self, 'btn_priority'):
+      self.btn_priority.visible = bool(on_priority) and active
+      if on_priority:
+        self.btn_priority.set_event_handler(
+          'click', lambda **e: on_priority(self.item))

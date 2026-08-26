@@ -9,7 +9,8 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
   collapsed by vw_pc_ship_candidates).
 
   Designer components: lbl_order, lbl_what, lbl_sub, lbl_qty, lbl_shipby,
-  lbl_load, lbl_flags, btn_add.
+  lbl_load, lbl_flags, btn_add
+  (+ btn_add_order '+SO' — hand-added in the designer, hasattr-guarded).
 
   Flags column (word + glyph, never color alone):
     ⚠ DEF  = classification defaulted conservative (PC review — 002_pratik)
@@ -57,3 +58,12 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     if on_add:
       self.btn_add.set_event_handler('click',
                                      lambda **e: on_add(self.item))
+
+    # btn_add_order ('+SO') is hand-added in the designer — guarded so
+    # this code runs clean before Dave adds it.
+    on_add_order = item.get('on_add_order')
+    if hasattr(self, 'btn_add_order'):
+      self.btn_add_order.visible = on_add_order is not None
+      if on_add_order:
+        self.btn_add_order.set_event_handler(
+          'click', lambda **e: on_add_order(self.item))

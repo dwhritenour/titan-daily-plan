@@ -21,6 +21,9 @@ class ship_plan(ship_planTemplate):
                     cb_defaulted_only, lbl_feed_note
       grids:        rp_candidates (ShipPlanCandidateRow),
                     rp_plan_lines (ShipPlanLineRow), cb_show_removed
+      row buttons (hand-added in the designer, hasattr-guarded until
+                    then): candidate row btn_add_order ('+SO'),
+                    line row btn_priority ('★')
       timer:        timer_drift (interval 300)
 
     The client computes NOTHING — capacity, loads, classification and the
@@ -86,7 +89,8 @@ class ship_plan(ship_planTemplate):
       return
     self._capacity = result['capacity']
     self._render_header(result.get('header'))
-    self._render_capacity(result['planned_inches'])
+    self._render_capacity(result['planned_inches'],
+                          result.get('stretch_inches', 0))
     self._render_lines(result['lines'])
     self.refresh_candidates()
 
@@ -104,6 +108,7 @@ class ship_plan(ship_planTemplate):
     items = result['candidates']
     for it in items:
       it['on_add'] = self._add_line if self.is_pc else None
+      it['on_add_order'] = self._add_order if self.is_pc else None
     self.rp_candidates.items = items
     self._render_feed_chip(result)
 
@@ -143,22 +148,38 @@ class ship_plan(ship_planTemplate):
       self.btn_publish.enabled = False
       return
     status = header['plan_status']
-    self.lbl_plan_status.text = status.upper()
+    txt = status.upper()
     if status == 'Published':
+      # "PUBLISHED 8:52 · rev 3 (10:14)" — post-publish edits are fine
+      # (real life happens) but they are VISIBLE, never silent. The
+      # counter lives server-side (_bump_revision); Draft edits are free.
+      pub_t = str(header.get('published_at') or '')[11:16]
+      if pub_t:
+        txt = f'PUBLISHED {pub_t}'
+      rev = header.get('revision_no') or 0
+      if rev:
+        rev_t = str(header.get('last_revised_at') or '')[11:16]
+        txt += f' · rev {rev}' + (f' ({rev_t})' if rev_t else '')
       self.lbl_plan_status.foreground = '#006300'
       self.lbl_plan_status.tooltip = (
         f"published by {header.get('published_by')} "
         f"at {header.get('published_at')}")
     else:
       self.lbl_plan_status.foreground = '#a16207'
+    self.lbl_plan_status.text = txt
     self.btn_publish.enabled = self.is_pc and status == 'Draft'
 
-  def _render_capacity(self, planned):
+  def _render_capacity(self, planned, stretch=0):
     cap = self._capacity or {}
     eff_cap = cap.get('capacity_inches_effective') or 0
     self._planned = planned
-    self.lbl_capacity_line.text = (
-      f"Planned {planned:,.0f} of {eff_cap:,.0f} work-inches")
+    self._stretch = stretch or 0
+    txt = f"Planned {planned:,.0f} of {eff_cap:,.0f} work-inches"
+    if self._stretch:
+      # Stretch is "if capacity permits" — it never counts against the
+      # cap, so it rides OUTSIDE the Planned number and the meter fill.
+      txt += f"  · +{self._stretch:,.0f} stretch"
+    self.lbl_capacity_line.text = txt
     self._draw_capacity_bar()
     self.lbl_crew.text = cap.get('capacity_detail', '')
     # ALWAYS-ON attendance freshness chip (Dave 2026-08-25): positive
@@ -276,6 +297,14 @@ class ship_plan(ship_planTemplate):
       fx = ratio * cap_x
       c.fill_style = '#fab219' if ratio >= 0.85 else '#2a78d6'
       rrect(0, fx, round_right=False)
+      # Stretch: LIGHTER segment appended after the fill — visible work,
+      # but visually "not load" (it doesn't count against the cap).
+      stretch = getattr(self, '_stretch', 0)
+      if stretch and eff_cap:
+        sx = min((planned + stretch) / eff_cap, 1.0) * cap_x
+        if sx > fx + 4:
+          c.fill_style = '#cfe1f8'
+          c.fill_rect(fx + 2, y0 + 2, sx - fx - 4, bh - 4)
       c.fill_style = '#fcfcfb'             # 2px surface gap at the data end
       c.fill_rect(fx, y0, 2, bh)
 
@@ -347,8 +376,10 @@ class ship_plan(ship_planTemplate):
         it['on_recalc'] = self._recalc_line
         it['on_snooze'] = self._snooze_line
         it['on_remove'] = self._remove_line
+        it['on_priority'] = self._priority_dialog
       else:
         it['on_recalc'] = it['on_snooze'] = it['on_remove'] = None
+        it['on_priority'] = None
     self.rp_plan_lines.items = shown
 
   # =================================================================
@@ -361,34 +392,90 @@ class ship_plan(ship_planTemplate):
       alert(result.get('message', 'Add failed'))
       return
     if result.get('over_capacity'):
-      self._cap_hit_dialog(item, result)
+      self._cap_hit_dialog(item['nx_order_numb'], [item['nx_sku']], result)
     self.load_day()
 
-  def _cap_hit_dialog(self, item, result):
-    """DECISION §4: snooze-to-suggested-day, explicit Unplaced, or keep —
-    never a silent drop. The line is already added when we get here."""
+  def _add_order(self, item):
+    """Whole sales order onto the day — every open SKU, ONE server
+    transaction, one cap dialog for the lot (not one per line)."""
+    order = item['nx_order_numb']
+    result = anvil.server.call('ship_plan_add_order', self.plan_date, order)
+    if result.get('status') != 'success':
+      alert(result.get('message', 'Add order failed'))
+      return
+    added = result.get('added') or []
+    skipped = result.get('skipped') or []
+    note = f"{order}: {len(added)} item(s) added"
+    if skipped:
+      note += f", {len(skipped)} already on the plan"
+    Notification(note, timeout=4).show()
+    if result.get('over_capacity'):
+      self._cap_hit_dialog(order, added, result)
+    self.load_day()
+
+  def _cap_hit_dialog(self, order, skus, result):
+    """DECISION §4: snooze / Mark Stretch / explicit Unplaced / keep —
+    never a silent drop. The line(s) are already added when we get here.
+    Mark Stretch re-tiers them so they stop counting against the cap —
+    "if capacity permits" made literal."""
     sug = result.get('suggested_day')
+    what = order if len(skus) != 1 else f"{order} / {skus[0]}"
     msg = (f"This puts {self.plan_date} at "
            f"{result['planned_inches']:,.0f} / "
            f"{result['capacity_inches']:,.0f} work-inches "
-           f"(+{result['line_inches']:,.0f} from {item['nx_order_numb']}).")
+           f"(+{result['line_inches']:,.0f} from {what}).")
     buttons = []
     if sug:
       buttons.append((f"Snooze to {sug}", 'snooze'))
-    buttons += [("Leave Unplaced", 'unplaced'), ("Keep anyway", 'keep')]
+    buttons += [("Mark Stretch", 'stretch'),
+                ("Leave Unplaced", 'unplaced'), ("Keep anyway", 'keep')]
     choice = alert(msg, title="Over capacity", buttons=buttons, large=True)
-    order, sku = item['nx_order_numb'], item['nx_sku']
-    if choice == 'snooze' and sug:
-      r = anvil.server.call('ship_plan_snooze_line', self.plan_date,
-                            order, sku, sug)
+    for sku in skus:
+      if choice == 'snooze' and sug:
+        r = anvil.server.call('ship_plan_snooze_line', self.plan_date,
+                              order, sku, sug)
+      elif choice == 'stretch':
+        r = anvil.server.call('ship_plan_set_priority', self.plan_date,
+                              order, sku, tier='Stretch')
+      elif choice == 'unplaced':
+        r = anvil.server.call('ship_plan_mark_unplaced', self.plan_date,
+                              order, sku, 'over capacity at add')
+      else:
+        return  # 'keep' (or dismissed): stays Planned, bar red — PC's call
       if r.get('status') != 'success':
-        alert(r.get('message', 'Snooze failed'))
-    elif choice == 'unplaced':
-      r = anvil.server.call('ship_plan_mark_unplaced', self.plan_date,
-                            order, sku, 'over capacity at add')
-      if r.get('status') != 'success':
-        alert(r.get('message', 'Unplace failed'))
-    # 'keep' (or dialog dismissed): stays Planned, bar shows red — PC's call.
+        alert(r.get('message', 'Action failed'))
+        return
+
+  def _priority_dialog(self, item):
+    """Tier + reason on one line. The REASON list is sales' vocabulary
+    (pc_priority_reasons); the TIER (Must / Next / Stretch) is the
+    Daily's call — sales proposes why, PC decides when."""
+    if not hasattr(self, '_reasons'):
+      r = anvil.server.call('ship_plan_get_reasons')
+      ok = r.get('status') == 'success'
+      self._reasons = (r.get('reasons') or []) if ok else []
+    dd_tier = DropDown(items=[('Must today', 'Must'), ('Next', 'Next'),
+                              ('Stretch — if capacity permits', 'Stretch')],
+                       selected_value=item.get('tier') or 'Next')
+    dd_reason = DropDown(
+      items=[('— no reason set —', '')] +
+      [(x['description'], x['reason_code']) for x in self._reasons],
+      selected_value=item.get('priority_reason') or '')
+    pnl = ColumnPanel()
+    pnl.add_component(Label(text='Tier', bold=True))
+    pnl.add_component(dd_tier)
+    pnl.add_component(Label(text='Reason (why it matters)', bold=True))
+    pnl.add_component(dd_reason)
+    if not confirm(f"Priority — {item['nx_order_numb']} / {item['nx_sku']}",
+                   content=pnl):
+      return
+    r = anvil.server.call('ship_plan_set_priority', self.plan_date,
+                          item['nx_order_numb'], item['nx_sku'],
+                          tier=dd_tier.selected_value,
+                          reason=dd_reason.selected_value)
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Priority change failed'))
+    self.load_day()
 
   def _recalc_line(self, item):
     r = anvil.server.call('ship_plan_recalc_line', self.plan_date,
@@ -418,13 +505,28 @@ class ship_plan(ship_planTemplate):
     self.load_day()
 
   def _remove_line(self, item):
+    order = item['nx_order_numb']
+    siblings = [l for l in self._lines
+                if l['nx_order_numb'] == order
+                and l['line_status'] != 'Removed']
     tb = TextBox(placeholder='reason (optional)')
-    if not confirm(f"Remove {item['nx_order_numb']} / {item['nx_sku']} "
-                   "from this plan?", content=tb):
+    cb_all = None
+    content = tb
+    if len(siblings) > 1:
+      # Whole-order removal rides the same dialog — no extra button.
+      cb_all = CheckBox(text=f'Remove ALL {len(siblings)} lines of {order}')
+      content = ColumnPanel()
+      content.add_component(cb_all)
+      content.add_component(tb)
+    if not confirm(f"Remove {order} / {item['nx_sku']} from this plan?",
+                   content=content):
       return
-    r = anvil.server.call('ship_plan_remove_line', self.plan_date,
-                          item['nx_order_numb'], item['nx_sku'],
-                          tb.text or None)
+    if cb_all and cb_all.checked:
+      r = anvil.server.call('ship_plan_remove_order', self.plan_date,
+                            order, tb.text or None)
+    else:
+      r = anvil.server.call('ship_plan_remove_line', self.plan_date,
+                            order, item['nx_sku'], tb.text or None)
     if r.get('status') != 'success':
       alert(r.get('message', 'Remove failed'))
     self.load_day()
@@ -475,7 +577,10 @@ class ship_plan(ship_planTemplate):
       return
     lines = []
     for e in r['events']:
-      what = f"{e['nx_order_numb']}/{e['nx_sku']}" if e['nx_order_numb'] else ''
+      what = ''
+      if e['nx_order_numb']:
+        what = (f"{e['nx_order_numb']}/{e['nx_sku']}" if e['nx_sku']
+                else e['nx_order_numb'])   # order-level events have no SKU
       change = ''
       if e['old_value'] and e['new_value']:
         change = f": {e['old_value']} → {e['new_value']}"
@@ -495,5 +600,6 @@ class ship_plan(ship_planTemplate):
     if result.get('status') != 'success':
       return
     self._capacity = result['capacity']
-    self._render_capacity(result['planned_inches'])
+    self._render_capacity(result['planned_inches'],
+                          result.get('stretch_inches', 0))
     self._render_lines(result['lines'])
