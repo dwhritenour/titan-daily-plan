@@ -1,6 +1,6 @@
 <anvil-form container="HtmlTemplate" prop:html="@theme:standard-page.html">
   <anvil-component type="ColumnPanel" name="content_panel" container:slot="default">
-    <anvil-component type="DataGrid" name="data_grid_1" prop:columns='[{"id":"VJQQOR","title":"Column 2","data_key":"column_2"},{"id":"OJLQEN","title":"Column 3","data_key":"column_3"}]' container:grid_position="ZWPCYR,ZCQDMX">
+    <anvil-component type="DataGrid" name="data_grid_1" prop:columns='[{"id":"VJQQOR","title":"Column 2","data_key":"column_2"},{"id":"OJLQEN","title":"Column 3","data_key":"column_3"}]' prop:rows_per_page="10" container:grid_position="ZWPCYR,ZCQDMX">
       <anvil-component type="RepeatingPanel" name="repeating_panel_1" prop:item_template="Titan_Daily_Plan.Form1.RowTemplate1"></anvil-component>
     </anvil-component>
   </anvil-component>
