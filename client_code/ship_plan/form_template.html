@@ -8,14 +8,15 @@
         <anvil-component type="Button" name="btn_publish" prop:text="Publish" prop:role="elevated-button"></anvil-component>
         <anvil-component type="Link" name="lk_history" prop:text="History"></anvil-component>
         <anvil-component type="Link" name="lk_params" prop:text="Parameters"></anvil-component>
+        <anvil-component type="Link" name="lk_overrides" prop:text="Assembler Overrides" prop:align="center" prop:bold="false" prop:spacing='{"margin":["5",null,"0",null]}'></anvil-component>
       </anvil-component>
     </anvil-component>
-    <anvil-component type="ColumnPanel" name="oc_capacity" prop:role="outlined-card" prop:col_widths='"{\"DGKFXL\":20,\"ZZJRPK\":20,\"EWJCZX\":20}"' container:grid_position="LYNGOP,YRRSCO" container:full_width_row="true">
-      <anvil-component type="Label" name="lbl_capacity_line" prop:bold="true" prop:font_size="20" container:grid_position="RJWMZB,DAHJIG" container:full_width_row="true"></anvil-component>
+    <anvil-component type="ColumnPanel" name="oc_capacity" prop:role="outlined-card" prop:col_widths='"{\"DGKFXL\":20,\"ZZJRPK\":20,\"DAHJIG\":15}"' container:grid_position="LYNGOP,YRRSCO" container:full_width_row="true">
+      <anvil-component type="Label" name="lbl_capacity_line" prop:bold="true" prop:font_size="20" prop:spacing='{"padding":[null,null,"0",null],"margin":[null,null,"0",null]}' container:grid_position="YFOEIC,KHYCKZ" container:full_width_row="true"></anvil-component>
+      <anvil-component type="Label" name="label_2" prop:text="(measures work, not product length)" prop:italic="true" prop:spacing='{"margin":["-5",null,"10",null],"padding":["0",null,"0",null]}' container:grid_position="LIJOLV,ORFYXA" container:full_width_row="true"></anvil-component>
       <anvil-component type="Label" name="lbl_feed_note" prop:font_size="13" prop:foreground="#595959" prop:visible="false" prop:background="#FCF3D9" prop:align="center" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="YPKEON,KABDSH" container:full_width_row="true"></anvil-component>
       <anvil-component type="Label" name="lbl_snapshot_warn" prop:visible="false" prop:foreground="#a16207" prop:background="#FCF3D9" prop:align="center" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="YPKEON,DGKFXL" container:full_width_row="true"></anvil-component>
       <anvil-component type="Label" name="lbl_crew" prop:font_size="13" prop:foreground="#595959" prop:align="center" prop:bold="true" prop:background="#FCF3D9" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="YPKEON,ZZJRPK"></anvil-component>
-      <anvil-component type="Link" name="lk_overrides" prop:text="Mark absent / trainee…" prop:align="center" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="YPKEON,EWJCZX"></anvil-component>
       <anvil-component type="Canvas" name="cv_capacity" prop:height="67.5" prop:margin='["0",null,"0",null]' container:grid_position="JPZSKA,ITYGHX" container:full_width_row="true"></anvil-component>
     </anvil-component>
     <!-- Capacity card -->
@@ -33,7 +34,7 @@
     <anvil-component type="ColumnPanel" name="pnl_body" prop:col_widths='"{\"LFTCOL\":30,\"RGTCOL\":30}"' prop:role="outlined-card" container:grid_position="BDYROW,BDYCOL" container:full_width_row="true">
       <anvil-component type="ColumnPanel" name="pnl_candidates" prop:role="outlined-card" container:grid_position="BODROW,LFTCOL" container:full_width_row="true">
         <anvil-component type="Label" name="lbl_candidates_header" prop:text="UP NEXT — CANDIDATES" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:bold="true" container:grid_position="CANA01,CANB01" container:full_width_row="true"></anvil-component>
-        <anvil-component type="DataGrid" name="dg_candidates" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="true" prop:columns='[{"id":"order","title":"Order","data_key":"order","width":90},{"id":"item","title":"Item","data_key":"item"},{"id":"qty","title":"Qty","data_key":"qty","width":60},{"id":"ship_by","title":"Ship By","data_key":"ship_by","width":110},{"id":"load","title":"Load","data_key":"load","width":90},{"id":"flags","title":"Flags","data_key":"flags","width":70},{"id":"add","title":"Add","data_key":"add","width":"80"}]' container:grid_position="CANA02,CANB02" container:full_width_row="true">
+        <anvil-component type="DataGrid" name="dg_candidates" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="true" prop:columns='[{"id":"order","title":"Order","data_key":"order","width":90},{"id":"item","title":"Item","data_key":"item"},{"id":"qty","title":"Qty","data_key":"qty","width":60},{"id":"ship_by","title":"Ship By","data_key":"ship_by","width":110},{"id":"load","title":"Load","data_key":"load","width":90},{"id":"flags","title":"Flags","data_key":"flags","width":70},{"id":"add","title":"Add","data_key":"add","width":"90"}]' container:grid_position="CANA02,CANB02" container:full_width_row="true">
           <anvil-component type="RepeatingPanel" name="rp_candidates" prop:item_template="Titan_Daily_Plan.ship_plan.ShipPlanCandidateRow" prop:margin='["0",null,"0",null]'></anvil-component>
         </anvil-component>
       </anvil-component>

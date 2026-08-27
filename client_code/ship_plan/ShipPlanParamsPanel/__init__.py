@@ -30,21 +30,29 @@ class ShipPlanParamsPanel(ShipPlanParamsPanelTemplate):
     self.override_date = override_date
     only_overrides = (section == 'overrides')
 
+    # Two DISTINCT popups (Dave 2026-08-26): Parameters = plan params +
+    # special customers only; the day overrides live solely in the
+    # "Mark absent / trainee..." popup. No duplicated section.
     for comp in (self.lbl_sec_params, self.pnl_params,
                  self.lbl_sec_customers, self.pnl_customers):
       comp.visible = not only_overrides
+    for comp in (getattr(self, 'lbl_sec_overrides', None),
+                 self.pnl_overrides, self.lbl_override_date):
+      if comp is not None:
+        comp.visible = only_overrides
 
-    self.lbl_override_date.text = f"Overrides for {override_date}"
-    # ONE bundle call (was three sequential calls = three seconds of
-    # frozen spinner; every Anvil call pays ~1s transport).
-    data = anvil.server.call('ship_plan_get_params_bundle', override_date)
-    if data.get('status') != 'success':
-      alert(data.get('message', 'Parameter load failed'))
-      data = {}
-    if not only_overrides:
+    if only_overrides:
+      self.lbl_override_date.text = f"Overrides for {override_date}"
+      self._load_overrides()        # its own popup — one call
+    else:
+      # ONE bundle call (was three sequential = three seconds of
+      # frozen spinner; every Anvil call pays transport per call).
+      data = anvil.server.call('ship_plan_get_params_bundle', None)
+      if data.get('status') != 'success':
+        alert(data.get('message', 'Parameter load failed'))
+        data = {}
       self._load_params(data.get('parameters'))
       self._load_customers(data.get('customers'))
-    self._load_overrides(data.get('overrides'))
 
   # =================================================================
   # 1. Plan parameters

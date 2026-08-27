@@ -501,20 +501,30 @@ class ship_plan(ship_planTemplate):
                        selected_value=item.get('tier') or 'Next')
     dd_reason = DropDown(
       items=[('— no reason set —', '')] +
-            [(x['description'], x['reason_code']) for x in self._reasons],
+      [(x['description'], x['reason_code']) for x in self._reasons],
       selected_value=item.get('priority_reason') or '')
+    tb_note = TextBox(text=item.get('priority_note') or '',
+                      placeholder='note — required for "Other"')
     pnl = ColumnPanel()
     pnl.add_component(Label(text='Tier', bold=True))
     pnl.add_component(dd_tier)
     pnl.add_component(Label(text='Reason (why it matters)', bold=True))
     pnl.add_component(dd_reason)
+    pnl.add_component(Label(text='Note', bold=True))
+    pnl.add_component(tb_note)
     if not confirm(f"Priority — {item['nx_order_numb']} / {item['nx_sku']}",
                    content=pnl):
+      return
+    if (dd_reason.selected_value == 'OTHER'
+        and not (tb_note.text or '').strip()):
+      alert('"Other (see note)" needs the note — that IS the reason. '
+            'Nothing saved; open ★ again.')
       return
     r = anvil.server.call('ship_plan_set_priority', self.plan_date,
                           item['nx_order_numb'], item['nx_sku'],
                           tier=dd_tier.selected_value,
-                          reason=dd_reason.selected_value)
+                          reason=dd_reason.selected_value,
+                          note=tb_note.text or '')
     if r.get('status') != 'success':
       alert(r.get('message', 'Priority change failed'))
     self.load_day()

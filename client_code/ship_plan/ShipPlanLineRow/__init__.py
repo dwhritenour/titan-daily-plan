@@ -44,8 +44,14 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     sub = item.get('shipto_code') or ''
     if float(item.get('surcharge_minutes') or 0) > 0.5:
       sub += f"  · +{float(item['surcharge_minutes']):,.0f} min surcharge"
-    if item.get('reason_desc'):
-      sub += f"  · {item['reason_desc']}"
+    reason_txt = item.get('reason_desc')
+    note = item.get('priority_note')
+    if note:
+      # For OTHER the note IS the reason; otherwise it colors it.
+      reason_txt = (note if item.get('priority_reason') == 'OTHER'
+                    else f"{reason_txt} — {note}" if reason_txt else note)
+    if reason_txt:
+      sub += f"  · {reason_txt}"
     self.lbl_sub.text = sub
     self.lbl_qty.text = f"{float(item['qty_planned']):g}"
     self.lbl_shipby.text = (item.get('ship_by_date') or '')[:10]
@@ -110,5 +116,3 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
       if on_priority:
         self.btn_priority.set_event_handler(
           'click', lambda **e: on_priority(self.item))
-
- 

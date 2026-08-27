@@ -711,10 +711,12 @@ def ship_plan_get_reasons():
 
 
 @anvil.server.callable
-def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None):
-  """Set tier and/or reason on one plan line. Pass only what changes;
-  reason='' clears it. Each change gets its own event (TierChange /
-  ReasonSet) and counts as a revision on a Published plan."""
+def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None,
+                           note=None):
+  """Set tier / reason / note on one plan line. Pass only what changes;
+  ''=clear. Each change gets its own event (TierChange / ReasonSet) and
+  counts as a revision on a Published plan. The note is the text behind
+  reason OTHER ('Other (see note)') — optional color on any reason."""
   plan_date = _parse_date(plan_date)
   if tier is not None and tier not in ('Must', 'Next', 'Stretch'):
     return {'status': 'error', 'message': f'Bad tier {tier}.'}
@@ -723,7 +725,7 @@ def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None):
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT tier, priority_reason, line_status
+        SELECT tier, priority_reason, priority_note, line_status
         FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
     """, (plan_date, order, sku))
@@ -755,6 +757,18 @@ def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None):
         _log_event(cursor, plan_date, order, sku, 'ReasonSet',
                    old_value=row['priority_reason'], new_value=new_reason,
                    actor=actor)
+        changed = True
+    if note is not None:
+      new_note = (note or '').strip()[:200] or None
+      if new_note != row['priority_note']:
+        cursor.execute("""
+            UPDATE dbo.pc_ship_plan_line
+            SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+        """, (new_note, actor, plan_date, order, sku))
+        _log_event(cursor, plan_date, order, sku, 'ReasonSet',
+                   old_value=row['priority_note'], new_value=new_note,
+                   actor=actor, note='note edit')
         changed = True
 
     if not changed:
@@ -1143,7 +1157,10 @@ def ship_plan_get_params_bundle(override_date=None):
   c = ship_plan_get_special_customers()
   if c.get('status') != 'success':
     return c
-  o = ship_plan_get_overrides(override_date)
+  # overrides only when a date is asked for — the Parameters popup no
+  # longer shows that section (it lives in Mark absent / trainee...)
+  o = (ship_plan_get_overrides(override_date) if override_date
+       else {'status': 'success', 'overrides': []})
   if o.get('status') != 'success':
     return o
   return {'status': 'success', 'parameters': p['parameters'],
