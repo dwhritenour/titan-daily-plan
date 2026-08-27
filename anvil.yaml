@@ -29,5 +29,5 @@ services:
 - client_config: {}
   server_config: {}
   source: /runtime/services/anvil/secrets.yml
-startup: {module: ship_plan, type: form}
+startup: {module: Form1, type: form}
 startup_form: null
