@@ -430,11 +430,27 @@ def ship_plan_get_capacity(plan_date):
 @anvil.server.callable
 def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
                              special_only=False, defaulted_only=False,
-                             limit=300):
-  """Left pane. The already-planned guard lives in the VIEW."""
+                             limit=1000):
+  """Left pane. The already-planned guard lives in the VIEW.
+  due_within_days='auto' means: read PLAN_HORIZON_DAYS here, server-side
+  — the client computes NOTHING, so the parameter takes effect the
+  moment it is saved (2026-08-27 bug: the client cached 10 forever)."""
   conn = get_connection()
   try:
     cursor = conn.cursor()
+    horizon_days = None
+    if due_within_days == 'auto':
+      cursor.execute("""
+          SELECT param_value FROM dbo.pc_plan_parameters
+          WHERE param_code = 'PLAN_HORIZON_DAYS'
+      """)
+      prow = cursor.fetchone()
+      try:
+        due_within_days = int(float(prow['param_value'])) if prow else 10
+      except (TypeError, ValueError):
+        due_within_days = 10
+    if due_within_days:
+      horizon_days = int(due_within_days)
     where, args = [], []
     if search:
       like = f'%{search.strip()}%'
@@ -458,6 +474,14 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     sql += " ORDER BY ship_by_date, load_inches DESC"
     cursor.execute(sql, tuple(args))
     rows = [serialize_row(r) for r in cursor.fetchall()]
+    # Total matching (pre-TOP) — so truncation is VISIBLE, never silent:
+    # with a deep overdue backlog the oldest rows can fill the cap and
+    # hide the future entirely (the "list ends at 8/24" mystery).
+    count_sql = "SELECT COUNT(*) AS n FROM dbo.vw_pc_ship_candidates"
+    if where:
+      count_sql += " WHERE " + " AND ".join(where)
+    cursor.execute(count_sql, tuple(args))
+    total = (cursor.fetchone() or {}).get('n', len(rows))
     # Feed freshness for the always-on Orders chip — age computed
     # SERVER-side (GETDATE) so browser clocks can't skew it.
     cursor.execute("""
@@ -467,6 +491,7 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     """)
     f = cursor.fetchone() or {}
     return {'status': 'success', 'candidates': rows,
+            'total_count': total, 'horizon_days': horizon_days,
             'feed_last_updated': make_serializable(f.get('feed_last_updated')),
             'feed_age_minutes': f.get('feed_age_minutes')}
   except Exception as e:

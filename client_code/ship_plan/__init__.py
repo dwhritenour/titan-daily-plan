@@ -61,7 +61,9 @@ class ship_plan(ship_planTemplate):
                             ('Zero-touch', 'ZERO'), ('Other', 'OTHER')]
     self.cb_due_window.checked = True
 
-    self._horizon_days = 10          # refreshed from parameters on load
+    # Horizon lives SERVER-side now: 'auto' tells get_candidates to
+    # read PLAN_HORIZON_DAYS itself, so a saved change applies on the
+    # very next refresh (the old client-cached 10 never updated).
     self._capacity = None
     self._lines = []
 
@@ -119,7 +121,7 @@ class ship_plan(ship_planTemplate):
       'ship_plan_get_day', self.plan_date,
       search=self.tb_search.text or None,
       bucket=self.dd_bucket.selected_value,
-      due_within_days=self._horizon_days if self.cb_due_window.checked else None,
+      due_within_days='auto' if self.cb_due_window.checked else None,
       special_only=self.cb_special_only.checked,
       defaulted_only=self.cb_defaulted_only.checked)
     if result.get('status') != 'success':
@@ -138,7 +140,7 @@ class ship_plan(ship_planTemplate):
       'ship_plan_get_candidates',
       search=self.tb_search.text or None,
       bucket=self.dd_bucket.selected_value,
-      due_within_days=self._horizon_days if self.cb_due_window.checked else None,
+      due_within_days='auto' if self.cb_due_window.checked else None,
       special_only=self.cb_special_only.checked,
       defaulted_only=self.cb_defaulted_only.checked)
     if result.get('status') != 'success':
@@ -152,6 +154,21 @@ class ship_plan(ship_planTemplate):
       it['on_add'] = self._add_line if self.is_pc else None
       it['on_add_order'] = self._add_order if self.is_pc else None
     self.rp_candidates.items = items
+    # Header says what the list IS — oldest-first, and exactly how much
+    # of the match survived the cap. Silent truncation caused the
+    # "horizon does nothing / list ends at 8/24" report of 2026-08-27.
+    if hasattr(self, 'lbl_candidates_header'):
+      total = result.get('total_count')
+      hz = result.get('horizon_days')
+      txt = 'UP NEXT — CANDIDATES'
+      if hz:
+        txt += f' (due within {hz} business days)'
+      if total is not None:
+        if total > len(items):
+          txt += f' — showing oldest {len(items)} of {total}'
+        else:
+          txt += f' — {total}'
+      self.lbl_candidates_header.text = txt
     self._render_feed_chip(result)
 
   def _render_feed_chip(self, result):
