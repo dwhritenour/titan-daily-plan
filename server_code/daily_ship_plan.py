@@ -461,8 +461,15 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
       where.append("bucket = %s")
       args.append(bucket)
     if due_within_days:
+      # BUSINESS days, as the label promises (Dave 2026-08-27: 4 days
+      # reached Monday — calendar counting was crossing the weekend).
+      end, added = date.today(), 0
+      while added < int(due_within_days):
+        end += timedelta(days=1)
+        if end.weekday() < 5:
+          added += 1
       where.append("ship_by_date <= %s")
-      args.append(date.today() + timedelta(days=int(due_within_days)))
+      args.append(end)
     if special_only:
       where.append("n_special > 0")
     if defaulted_only:
