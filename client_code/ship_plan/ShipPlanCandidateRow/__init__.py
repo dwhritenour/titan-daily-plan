@@ -19,7 +19,10 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     S      = special elements present
     Z      = zero-touch (plans free against the cap)
     $      = surcharge applies (SpaceX / Termotran / duplex / mount)
-  Tooltip lists priority score + every flag as 'code — note'.
+  Tooltip lists priority score + every flag as 'code — note' (desktop).
+  TAP-TO-SEE: lbl_flags is a LINK in the designer (same name); a tap
+  opens a popup with the same breakdown — the Vibe boards have no
+  hover. Guarded so the code runs clean while it is still a Label.
   """
 
   def __init__(self, **properties):
@@ -77,6 +80,13 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
       self.lbl_flags.bold = True
     elif item.get('n_class_defaulted'):
       self.lbl_flags.foreground = '#a16207'
+    self._flag_tip_lines = tip_lines
+    # Tap-to-see (touch boards): Link fires 'click'; a Label raises
+    # ValueError on this call — swallowed so nothing breaks pre-swap.
+    try:
+      self.lbl_flags.set_event_handler('click', self._show_flag_details)
+    except (ValueError, AttributeError):
+      pass
 
     # Gated rows are not plannable — the line-level add is hidden.
     # (+SO stays visible: adding the ORDER is a PC judgment call on a
@@ -97,3 +107,34 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
       if on_add_order:
         self.btn_add_order.set_event_handler(
           'click', lambda **e: on_add_order(self.item))
+
+  def _show_flag_details(self, **event_args):
+    """Popup with the flag breakdown for this row — data already in
+    hand (no round trip). Fat text for the 75-inch boards."""
+    item = self.item
+    gated = bool(item.get('is_gated'))
+    panel = ColumnPanel()
+    panel.add_component(Label(
+      text=f"{item['nx_order_numb']} · "
+      f"{item.get('sku_desc') or item['nx_sku']}",
+      bold=True, font_size=18))
+    head = Label(text=self._flag_tip_lines[0], font_size=16)
+    if gated:
+      head.text += '  —  GATED: not plannable as things stand'
+      head.foreground = '#C62828'
+      head.bold = True
+    panel.add_component(head)
+    for f in (item.get('flags') or []):
+      lbl = Label(text=f"{f['code']}  {f['name']}", bold=True, font_size=16)
+      if f['code'].startswith('X'):
+        lbl.foreground = '#C62828'
+      panel.add_component(lbl)
+      panel.add_component(Label(text=f['note'] or '', font_size=15))
+    if item.get('n_class_defaulted'):
+      panel.add_component(Label(
+        text='DEF  classification missing at plan time — charged '
+        'conservative (Special)', foreground='#a16207', font_size=15))
+    if not (item.get('flags') or item.get('n_class_defaulted')):
+      panel.add_component(Label(text='No flags on this line.', font_size=15))
+    alert(content=panel, title='Flags', buttons=[('Close', None)],
+          large=False)
