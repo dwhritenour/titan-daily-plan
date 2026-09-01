@@ -154,8 +154,9 @@ class ship_plan(ship_planTemplate):
       it['on_add'] = self._add_line if self.is_pc else None
       it['on_add_order'] = self._add_order if self.is_pc else None
     self.rp_candidates.items = items
-    # Header says what the list IS — oldest-first, and exactly how much
-    # of the match survived the cap. Silent truncation caused the
+    # Header says what the list IS — gated-last / priority-first
+    # (flag system 041), and exactly how much of the match survived
+    # the cap. Silent truncation caused the
     # "horizon does nothing / list ends at 8/24" report of 2026-08-27.
     if hasattr(self, 'lbl_candidates_header'):
       total = result.get('total_count')
@@ -165,9 +166,12 @@ class ship_plan(ship_planTemplate):
         txt += f' (due within {hz} business days)'
       if total is not None:
         if total > len(items):
-          txt += f' — showing oldest {len(items)} of {total}'
+          txt += f' — showing top {len(items)} of {total} by priority'
         else:
           txt += f' — {total}'
+      n_gated = sum(1 for it in items if it.get('is_gated'))
+      if n_gated:
+        txt += f' · {n_gated} gated'
       self.lbl_candidates_header.text = txt
     self._render_feed_chip(result)
 

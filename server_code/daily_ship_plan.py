@@ -434,7 +434,11 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
   """Left pane. The already-planned guard lives in the VIEW.
   due_within_days='auto' means: read PLAN_HORIZON_DAYS here, server-side
   — the client computes NOTHING, so the parameter takes effect the
-  moment it is saved (2026-08-27 bug: the client cached 10 forever)."""
+  moment it is saved (2026-08-27 bug: the client cached 10 forever).
+  2026-08-31 flag system (040/041): joined to vw_pc_order_flag_scores —
+  each row carries is_gated / gate_codes / priority_score / flag_codes
+  plus 'flags' = [{code, name, note}] for tooltips; sort = gated last,
+  then priority_score DESC, then oldest ship-by."""
   conn = get_connection()
   try:
     cursor = conn.cursor()
@@ -454,11 +458,11 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     where, args = [], []
     if search:
       like = f'%{search.strip()}%'
-      where.append("(nx_order_numb LIKE %s OR nx_sku LIKE %s "
-                   "OR sku_desc LIKE %s OR shipto_code LIKE %s)")
+      where.append("(c.nx_order_numb LIKE %s OR c.nx_sku LIKE %s "
+                   "OR c.sku_desc LIKE %s OR c.shipto_code LIKE %s)")
       args += [like, like, like, like]
     if bucket in ('ST', 'ZERO', 'OTHER'):
-      where.append("bucket = %s")
+      where.append("c.bucket = %s")
       args.append(bucket)
     if due_within_days:
       # BUSINESS days, as the label promises (Dave 2026-08-27: 4 days
@@ -468,27 +472,57 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
         end += timedelta(days=1)
         if end.weekday() < 5:
           added += 1
-      where.append("ship_by_date <= %s")
+      where.append("c.ship_by_date <= %s")
       args.append(end)
     if special_only:
-      where.append("n_special > 0")
+      where.append("c.n_special > 0")
     if defaulted_only:
-      where.append("n_class_defaulted > 0")
-    sql = ("SELECT TOP %d * FROM dbo.vw_pc_ship_candidates"
+      where.append("c.n_class_defaulted > 0")
+    # Flag system (040/041): the scores view drives eligibility + rank.
+    # Gated rows sort LAST (they are the Daily conversation, not the
+    # plan); ungated rank by priority_score, then oldest ship-by.
+    sql = ("SELECT TOP %d c.*, ISNULL(fs.is_gated, 0) AS is_gated, "
+           "fs.gate_codes, "
+           "ISNULL(fs.priority_score, 0) AS priority_score, "
+           "fs.flag_codes "
+           "FROM dbo.vw_pc_ship_candidates c "
+           "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
+           "ON fs.nx_order_numb = c.nx_order_numb "
+           "AND fs.nx_sku = c.nx_sku"
            % max(1, min(int(limit), 1000)))
     if where:
       sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY ship_by_date, load_inches DESC"
+    sql += (" ORDER BY is_gated, priority_score DESC, "
+            "c.ship_by_date, c.load_inches DESC")
     cursor.execute(sql, tuple(args))
     rows = [serialize_row(r) for r in cursor.fetchall()]
     # Total matching (pre-TOP) — so truncation is VISIBLE, never silent:
     # with a deep overdue backlog the oldest rows can fill the cap and
     # hide the future entirely (the "list ends at 8/24" mystery).
-    count_sql = "SELECT COUNT(*) AS n FROM dbo.vw_pc_ship_candidates"
+    count_sql = "SELECT COUNT(*) AS n FROM dbo.vw_pc_ship_candidates c"
     if where:
       count_sql += " WHERE " + " AND ".join(where)
     cursor.execute(count_sql, tuple(args))
     total = (cursor.fetchone() or {}).get('n', len(rows))
+    # Per-flag detail (code + note) for row tooltips — same WHERE, so
+    # the notes describe exactly the rows on screen. One more query,
+    # still ONE round trip for the client.
+    flags_sql = ("SELECT f.nx_order_numb, f.nx_sku, f.flag_code, "
+                 "f.flag_name, f.note "
+                 "FROM dbo.vw_pc_order_flags f "
+                 "JOIN dbo.vw_pc_ship_candidates c "
+                 "ON c.nx_order_numb = f.nx_order_numb "
+                 "AND c.nx_sku = f.nx_sku")
+    if where:
+      flags_sql += " WHERE " + " AND ".join(where)
+    cursor.execute(flags_sql, tuple(args))
+    fmap = {}
+    for fr in cursor.fetchall():
+      fmap.setdefault((fr['nx_order_numb'], fr['nx_sku']), []).append(
+        {'code': fr['flag_code'], 'name': fr['flag_name'],
+         'note': fr['note']})
+    for r in rows:
+      r['flags'] = fmap.get((r['nx_order_numb'], r['nx_sku']), [])
     # Feed freshness for the always-on Orders chip — age computed
     # SERVER-side (GETDATE) so browser clocks can't skew it.
     cursor.execute("""
