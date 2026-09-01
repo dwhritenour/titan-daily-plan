@@ -37,6 +37,12 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     self.lbl_load.tooltip = (f"{item['load_minutes']:,.0f} min total, "
                              f"{item['surcharge_minutes']:,.0f} min surcharge, "
                              f"{item['n_source_rows']} source line(s)")
+    # Tap-to-see for the boards (lbl_load = Link in the designer; a
+    # Label raises ValueError here — swallowed so pre-swap runs clean).
+    try:
+      self.lbl_load.set_event_handler('click', self._show_load_details)
+    except (ValueError, AttributeError):
+      pass
 
     ship_by = item.get('ship_by_date')
     self.lbl_shipby.text = (ship_by or '')[:10]
@@ -108,33 +114,70 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
         self.btn_add_order.set_event_handler(
           'click', lambda **e: on_add_order(self.item))
 
+  # ---------------------------------------------------------------
+  # Tap-to-see popups (the 75" Vibe boards have no hover). Data is
+  # already in the row item — no round trip. Tight line spacing: every
+  # Label gets spacing_above/below 'none'; one line per fact.
+  # ---------------------------------------------------------------
+  @staticmethod
+  def _line(text, size=15, bold=False, color=None):
+    lbl = Label(text=text, font_size=size, bold=bold,
+                spacing_above='none', spacing_below='none')
+    if color:
+      lbl.foreground = color
+    return lbl
+
+  def _popup(self, title, lines):
+    panel = ColumnPanel(spacing_above='none', spacing_below='none')
+    for l in lines:
+      panel.add_component(l)
+    alert(content=panel, title=title, buttons=[('Close', None)],
+          large=False)
+
+  def _headline(self):
+    item = self.item
+    return self._line(f"{item['nx_order_numb']} · "
+                      f"{item.get('sku_desc') or item['nx_sku']}",
+                      size=17, bold=True)
+
   def _show_flag_details(self, **event_args):
-    """Popup with the flag breakdown for this row — data already in
-    hand (no round trip). Fat text for the 75-inch boards."""
     item = self.item
     gated = bool(item.get('is_gated'))
-    panel = ColumnPanel()
-    panel.add_component(Label(
-      text=f"{item['nx_order_numb']} · "
-      f"{item.get('sku_desc') or item['nx_sku']}",
-      bold=True, font_size=18))
-    head = Label(text=self._flag_tip_lines[0], font_size=16)
+    lines = [self._headline()]
+    score_txt = self._flag_tip_lines[0]
     if gated:
-      head.text += '  —  GATED: not plannable as things stand'
-      head.foreground = '#C62828'
-      head.bold = True
-    panel.add_component(head)
+      lines.append(self._line(score_txt + '  —  GATED: not plannable as '
+                              'things stand', bold=True, color='#C62828'))
+    else:
+      lines.append(self._line(score_txt))
     for f in (item.get('flags') or []):
-      lbl = Label(text=f"{f['code']}  {f['name']}", bold=True, font_size=16)
-      if f['code'].startswith('X'):
-        lbl.foreground = '#C62828'
-      panel.add_component(lbl)
-      panel.add_component(Label(text=f['note'] or '', font_size=15))
+      is_gate = f['code'].startswith('X')
+      lines.append(self._line(f"{f['code']}  {f['name']} — {f['note'] or ''}",
+                              bold=is_gate,
+                              color='#C62828' if is_gate else None))
     if item.get('n_class_defaulted'):
-      panel.add_component(Label(
-        text='DEF  classification missing at plan time — charged '
-        'conservative (Special)', foreground='#a16207', font_size=15))
-    if not (item.get('flags') or item.get('n_class_defaulted')):
-      panel.add_component(Label(text='No flags on this line.', font_size=15))
-    alert(content=panel, title='Flags', buttons=[('Close', None)],
-          large=False)
+      lines.append(self._line('DEF  classification missing at plan time — '
+                              'charged conservative (Special)',
+                              color='#a16207'))
+    if len(lines) == 2 and not item.get('flags'):
+      lines.append(self._line('No flags on this line.'))
+    self._popup('Flags', lines)
+
+  def _show_load_details(self, **event_args):
+    """Load (work-inches) breakdown — mirrors the desktop tooltip."""
+    item = self.item
+    mins = float(item.get('load_minutes') or 0)
+    sur = float(item.get('surcharge_minutes') or 0)
+    lines = [self._headline(),
+             self._line(f"{float(item.get('load_inches') or 0):,.1f} work-inches",
+                        size=16, bold=True),
+             self._line(f"{mins:,.0f} min total  ·  {sur:,.0f} min surcharge"),
+             self._line(f"{item.get('n_source_rows') or 0} source line(s)  ·  "
+                        f"qty open {float(item.get('qty_open') or 0):g}  ·  "
+                        f"bucket {item.get('bucket') or '—'}")]
+    if item.get('n_special'):
+      lines.append(self._line(f"{item['n_special']} special line(s)"))
+    if item.get('n_class_defaulted'):
+      lines.append(self._line('DEF  classification missing — charged '
+                              'conservative (Special)', color='#a16207'))
+    self._popup('Load', lines)
