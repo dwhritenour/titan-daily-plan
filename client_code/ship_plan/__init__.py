@@ -18,7 +18,9 @@ class ship_plan(ship_planTemplate):
                     full width — the bar is DRAWN, so it needs no CSS),
                     lbl_crew, lbl_snapshot_warn, lk_overrides
       flow_filters: tb_search, dd_bucket, cb_due_window, cb_special_only,
-                    cb_defaulted_only, lbl_feed_note
+                    cb_defaulted_only, lbl_feed_note,
+                    dd_flag (Flag filter) + btn_flag_legend ('Flag legend')
+                    — both hand-added 2026-09-01, hasattr-guarded
       grids:        rp_candidates (ShipPlanCandidateRow),
                     rp_plan_lines (ShipPlanLineRow), cb_show_removed
       row buttons (hand-added in the designer, hasattr-guarded until
@@ -60,6 +62,15 @@ class ship_plan(ship_planTemplate):
     self.dd_bucket.items = [('All product', None), ('Strainers', 'ST'),
                             ('Zero-touch', 'ZERO'), ('Other', 'OTHER')]
     self.cb_due_window.checked = True
+
+    # --- Flag filter + legend (2026-09-01; designer controls guarded) --
+    self._flag_defs = []
+    if hasattr(self, 'dd_flag'):
+      self.dd_flag.items = self._flag_items()
+      self.dd_flag.selected_value = 'ALL'
+      self.dd_flag.set_event_handler('change', self._filters_changed)
+    if hasattr(self, 'btn_flag_legend'):
+      self.btn_flag_legend.set_event_handler('click', self._show_flag_legend)
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
     # read PLAN_HORIZON_DAYS itself, so a saved change applies on the
@@ -123,10 +134,18 @@ class ship_plan(ship_planTemplate):
       bucket=self.dd_bucket.selected_value,
       due_within_days='auto' if self.cb_due_window.checked else None,
       special_only=self.cb_special_only.checked,
-      defaulted_only=self.cb_defaulted_only.checked)
+      defaulted_only=self.cb_defaulted_only.checked,
+      flag_filter=self._flag_filter())
     if result.get('status') != 'success':
       alert(f"Error loading plan: {result.get('message', 'Unknown error')}")
       return
+    defs = result.get('flag_definitions')
+    if defs is not None and defs != self._flag_defs:
+      self._flag_defs = defs
+      if hasattr(self, 'dd_flag'):
+        keep = self.dd_flag.selected_value
+        self.dd_flag.items = self._flag_items()
+        self.dd_flag.selected_value = keep or 'ALL'
     plan = result['plan']
     self._capacity = plan['capacity']
     self._render_header(plan.get('header'))
@@ -142,7 +161,8 @@ class ship_plan(ship_planTemplate):
       bucket=self.dd_bucket.selected_value,
       due_within_days='auto' if self.cb_due_window.checked else None,
       special_only=self.cb_special_only.checked,
-      defaulted_only=self.cb_defaulted_only.checked)
+      defaulted_only=self.cb_defaulted_only.checked,
+      flag_filter=self._flag_filter())
     if result.get('status') != 'success':
       alert(f"Error loading candidates: {result.get('message')}")
       return
@@ -193,6 +213,81 @@ class ship_plan(ship_planTemplate):
       self.lbl_feed_note.foreground = '#006300'
 
   _filters_changed = refresh_candidates
+
+  # =================================================================
+  # Flag filter + legend (2026-09-01) — both read the LIVE definitions
+  # that ride along with get_day; nothing about flags is hardcoded here.
+  # =================================================================
+  _FLAG_CATS = (('X', 'X — Eligibility gates', '#C62828'),
+                ('A', 'A — Urgency & commitments', None),
+                ('B', 'B — Business value', None),
+                ('C', 'C — Informational context', None))
+
+  def _flag_filter(self):
+    if not hasattr(self, 'dd_flag'):
+      return None
+    v = self.dd_flag.selected_value
+    return None if v in (None, 'ALL') else v
+
+  def _flag_items(self):
+    items = [('All flags', 'ALL'),
+             ('Plannable only (no gate)', 'PLANNABLE'),
+             ('Gated only', 'GATED'),
+             ('Any A — urgency', 'ANY_A'),
+             ('Any B — value', 'ANY_B')]
+    for f in self._flag_defs:
+      if f.get('active') and f.get('category') in ('X', 'A', 'B'):
+        items.append((f"{f['flag_code']}  {f['flag_name']}", f['flag_code']))
+    return items
+
+  @staticmethod
+  def _legend_line(text, size=15, bold=False, color=None):
+    lbl = Label(text=text, font_size=size, bold=bold,
+                spacing_above='none', spacing_below='none')
+    if color:
+      lbl.foreground = color
+    return lbl
+
+  def _show_flag_legend(self, **event_args):
+    """Legend popup — same tight, large-type style as the row popups
+    (the boards have no hover). Inactive rows greyed, never hidden."""
+    defs = self._flag_defs or []
+    panel = ColumnPanel(spacing_above='none', spacing_below='none')
+    panel.add_component(self._legend_line(
+      'Flags — what they mean and how they rank', size=17, bold=True))
+    panel.add_component(self._legend_line(
+      'Gates (X) are filtered out of ranking and shown with their reason. '
+      'Ungated rows rank by the sum of their flag weights, then oldest '
+      'ship-by. Tap a row\'s flags for its own breakdown.', size=13,
+      color='#595959'))
+    for cat, title, color in self._FLAG_CATS:
+      rows = [f for f in defs if f.get('category') == cat]
+      if not rows:
+        continue
+      panel.add_component(self._legend_line(' ', size=6))
+      panel.add_component(self._legend_line(title, size=16, bold=True,
+                                            color=color))
+      for f in rows:
+        active = bool(f.get('active'))
+        txt = f"{f['flag_code']}  {f['flag_name']} — {f.get('description') or ''}"
+        if cat == 'X':
+          txt += '   · gate'
+        elif cat == 'C':
+          glyph = f.get('display_glyph')
+          txt += f"   · shown as {glyph}" if glyph else ''
+        else:
+          txt += f"   · weight {int(f.get('weight') or 0)}"
+          thr = f.get('threshold_value')
+          if thr:
+            txt += f", threshold ${float(thr):,.0f}"
+        if not active:
+          txt += '   (not yet active)'
+        panel.add_component(self._legend_line(
+          txt, bold=(cat == 'X' and active),
+          color='#8a8a8a' if not active
+          else ('#C62828' if cat == 'X' else None)))
+    alert(content=panel, title='Flag legend',
+          buttons=[('Close', None)], large=True)
 
   def _date_changed(self, **event_args):
     self.load_day()

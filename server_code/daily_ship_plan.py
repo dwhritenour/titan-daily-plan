@@ -430,7 +430,7 @@ def ship_plan_get_capacity(plan_date):
 @anvil.server.callable
 def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
                              special_only=False, defaulted_only=False,
-                             limit=1000):
+                             limit=1000, flag_filter=None):
   """Left pane. The already-planned guard lives in the VIEW.
   due_within_days='auto' means: read PLAN_HORIZON_DAYS here, server-side
   — the client computes NOTHING, so the parameter takes effect the
@@ -438,7 +438,11 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
   2026-08-31 flag system (040/041): joined to vw_pc_order_flag_scores —
   each row carries is_gated / gate_codes / priority_score / flag_codes
   plus 'flags' = [{code, name, note}] for tooltips; sort = gated last,
-  then priority_score DESC, then oldest ship-by."""
+  then priority_score DESC, then oldest ship-by.
+  flag_filter (2026-09-01, the single Flag dropdown): None/'ALL' = all;
+  'PLANNABLE' / 'GATED' = by is_gated; 'ANY_A' / 'ANY_B' = carries any
+  flag of that category; or one code ('X03', 'B02') = carries it.
+  Applied server-side so the header count stays honest."""
   conn = get_connection()
   try:
     cursor = conn.cursor()
@@ -478,18 +482,31 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
       where.append("c.n_special > 0")
     if defaulted_only:
       where.append("c.n_class_defaulted > 0")
+    ff = (flag_filter or 'ALL').strip().upper()
+    if ff == 'PLANNABLE':
+      where.append("ISNULL(fs.is_gated, 0) = 0")
+    elif ff == 'GATED':
+      where.append("ISNULL(fs.is_gated, 0) = 1")
+    elif ff in ('ANY_A', 'ANY_B'):
+      # flag_codes is a CSV ('A01,A05,B02'); wrap in commas, LIKE ',A__,'
+      where.append("',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s")
+      args.append('%,' + ff[-1] + '__,%')
+    elif (len(ff) == 3 and ff[0] in 'XABC' and ff[1:].isdigit()):
+      where.append("',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s")
+      args.append('%,' + ff + ',%')
+    # One FROM for all three queries below: the scores join is needed by
+    # the filter, the count and the sort alike.
+    from_sql = ("FROM dbo.vw_pc_ship_candidates c "
+                "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
+                "ON fs.nx_order_numb = c.nx_order_numb "
+                "AND fs.nx_sku = c.nx_sku")
     # Flag system (040/041): the scores view drives eligibility + rank.
     # Gated rows sort LAST (they are the Daily conversation, not the
     # plan); ungated rank by priority_score, then oldest ship-by.
     sql = ("SELECT TOP %d c.*, ISNULL(fs.is_gated, 0) AS is_gated, "
            "fs.gate_codes, "
            "ISNULL(fs.priority_score, 0) AS priority_score, "
-           "fs.flag_codes "
-           "FROM dbo.vw_pc_ship_candidates c "
-           "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
-           "ON fs.nx_order_numb = c.nx_order_numb "
-           "AND fs.nx_sku = c.nx_sku"
-           % max(1, min(int(limit), 1000)))
+           "fs.flag_codes " % max(1, min(int(limit), 1000))) + from_sql
     if where:
       sql += " WHERE " + " AND ".join(where)
     sql += (" ORDER BY is_gated, priority_score DESC, "
@@ -499,7 +516,7 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     # Total matching (pre-TOP) — so truncation is VISIBLE, never silent:
     # with a deep overdue backlog the oldest rows can fill the cap and
     # hide the future entirely (the "list ends at 8/24" mystery).
-    count_sql = "SELECT COUNT(*) AS n FROM dbo.vw_pc_ship_candidates c"
+    count_sql = "SELECT COUNT(*) AS n " + from_sql
     if where:
       count_sql += " WHERE " + " AND ".join(where)
     cursor.execute(count_sql, tuple(args))
@@ -512,7 +529,10 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
                  "FROM dbo.vw_pc_order_flags f "
                  "JOIN dbo.vw_pc_ship_candidates c "
                  "ON c.nx_order_numb = f.nx_order_numb "
-                 "AND c.nx_sku = f.nx_sku")
+                 "AND c.nx_sku = f.nx_sku "
+                 "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
+                 "ON fs.nx_order_numb = c.nx_order_numb "
+                 "AND fs.nx_sku = c.nx_sku")
     if where:
       flags_sql += " WHERE " + " AND ".join(where)
     cursor.execute(flags_sql, tuple(args))
@@ -1197,7 +1217,7 @@ def ship_plan_publish(plan_date):
 @anvil.server.callable
 def ship_plan_get_day(plan_date, search=None, bucket=None,
                       due_within_days=None, special_only=False,
-                      defaulted_only=False):
+                      defaulted_only=False, flag_filter=None):
   """Plan + candidates in ONE round trip. Anvil charges ~1s of transport
   per call regardless of query size, so the form's load path (and every
   dialog-close reload) pays it once, not twice."""
@@ -1207,10 +1227,40 @@ def ship_plan_get_day(plan_date, search=None, bucket=None,
   cands = ship_plan_get_candidates(search=search, bucket=bucket,
                                    due_within_days=due_within_days,
                                    special_only=special_only,
-                                   defaulted_only=defaulted_only)
+                                   defaulted_only=defaulted_only,
+                                   flag_filter=flag_filter)
   if cands.get('status') != 'success':
     return cands
-  return {'status': 'success', 'plan': plan, 'candidates': cands}
+  # Flag definitions ride along (22 tiny rows): the legend popup, the
+  # Flag dropdown items and the How-To all read the SAME live table, so
+  # a weight or threshold change shows up on the next load — no extra
+  # round trip, no hardcoded legend to go stale.
+  defs = ship_plan_get_flag_definitions()
+  return {'status': 'success', 'plan': plan, 'candidates': cands,
+          'flag_definitions': defs.get('definitions', [])}
+
+
+@anvil.server.callable
+def ship_plan_get_flag_definitions():
+  """Live legend source: dbo.pc_flag_definitions (migration 040), all
+  rows incl. inactive Phase-2 ones (shown greyed), category order
+  X, A, B, C then code."""
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT flag_code, category, flag_name, description, weight,
+               threshold_value, is_manual, display_glyph, phase, active
+        FROM dbo.pc_flag_definitions
+        ORDER BY CASE category WHEN 'X' THEN 0 WHEN 'A' THEN 1
+                               WHEN 'B' THEN 2 ELSE 3 END, flag_code
+    """)
+    return {'status': 'success',
+            'definitions': [serialize_row(r) for r in cursor.fetchall()]}
+  except Exception as e:
+    return {'status': 'error', 'message': f'Flag definitions error: {e}'}
+  finally:
+    conn.close()
 
 
 @anvil.server.callable
