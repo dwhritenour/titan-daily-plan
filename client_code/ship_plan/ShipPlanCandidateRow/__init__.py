@@ -16,7 +16,7 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     ⛔ Xnn  = eligibility gate (hold / stock / no-WO) — row not plannable
     A/B    = urgency / value flag codes (flag system 040/041)
     ⚠ DEF  = classification defaulted conservative (PC review — 002_pratik)
-    S      = special elements present
+    S      = non-standard elements present
     Z      = zero-touch (plans free against the cap)
     $      = surcharge applies (SpaceX / Termotran / duplex / mount)
   Tooltip lists priority score + every flag as 'code — note' (desktop).
@@ -53,7 +53,7 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     glyphs = []
     if item.get('n_class_defaulted'):
       glyphs.append('⚠ DEF')
-    if item.get('n_special'):
+    if item.get('n_non_standard'):
       glyphs.append('S')
     if item.get('bucket') == 'ZERO':
       glyphs.append('Z')
@@ -77,7 +77,7 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     tip_lines += [f"{f['code']} — {f['note']}" for f in flag_list]
     if item.get('n_class_defaulted'):
       tip_lines.append('DEF — classification missing at plan time; '
-                       'charged conservative (Special)')
+                       'charged conservative (Non-Standard)')
     self.lbl_flags.tooltip = '\n'.join(tip_lines)
     if item.get('is_gated'):
       # Gated — red (#C62828, light-surface step) + the ⛔ word/glyph,
@@ -157,7 +157,7 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
                               color='#C62828' if is_gate else None))
     if item.get('n_class_defaulted'):
       lines.append(self._line('DEF  classification missing at plan time — '
-                              'charged conservative (Special)',
+                              'charged conservative (Non-Standard)',
                               color='#a16207'))
     if len(lines) == 2 and not item.get('flags'):
       lines.append(self._line('No flags on this line.'))
@@ -175,9 +175,9 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
              self._line(f"{item.get('n_source_rows') or 0} source line(s)  ·  "
                         f"qty open {float(item.get('qty_open') or 0):g}  ·  "
                         f"bucket {item.get('bucket') or '—'}")]
-    if item.get('n_special'):
-      lines.append(self._line(f"{item['n_special']} special line(s)"))
+    if item.get('n_non_standard'):
+      lines.append(self._line(f"{item['n_non_standard']} non-standard line(s)"))
     if item.get('n_class_defaulted'):
       lines.append(self._line('DEF  classification missing — charged '
-                              'conservative (Special)', color='#a16207'))
+                              'conservative (Non-Standard)', color='#a16207'))
     self._popup('Load', lines)

@@ -479,7 +479,7 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
       where.append("c.ship_by_date <= %s")
       args.append(end)
     if special_only:
-      where.append("c.n_special > 0")
+      where.append("c.n_non_standard > 0")
     if defaulted_only:
       where.append("c.n_class_defaulted > 0")
     ff = (flag_filter or 'ALL').strip().upper()
@@ -674,7 +674,7 @@ def _insert_line_and_source(cursor, plan_date, order, sku, rows, agg,
     """, (plan_date, order, sku, r['nx_rel_numb'], r['nx_item_no'],
           r['nx_qty_balance_due'], r['nx_attrib_val'],
           (r['element_class'] if r['element_class'] in
-           ('Standard', 'Special') else 'n/a'),
+           ('Standard', 'Non-Standard') else 'n/a'),
           r['class_was_defaulted'], r['size_inches'], r['minutes_charged']))
 
 
@@ -746,7 +746,7 @@ def ship_plan_add_line(plan_date, order, sku, tier='Next', reason=None):
         """, (plan_date, order, sku, r['nx_rel_numb'], r['nx_item_no'],
               r['nx_qty_balance_due'], r['nx_attrib_val'],
               (r['element_class'] if r['element_class'] in
-               ('Standard', 'Special') else 'n/a'),
+               ('Standard', 'Non-Standard') else 'n/a'),
               r['class_was_defaulted'], r['size_inches'],
               r['minutes_charged']))
     else:
@@ -1154,7 +1154,7 @@ def ship_plan_recalc_line(plan_date, order, sku):
       """, (plan_date, order, sku, r['nx_rel_numb'], r['nx_item_no'],
             r['nx_qty_balance_due'], r['nx_attrib_val'],
             (r['element_class'] if r['element_class'] in
-             ('Standard', 'Special') else 'n/a'),
+             ('Standard', 'Non-Standard') else 'n/a'),
             r['class_was_defaulted'], r['size_inches'], r['minutes_charged']))
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
