@@ -1616,7 +1616,15 @@ def _agent_params(cursor):
   return {'enabled': str(p.get('AGENT_ENABLED', '1')).strip() == '1',
           'fill_pct': max(0.0, min(_f('AGENT_FILL_PCT', 80), 100.0)) / 100.0,
           'stretch_lines': max(0, int(_f('AGENT_STRETCH_LINES', 5))),
-          'horizon_days': max(0, int(_f('PLAN_HORIZON_DAYS', 3)))}
+          'horizon_days': max(0, int(_f('PLAN_HORIZON_DAYS', 3))),
+          # zero-touch lines cost no capacity, so first-fit would propose
+          # EVERY one of them (170 in the horizon on 2026-09-06). The plan
+          # measures assembly; pick-and-ship stays off it unless switched on.
+          'include_zero_touch': str(p.get('AGENT_INCLUDE_ZERO_TOUCH', '0')).strip() == '1',
+          # a single line bigger than this share of the fill target is a
+          # SPLIT decision, not a proposal (first run: one 1,631-in line
+          # took 82% of the day).
+          'max_line_pct': max(1.0, min(_f('AGENT_MAX_LINE_PCT', 50), 100.0)) / 100.0}
 
 
 def _next_business_day(d=None):
@@ -1712,8 +1720,34 @@ def _upsert_proposed_line(cursor, plan_date, order, sku, rows, agg, tier,
   return True
 
 
+@anvil.server.background_task
+def agent_propose_task(plan_date=None, force=False):
+  """Background task wrapper: the fill can take longer than Anvil's 30 s
+  server-call limit (first live run, 2026-09-06: ~1,100 candidates)."""
+  return _agent_propose_impl(plan_date, force)
+
+
 @anvil.server.callable
 def ship_plan_agent_propose(plan_date=None, force=False):
+  """Launch the proposal run in the background; poll with
+  ship_plan_agent_task_status(task_id)."""
+  task = anvil.server.launch_background_task('agent_propose_task',
+                                             plan_date, force)
+  return {'status': 'started', 'task_id': task.get_id()}
+
+
+@anvil.server.callable
+def ship_plan_agent_task_status(task_id):
+  try:
+    t = anvil.server.get_background_task(task_id)
+    if t.is_completed():
+      return {'status': 'done', 'result': t.get_return_value()}
+    return {'status': 'running', 'state': t.get_state() or {}}
+  except Exception as e:
+    return {'status': 'error', 'message': f'{e}'}
+
+
+def _agent_propose_impl(plan_date=None, force=False):
   """Build the agent's proposal for a day (default: next business day).
   Deterministic: ungated candidates within the horizon, in priority order
   (score, oldest ship-by, biggest load); fill Must/Next up to
@@ -1786,34 +1820,57 @@ def ship_plan_agent_propose(plan_date=None, force=False):
     notes = {}
     for r in cursor.fetchall():
       notes.setdefault((r['nx_order_numb'], r['nx_sku']), []).append(r)
+    # All source rows for the horizon in ONE query (per-line view queries
+    # were the 30 s timeout on the first run).
+    cursor.execute("""
+        SELECT * FROM dbo.vw_pc_ship_candidate_rows
+        WHERE CAST(COALESCE(nx_dship_by_date, nx_hship_by_date) AS DATE) <= %s
+    """, (end,))
+    rows_by_key = {}
+    for r in cursor.fetchall():
+      rows_by_key.setdefault((r['nx_order_numb'], r['nx_sku']), []).append(r)
 
     # --- the fill ---------------------------------------------------
     # First-fit in priority order: a line that does not fit is passed
-    # over, never blocks the ones behind it. Oversize = bigger than the
-    # WHOLE day's capacity (seen live: a 1,955-inch gasket order) - it can
-    # never be planned whole, so it is not proposed; the narrative raises
-    # it as a split decision. Stretch = next-best lines that would fit in
-    # the unused reserve if no rush arrives (the reserve is a target, not
-    # a cap) - a line bigger than the slack is not a realistic stretch.
-    picks, stretch, gated, oversize, skipped = [], [], [], [], 0
+    # over, never blocks the ones behind it. SPLIT DECISIONS (not
+    # proposed, raised by the narrative): a line bigger than the whole
+    # day (seen live: 1,955-in gasket lines) or bigger than
+    # AGENT_MAX_LINE_PCT of the fill target (seen live: one 1,631-in line
+    # = 82% of the day). Stretch is decided AFTER the fill, against the
+    # final slack (capacity - used): the next-best deferred lines that
+    # would fit if no rush arrives - the reserve is a target, not a cap.
+    max_line = target * ap['max_line_pct']
+    picks, deferred, gated, split_needed = [], [], [], []
+    skipped_zero = 0
     for c in cands:
       if c.get('is_gated'):
         gated.append(c)
         continue
       load = float(c.get('load_inches') or 0)
       codes = c.get('flag_codes') or ''
-      if load > cap_in + 1e-9:
-        oversize.append(c)
+      if c.get('bucket') == 'ZERO' and not ap['include_zero_touch']:
+        skipped_zero += 1
+        continue
+      if load > cap_in + 1e-9 or load > max_line + 1e-9:
+        c['split_reason'] = ('bigger than the whole day' if load > cap_in
+                             else f"over {int(ap['max_line_pct'] * 100)}% of the fill target")
+        split_needed.append(c)
         continue
       if used + load <= target + 1e-9:
         tier = 'Must' if ('A01' in codes or 'A02' in codes) else 'Next'
         picks.append((c, tier))
         used += load
-      elif (len(stretch) < ap['stretch_lines']
-            and used + load <= cap_in + 1e-9):
-        stretch.append((c, 'Stretch'))
       else:
-        skipped += 1
+        deferred.append(c)
+    slack = cap_in - used
+    stretch = []
+    for c in deferred:
+      if len(stretch) >= ap['stretch_lines']:
+        break
+      if float(c.get('load_inches') or 0) <= slack + 1e-9:
+        stretch.append((c, 'Stretch'))
+    skipped = len(deferred) - len(stretch)
+    oversize = split_needed          # name kept for the response below
 
     # --- record the proposal ----------------------------------------
     cursor.execute("""
@@ -1837,7 +1894,7 @@ def ship_plan_agent_propose(plan_date=None, force=False):
       """, (proposal_id, order, sku, rank, tier,
             float(c.get('load_inches') or 0), int(c.get('priority_score') or 0),
             c.get('gate_codes'), c.get('flag_codes'), reason))
-      rows = _fetch_candidate_rows(cursor, order, sku)
+      rows = rows_by_key.get((order, sku)) or []
       if rows and _upsert_proposed_line(cursor, plan_date, order, sku, rows,
                                         _aggregate(rows), tier, reason, actor):
         n_added += 1
@@ -1861,8 +1918,9 @@ def ship_plan_agent_propose(plan_date=None, force=False):
                      'load_inches': float(o.get('load_inches') or 0),
                      'qty_open': float(o.get('qty_open') or 0),
                      'score': int(o.get('priority_score') or 0),
-                     'ship_by': o.get('ship_by_date'), 'flags': o.get('flag_codes')}
-                    for o in oversize[:10]]
+                     'ship_by': o.get('ship_by_date'), 'flags': o.get('flag_codes'),
+                     'why': o.get('split_reason')}
+                    for o in oversize[:15]]
     snapshot_warning = None
     try:
       _snapshot_flags(cursor, plan_date, -1, weight_set_id)
@@ -1878,7 +1936,9 @@ def ship_plan_agent_propose(plan_date=None, force=False):
             'n_proposed': len(picks), 'n_stretch': len(stretch),
             'n_added_to_plan': n_added, 'n_cleared': n_cleared,
             'n_gated': len(gated), 'n_skipped': skipped,
-            'n_oversize': len(oversize),
+            'n_oversize': len(oversize), 'n_split_needed': len(oversize),
+            'max_line_inches': round(max_line, 1), 'slack_inches': round(slack, 1),
+            'n_zero_touch_skipped': skipped_zero,
             'n_candidates': len(cands), 'horizon_end': end.isoformat(),
             'lines': out_lines, 'gated': gated_out, 'oversize': oversize_out,
             'snapshot_warning': snapshot_warning}
@@ -1889,21 +1949,32 @@ def ship_plan_agent_propose(plan_date=None, force=False):
     conn.close()
 
 
-@anvil.server.http_endpoint('/agent/propose', methods=['POST'])
-def agent_propose_endpoint(**kwargs):
-  """titan-ai-service calls this at AGENT_RUN_TIME. Shared secret
-  AGENT_API_KEY (Anvil Secrets) in the X-Agent-Key header."""
+def _agent_key_ok():
+  """Shared secret AGENT_API_KEY (Anvil Secrets) in the X-Agent-Key header."""
   import anvil.secrets
-  req = anvil.server.request
-  key = (req.headers or {}).get('x-agent-key')
+  key = (anvil.server.request.headers or {}).get('x-agent-key')
   try:
     expected = anvil.secrets.get_secret('AGENT_API_KEY')
   except Exception:
     expected = None
-  if not expected or key != expected:
+  return bool(expected) and key == expected
+
+
+@anvil.server.http_endpoint('/agent/propose', methods=['POST'])
+def agent_propose_endpoint(**kwargs):
+  """titan-ai-service calls this at AGENT_RUN_TIME. Launches the
+  background run and returns its task_id; poll /agent/status."""
+  if not _agent_key_ok():
     return anvil.server.HttpResponse(401, 'unauthorized')
-  body = req.body_json or {}
+  body = anvil.server.request.body_json or {}
   return ship_plan_agent_propose(body.get('plan_date'), bool(body.get('force')))
+
+
+@anvil.server.http_endpoint('/agent/status', methods=['GET'])
+def agent_status_endpoint(task_id=None, **kwargs):
+  if not _agent_key_ok():
+    return anvil.server.HttpResponse(401, 'unauthorized')
+  return ship_plan_agent_task_status(task_id)
 
 
 @anvil.server.callable

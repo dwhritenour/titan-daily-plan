@@ -79,6 +79,7 @@ class ship_plan(ship_planTemplate):
       self.lk_accept_all.set_event_handler('click', self._accept_all_proposed)
       self.lk_accept_all.visible = False
     if hasattr(self, 'lk_run_agent'):
+      self.lk_run_agent.text = 'Run agent'      # code owns the label
       self.lk_run_agent.set_event_handler('click', self._run_agent_now)
       self.lk_run_agent.visible = self.is_pc
 
@@ -876,11 +877,46 @@ class ship_plan(ship_planTemplate):
     service run performs; useful before the service is scheduled and for
     a re-run after a big feed change. Supersedes the earlier proposal but
     keeps anything PC already confirmed."""
+    if getattr(self, '_agent_task_id', None):
+      alert('The agent is already running for this form — give it a moment.')
+      return
     if not confirm(f'Run the agent for {self.plan_date} now? '
                    'Its earlier still-Proposed lines are replaced; '
                    'confirmed lines are kept.'):
       return
     r = anvil.server.call('ship_plan_agent_propose', self.plan_date)
+    if r.get('status') != 'started':
+      alert(r.get('message', 'Could not start the agent'))
+      return
+    # The fill runs as a BACKGROUND TASK (past the 30 s call limit);
+    # poll every 2 s from a code-made Timer, then show the summary.
+    self._agent_task_id = r['task_id']
+    self._agent_polls = 0
+    if hasattr(self, 'lk_run_agent'):
+      self.lk_run_agent.text = 'Agent running…'
+    self._agent_timer = Timer(interval=2)
+    self._agent_timer.set_event_handler('tick', self._agent_poll)
+    self.add_component(self._agent_timer)
+
+  def _agent_poll(self, **event_args):
+    self._agent_polls += 1
+    s = anvil.server.call('ship_plan_agent_task_status', self._agent_task_id)
+    if s.get('status') == 'running' and self._agent_polls < 150:   # 5 min cap
+      return
+    self._agent_timer.interval = 0
+    self._agent_timer.remove_from_parent()
+    self._agent_task_id = None
+    if hasattr(self, 'lk_run_agent'):
+      self.lk_run_agent.text = 'Run agent'
+    if s.get('status') == 'running':
+      alert('The agent is still running after 5 minutes — check the '
+            'Background Tasks log in Anvil.')
+      return
+    if s.get('status') == 'error':
+      alert(s.get('message', 'Agent run failed'))
+      self.load_day()
+      return
+    r = s.get('result') or {}
     if r.get('status') == 'error':
       alert(r.get('message', 'Agent run failed'))
     elif r.get('status') == 'skipped':
@@ -891,7 +927,9 @@ class ship_plan(ship_planTemplate):
              f"target in ({int(float(r.get('fill_pct', 0.8)) * 100)}% of "
              f"{r.get('capacity_inches', 0):,.0f}). "
              f"{r.get('n_gated', 0)} gated, {r.get('n_skipped', 0)} beyond stretch, "
-             f"{r.get('n_oversize', 0)} oversize (bigger than the whole day).")
+             f"{r.get('n_split_needed', 0)} need a split decision (bigger than a day "
+             f"or than {r.get('max_line_inches', 0):,.0f} in), "
+             f"{r.get('n_zero_touch_skipped', 0)} zero-touch left off.")
       if r.get('snapshot_warning'):
         msg += f"\n\nSnapshot warning: {r['snapshot_warning']}"
       alert(msg)
