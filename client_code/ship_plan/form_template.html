@@ -36,13 +36,16 @@
     <anvil-component type="ColumnPanel" name="pnl_body" prop:col_widths='"{\"LFTCOL\":30,\"RGTCOL\":30}"' prop:role="outlined-card" container:grid_position="BDYROW,BDYCOL" container:full_width_row="true">
       <anvil-component type="ColumnPanel" name="pnl_candidates" prop:role="outlined-card" container:grid_position="BODROW,LFTCOL" container:full_width_row="true">
         <anvil-component type="Label" name="lbl_candidates_header" prop:text="UP NEXT — CANDIDATES" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' prop:bold="true" container:grid_position="CANA01,CANB01" container:full_width_row="true"></anvil-component>
+        <anvil-component type="FlowPanel" name="fp_notes" prop:spacing='{"margin":["8",null,"8",null]}' container:grid_position="BMKTZA,VEGEUL" container:full_width_row="true">
+          <anvil-component type="Label" name="lb_notes" prop:text="Check AI Agent's proposed plan for a good starting pont." prop:bold="true" prop:italic="true" prop:font_size="null" prop:align="left" prop:foreground="#674fa4" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}'></anvil-component>
+        </anvil-component>
         <anvil-component type="DataGrid" name="dg_candidates" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="true" prop:columns='[{"id":"order","title":"Order","data_key":"order","width":"80"},{"id":"item","title":"Item","data_key":"item"},{"id":"qty","title":"Qty","data_key":"qty","width":60},{"id":"ship_by","title":"Ship By","data_key":"ship_by","width":"100"},{"id":"load","title":"Load","data_key":"load","width":"70"},{"id":"flags","title":"Flags","data_key":"flags","width":"160"},{"id":"add","title":"Add","data_key":"add","width":"90"}]' container:grid_position="CANA02,CANB02" container:full_width_row="true">
           <anvil-component type="RepeatingPanel" name="rp_candidates" prop:item_template="Titan_Daily_Plan.ship_plan.ShipPlanCandidateRow" prop:margin='["0",null,"0",null]' container:pinned="false"></anvil-component>
         </anvil-component>
       </anvil-component>
       <anvil-component type="ColumnPanel" name="pnl_plan" prop:role="outlined-card" container:grid_position="BODROW,RGTCOL">
         <anvil-component type="Label" name="lbl_plan_header" prop:text="THIS DAY'S PLAN" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="PLNA01,PLNB01" container:full_width_row="true"></anvil-component>
-        <anvil-component type="FlowPanel" name="fp_actions" prop:align="left" container:grid_position="XOVZVS,AQEODQ" container:full_width_row="true">
+        <anvil-component type="FlowPanel" name="fp_actions" prop:align="left" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="XOVZVS,AQEODQ" container:full_width_row="true">
           <anvil-component type="Link" name="lk_proposal" prop:spacing='{"margin":["0",null,"0",null]}' prop:bold="true"></anvil-component>
           <anvil-component type="Link" name="lk_accept_all" prop:spacing='{"margin":["0",null,"0",null]}' prop:bold="true"></anvil-component>
           <anvil-component type="Link" name="lk_run_agent" prop:spacing='{"margin":["0",null,"0",null]}' prop:text="Run AI Agent" prop:bold="true"></anvil-component>
