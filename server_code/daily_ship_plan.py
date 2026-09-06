@@ -1970,11 +1970,21 @@ def agent_propose_endpoint(**kwargs):
   return ship_plan_agent_propose(body.get('plan_date'), bool(body.get('force')))
 
 
+def _jsonable(v):
+  """Deep make_serializable — HTTP endpoints return JSON, and the task
+  result carries dates (ship_by) and Decimals."""
+  if isinstance(v, dict):
+    return {k: _jsonable(x) for k, x in v.items()}
+  if isinstance(v, (list, tuple)):
+    return [_jsonable(x) for x in v]
+  return make_serializable(v)
+
+
 @anvil.server.http_endpoint('/agent/status', methods=['GET'])
 def agent_status_endpoint(task_id=None, **kwargs):
   if not _agent_key_ok():
     return anvil.server.HttpResponse(401, 'unauthorized')
-  return ship_plan_agent_task_status(task_id)
+  return _jsonable(ship_plan_agent_task_status(task_id))
 
 
 @anvil.server.callable
