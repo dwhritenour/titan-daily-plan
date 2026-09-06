@@ -52,6 +52,8 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
                     else f"{reason_txt} — {note}" if reason_txt else note)
     if reason_txt:
       sub += f"  · {reason_txt}"
+    if status == 'Proposed' and item.get('proposed_by') == 'agent':
+      sub = 'AGENT PROPOSED  · ' + sub      # word, not just the blue chip
     self.lbl_sub.text = sub
     self.lbl_qty.text = f"{float(item['qty_planned']):g}"
     self.lbl_shipby.text = (item.get('ship_by_date') or '')[:10]
@@ -116,3 +118,12 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
       if on_priority:
         self.btn_priority.set_event_handler(
           'click', lambda **e: on_priority(self.item))
+
+    # btn_confirm ('✓') is hand-added in the designer — guarded. Visible
+    # only on Proposed lines for PC: one tap = Proposed -> Planned.
+    on_confirm = item.get('on_confirm')
+    if hasattr(self, 'btn_confirm'):
+      self.btn_confirm.visible = bool(on_confirm) and status == 'Proposed'
+      if on_confirm:
+        self.btn_confirm.set_event_handler(
+          'click', lambda **e: on_confirm(self.item))

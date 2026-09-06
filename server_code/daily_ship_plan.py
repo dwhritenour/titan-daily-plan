@@ -310,15 +310,20 @@ def _get_active_weights(cursor):
 # CAPACITY
 # =============================================================================
 
-def _capacity_for(cursor, plan_date):
+def _capacity_for(cursor, plan_date, prefer_estimate=False):
   """Capacity dict for a date. Today = vw_pc_capacity_day (the 08:45
   snapshot + overrides). Future = same formula with crew estimated as the
   full active roster, adjusted by that date's overrides — is_estimate=True
-  so the bar renders hollow."""
+  so the bar renders hollow.
+  prefer_estimate (agent, 06:30 — before the attendance snapshot loads):
+  use the view only when its snapshot IS the plan date; otherwise the
+  roster estimate with that date's overrides, never yesterday's crew."""
   today = date.today()
   if plan_date <= today:
     cursor.execute("SELECT * FROM dbo.vw_pc_capacity_day")
     row = cursor.fetchone()
+    if row and prefer_estimate and row['snapshot_date'] != plan_date:
+      row = None            # stale for the agent's purpose — fall through
     if row:
       out = serialize_row(row)
       out['is_estimate'] = False
@@ -612,12 +617,24 @@ def ship_plan_get_plan(plan_date):
     stretch_total = sum(float(l['load_inches']) for l in lines
                         if l['line_status'] in _COUNTS_AGAINST_CAP
                         and l.get('tier') == 'Stretch')
+    cursor.execute("""
+        SELECT TOP 1 proposal_id, status, generated_at, agent_version,
+               capacity_inches, proposed_inches, rationale,
+               (SELECT COUNT(*) FROM dbo.pc_agent_proposal_line l
+                WHERE l.proposal_id = p.proposal_id AND l.rank_no > 0) AS n_lines
+        FROM dbo.pc_agent_proposal p
+        WHERE plan_date = %s ORDER BY generated_at DESC
+    """, (plan_date,))
+    prop = cursor.fetchone()
+    n_proposed_open = sum(1 for l in lines if l['line_status'] == 'Proposed')
     return {'status': 'success',
             'header': serialize_row(header) if header else None,
             'lines': lines,
             'planned_inches': round(planned_total, 1),
             'stretch_inches': round(stretch_total, 1),
-            'capacity': _capacity_for(cursor, plan_date)}
+            'capacity': _capacity_for(cursor, plan_date),
+            'proposal': serialize_row(prop) if prop else None,
+            'n_proposed_open': n_proposed_open}
   except Exception as e:
     return {'status': 'error', 'message': f'Plan load error: {e}'}
   finally:
@@ -1258,6 +1275,7 @@ def ship_plan_publish(plan_date):
           actor, plan_date))
     if cursor.rowcount == 0:
       return {'status': 'error', 'message': 'No plan exists for that day yet.'}
+    proposal_outcome = _settle_proposal_outcomes(cursor, plan_date, actor)
     _log_event(cursor, plan_date, None, None, 'Published',
                new_value=f"capacity {cap['capacity_inches_effective']:.0f} in",
                actor=actor, note=cap['capacity_detail'][:500])
@@ -1277,10 +1295,12 @@ def ship_plan_publish(plan_date):
     n = _snapshot_flags(cursor, plan_date, int(row.get('revision_no') or 0),
                         row.get('weight_set_id'))
     conn.commit()
-    return {'status': 'success', 'capacity': cap, 'snapshot_rows': n}
+    return {'status': 'success', 'capacity': cap, 'snapshot_rows': n,
+            'proposal_outcome': proposal_outcome}
   except Exception as e:
     conn.rollback()
     return {'status': 'success', 'capacity': cap,
+            'proposal_outcome': proposal_outcome,
             'snapshot_warning': f'Published, but the flag snapshot failed: {e}'}
   finally:
     conn.close()
@@ -1564,6 +1584,487 @@ def ship_plan_get_events(plan_date, limit=100):
     """ % max(1, min(int(limit), 500)), (plan_date,))
     return {'status': 'success',
             'events': [serialize_row(r) for r in cursor.fetchall()]}
+  except Exception as e:
+    return {'status': 'error', 'message': f'{e}'}
+  finally:
+    conn.close()
+
+
+# =============================================================================
+# AI AGENT — PROPOSAL ENGINE  (Operating Cycle steps 2-3; migrations 051/052)
+# =============================================================================
+# The agent is "just another proposer": it adds the day's picks as Proposed
+# lines (proposed_by='agent', added_by_role='Agent') that PC confirms or
+# drops in the pane they already use. The pick is DETERMINISTIC — score
+# order, tier rule, fill to AGENT_FILL_PCT of capacity, then a Stretch tail —
+# so it is explainable line by line. The model (titan-ai-service) never
+# chooses lines; it writes the narrative on top (pc_agent_proposal.rationale)
+# and sends the SMS. v1 authority: recommend, record, ask. Nothing here
+# publishes, approves, or touches e21.
+
+_AGENT_ACTOR = 'agent'
+_AGENT_VERSION = 'v1.0'
+
+
+def _agent_params(cursor):
+  p = _get_params(cursor)
+  def _f(k, d):
+    try:
+      return float(p.get(k, d))
+    except (TypeError, ValueError):
+      return float(d)
+  return {'enabled': str(p.get('AGENT_ENABLED', '1')).strip() == '1',
+          'fill_pct': max(0.0, min(_f('AGENT_FILL_PCT', 80), 100.0)) / 100.0,
+          'stretch_lines': max(0, int(_f('AGENT_STRETCH_LINES', 5))),
+          'horizon_days': max(0, int(_f('PLAN_HORIZON_DAYS', 3)))}
+
+
+def _next_business_day(d=None):
+  d = d or date.today()
+  while d.weekday() >= 5:
+    d += timedelta(days=1)
+  return d
+
+
+def _horizon_end(days):
+  """Same BUSINESS-day walk as the candidates pane (2026-08-27 lesson)."""
+  end, added = date.today(), 0
+  while added < int(days):
+    end += timedelta(days=1)
+    if end.weekday() < 5:
+      added += 1
+  return end
+
+
+_REASON_WORDS = {   # short words for the reason line; notes carry detail
+  'A01': 'late', 'A02': 'due now', 'A03': 'LD/freight', 'A04': 'rush',
+  'A05': 'expedited', 'A06': 'must start', 'A07': 'carrier cutoff',
+  'B01': 'strategic', 'B02': 'high $', 'B04': 'completes order',
+  'B05': 'consolidates', 'B06': 'new customer', 'B07': 'bumped before',
+  'E01': 'exception',
+}
+
+
+def _agent_reason(c, tier, notes):
+  """One line PC reads on the row: tier, why (flag notes), load."""
+  why = []
+  for n in notes:
+    code = n['flag_code']
+    if code[:1] in ('A', 'B', 'E'):
+      why.append(n['note'] or _REASON_WORDS.get(code, code))
+  if not why:
+    why = ['within horizon, by score']
+  txt = f"{tier}: " + '; '.join(why)
+  txt += f" — {float(c.get('load_inches') or 0):,.1f} in, score {int(c.get('priority_score') or 0)}"
+  return txt[:500]
+
+
+def _upsert_proposed_line(cursor, plan_date, order, sku, rows, agg, tier,
+                          reason, actor):
+  """Insert (or revive a Removed) line as Proposed by the agent. Returns
+  False if PC already has the line active — the proposal records it, the
+  plan is left alone."""
+  cursor.execute("""
+      SELECT line_status FROM dbo.pc_ship_plan_line
+      WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+  """, (plan_date, order, sku))
+  ex = cursor.fetchone()
+  if ex and ex['line_status'] in _ACTIVE_STATUSES:
+    return False
+  if ex:   # Removed earlier today — revive under the PK
+    cursor.execute("""
+        DELETE FROM dbo.pc_ship_plan_line_source
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+    """, (plan_date, order, sku))
+    cursor.execute("""
+        UPDATE dbo.pc_ship_plan_line
+        SET qty_planned = %s, ship_by_date = %s, shipto_code = %s,
+            carrier = %s, load_inches = %s, load_minutes = %s,
+            surcharge_minutes = %s, line_status = 'Proposed',
+            added_by_role = 'Agent', tier = %s, priority_reason = NULL,
+            priority_note = %s, proposed_by = %s, snooze_to_date = NULL,
+            updated_by = %s, updated_at = GETDATE()
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+    """, (agg['qty'], agg['ship_by'], agg['shipto'], agg['carrier'],
+          agg['inches'], agg['minutes'], agg['surcharge'],
+          tier, reason, actor, actor, plan_date, order, sku))
+    for r in rows:
+      cursor.execute("""
+          INSERT INTO dbo.pc_ship_plan_line_source
+              (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
+               qty_balance, nx_attrib_val, element_class_used,
+               class_was_defaulted, size_inches, minutes_charged)
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+      """, (plan_date, order, sku, r['nx_rel_numb'], r['nx_item_no'],
+            r['nx_qty_balance_due'], r['nx_attrib_val'],
+            (r['element_class'] if r['element_class'] in
+             ('Standard', 'Non-Standard') else 'n/a'),
+            r['class_was_defaulted'], r['size_inches'],
+            r['minutes_charged']))
+  else:
+    _insert_line_and_source(cursor, plan_date, order, sku, rows, agg,
+                            role='Agent', actor=actor, tier=tier, reason=None)
+    cursor.execute("""
+        UPDATE dbo.pc_ship_plan_line
+        SET line_status = 'Proposed', proposed_by = %s, priority_note = %s
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+    """, (actor, reason, plan_date, order, sku))
+  return True
+
+
+@anvil.server.callable
+def ship_plan_agent_propose(plan_date=None, force=False):
+  """Build the agent's proposal for a day (default: next business day).
+  Deterministic: ungated candidates within the horizon, in priority order
+  (score, oldest ship-by, biggest load); fill Must/Next up to
+  AGENT_FILL_PCT of capacity ON TOP of whatever PC already planned; then
+  AGENT_STRETCH_LINES more as Stretch (outside the cap by definition).
+  Tier rule: Must = late (A01) or due today/tomorrow (A02); else Next.
+  Re-running supersedes the earlier proposal and clears ONLY its
+  still-Proposed lines — anything PC confirmed stays and counts.
+  Refuses a Published day unless force. Takes a proposal-time flag
+  snapshot under revision_no = -1 (publish uses 0+)."""
+  actor = _AGENT_ACTOR
+  plan_date = _parse_date(plan_date) if plan_date else _next_business_day()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    ap = _agent_params(cursor)
+    if not ap['enabled'] and not force:
+      return {'status': 'skipped', 'message': 'AGENT_ENABLED is 0.'}
+    cursor.execute("SELECT plan_status, weight_set_id FROM dbo.pc_ship_plan "
+                   "WHERE plan_date = %s", (plan_date,))
+    hdr = cursor.fetchone()
+    if hdr and hdr['plan_status'] == 'Published' and not force:
+      return {'status': 'skipped',
+              'message': f'{plan_date} is already published.'}
+    _ensure_header(cursor, plan_date, actor)
+    cursor.execute("SELECT weight_set_id FROM dbo.pc_ship_plan "
+                   "WHERE plan_date = %s", (plan_date,))
+    weight_set_id = (cursor.fetchone() or {}).get('weight_set_id')
+
+    # --- supersede an earlier run: its untouched Proposed lines go ----
+    cursor.execute("""
+        UPDATE dbo.pc_agent_proposal SET status = 'SUPERSEDED'
+        WHERE plan_date = %s AND status = 'PROPOSED'
+    """, (plan_date,))
+    cursor.execute("""
+        UPDATE dbo.pc_ship_plan_line
+        SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
+        WHERE plan_date = %s AND line_status = 'Proposed' AND proposed_by = %s
+    """, (actor, plan_date, actor))
+    n_cleared = cursor.rowcount
+
+    # --- capacity + what PC already planned --------------------------
+    cap = _capacity_for(cursor, plan_date, prefer_estimate=True)
+    cap_in = float(cap.get('capacity_inches_effective') or 0)
+    target = cap_in * ap['fill_pct']
+    used = float(_planned_inches(cursor, plan_date) or 0)
+    already_in = used
+
+    # --- candidates in the horizon, ranked exactly like the pane -----
+    end = _horizon_end(ap['horizon_days'])
+    cursor.execute("""
+        SELECT c.*, ISNULL(fs.is_gated, 0) AS is_gated, fs.gate_codes,
+               ISNULL(fs.priority_score, 0) AS priority_score, fs.flag_codes
+        FROM dbo.vw_pc_ship_candidates c
+        LEFT JOIN dbo.vw_pc_order_flag_scores fs
+               ON fs.nx_order_numb = c.nx_order_numb AND fs.nx_sku = c.nx_sku
+        WHERE c.ship_by_date <= %s
+        ORDER BY ISNULL(fs.is_gated, 0), ISNULL(fs.priority_score, 0) DESC,
+                 c.ship_by_date, c.load_inches DESC
+    """, (end,))
+    cands = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT f.nx_order_numb, f.nx_sku, f.flag_code, f.note
+        FROM dbo.vw_pc_order_flags f
+        JOIN dbo.vw_pc_ship_candidates c
+          ON c.nx_order_numb = f.nx_order_numb AND c.nx_sku = f.nx_sku
+        WHERE c.ship_by_date <= %s
+        ORDER BY f.flag_code
+    """, (end,))
+    notes = {}
+    for r in cursor.fetchall():
+      notes.setdefault((r['nx_order_numb'], r['nx_sku']), []).append(r)
+
+    # --- the fill ---------------------------------------------------
+    # First-fit in priority order: a line that does not fit is passed
+    # over, never blocks the ones behind it. Oversize = bigger than the
+    # WHOLE day's capacity (seen live: a 1,955-inch gasket order) - it can
+    # never be planned whole, so it is not proposed; the narrative raises
+    # it as a split decision. Stretch = next-best lines that would fit in
+    # the unused reserve if no rush arrives (the reserve is a target, not
+    # a cap) - a line bigger than the slack is not a realistic stretch.
+    picks, stretch, gated, oversize, skipped = [], [], [], [], 0
+    for c in cands:
+      if c.get('is_gated'):
+        gated.append(c)
+        continue
+      load = float(c.get('load_inches') or 0)
+      codes = c.get('flag_codes') or ''
+      if load > cap_in + 1e-9:
+        oversize.append(c)
+        continue
+      if used + load <= target + 1e-9:
+        tier = 'Must' if ('A01' in codes or 'A02' in codes) else 'Next'
+        picks.append((c, tier))
+        used += load
+      elif (len(stretch) < ap['stretch_lines']
+            and used + load <= cap_in + 1e-9):
+        stretch.append((c, 'Stretch'))
+      else:
+        skipped += 1
+
+    # --- record the proposal ----------------------------------------
+    cursor.execute("""
+        INSERT INTO dbo.pc_agent_proposal
+            (plan_date, agent_version, capacity_inches, proposed_inches, status)
+        OUTPUT INSERTED.proposal_id
+        VALUES (%s, %s, %s, %s, 'PROPOSED')
+    """, (plan_date, _AGENT_VERSION, round(cap_in, 1), round(used, 1)))
+    proposal_id = cursor.fetchone()['proposal_id']
+
+    out_lines, rank, n_added = [], 0, 0
+    for c, tier in picks + stretch:
+      rank += 1
+      order, sku = c['nx_order_numb'], c['nx_sku']
+      reason = _agent_reason(c, tier, notes.get((order, sku), []))
+      cursor.execute("""
+          INSERT INTO dbo.pc_agent_proposal_line
+              (proposal_id, nx_order_numb, nx_sku, rank_no, proposed_tier,
+               load_inches, priority_score, gate_codes, flag_codes, reason)
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+      """, (proposal_id, order, sku, rank, tier,
+            float(c.get('load_inches') or 0), int(c.get('priority_score') or 0),
+            c.get('gate_codes'), c.get('flag_codes'), reason))
+      rows = _fetch_candidate_rows(cursor, order, sku)
+      if rows and _upsert_proposed_line(cursor, plan_date, order, sku, rows,
+                                        _aggregate(rows), tier, reason, actor):
+        n_added += 1
+        _log_event(cursor, plan_date, order, sku, 'Proposed',
+                   new_value=tier, actor=actor, note=reason)
+      out_lines.append({'rank': rank, 'order': order, 'sku': sku,
+                        'desc': c.get('sku_desc'), 'shipto': c.get('shipto_code'),
+                        'tier': tier, 'load_inches': float(c.get('load_inches') or 0),
+                        'ship_by': c.get('ship_by_date'),
+                        'score': int(c.get('priority_score') or 0),
+                        'flags': c.get('flag_codes'), 'reason': reason})
+
+    gated_out = [{'order': g['nx_order_numb'], 'sku': g['nx_sku'],
+                  'gates': g.get('gate_codes'), 'score': int(g.get('priority_score') or 0),
+                  'ship_by': g.get('ship_by_date'),
+                  'notes': [n['note'] for n in notes.get((g['nx_order_numb'], g['nx_sku']), [])
+                            if (n['flag_code'] or '')[:1] == 'X']}
+                 for g in gated[:25]]
+
+    oversize_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
+                     'load_inches': float(o.get('load_inches') or 0),
+                     'qty_open': float(o.get('qty_open') or 0),
+                     'score': int(o.get('priority_score') or 0),
+                     'ship_by': o.get('ship_by_date'), 'flags': o.get('flag_codes')}
+                    for o in oversize[:10]]
+    snapshot_warning = None
+    try:
+      _snapshot_flags(cursor, plan_date, -1, weight_set_id)
+    except Exception as e:      # history must never block the proposal
+      snapshot_warning = str(e)
+    conn.commit()
+    return {'status': 'success', 'proposal_id': proposal_id,
+            'plan_date': plan_date.isoformat(),
+            'capacity': cap, 'capacity_inches': round(cap_in, 1),
+            'fill_pct': ap['fill_pct'], 'target_inches': round(target, 1),
+            'already_planned_inches': round(already_in, 1),
+            'proposed_inches': round(used, 1),
+            'n_proposed': len(picks), 'n_stretch': len(stretch),
+            'n_added_to_plan': n_added, 'n_cleared': n_cleared,
+            'n_gated': len(gated), 'n_skipped': skipped,
+            'n_oversize': len(oversize),
+            'n_candidates': len(cands), 'horizon_end': end.isoformat(),
+            'lines': out_lines, 'gated': gated_out, 'oversize': oversize_out,
+            'snapshot_warning': snapshot_warning}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Agent propose failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.http_endpoint('/agent/propose', methods=['POST'])
+def agent_propose_endpoint(**kwargs):
+  """titan-ai-service calls this at AGENT_RUN_TIME. Shared secret
+  AGENT_API_KEY (Anvil Secrets) in the X-Agent-Key header."""
+  import anvil.secrets
+  req = anvil.server.request
+  key = (req.headers or {}).get('x-agent-key')
+  try:
+    expected = anvil.secrets.get_secret('AGENT_API_KEY')
+  except Exception:
+    expected = None
+  if not expected or key != expected:
+    return anvil.server.HttpResponse(401, 'unauthorized')
+  body = req.body_json or {}
+  return ship_plan_agent_propose(body.get('plan_date'), bool(body.get('force')))
+
+
+@anvil.server.callable
+def ship_plan_confirm_line(plan_date, order, sku):
+  """PC accepts one Proposed line: it becomes Planned, tier unchanged."""
+  plan_date = _parse_date(plan_date)
+  actor = _current_actor()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE dbo.pc_ship_plan_line
+        SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+          AND line_status = 'Proposed'
+    """, (actor, plan_date, order, sku))
+    if cursor.rowcount == 0:
+      return {'status': 'error', 'message': 'Line is not Proposed.'}
+    _log_event(cursor, plan_date, order, sku, 'Confirmed', actor=actor)
+    _bump_revision(cursor, plan_date, actor)
+    conn.commit()
+    return {'status': 'success'}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Confirm failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def ship_plan_confirm_all_proposed(plan_date):
+  """PC accepts every Proposed line on the day in one go."""
+  plan_date = _parse_date(plan_date)
+  actor = _current_actor()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT nx_order_numb, nx_sku FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND line_status = 'Proposed'
+    """, (plan_date,))
+    todo = cursor.fetchall()
+    for r in todo:
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+            AND line_status = 'Proposed'
+      """, (actor, plan_date, r['nx_order_numb'], r['nx_sku']))
+      _log_event(cursor, plan_date, r['nx_order_numb'], r['nx_sku'],
+                 'Confirmed', actor=actor, note='accept all')
+    if todo:
+      _bump_revision(cursor, plan_date, actor)
+    conn.commit()
+    return {'status': 'success', 'confirmed': len(todo)}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Confirm-all failed: {e}'}
+  finally:
+    conn.close()
+
+
+def _settle_proposal_outcomes(cursor, plan_date, actor):
+  """At publish: auto-confirm any line still Proposed (publishing IS the
+  acceptance), then score the latest proposal line by line —
+  KEPT / RETIERED / DROPPED, plus ADDED_BY_PC for plan lines the agent
+  did not propose. Proposal status: ACCEPTED (all kept, nothing added),
+  MODIFIED, or REJECTED (nothing kept). This is the hit-rate record."""
+  cursor.execute("""
+      SELECT nx_order_numb, nx_sku FROM dbo.pc_ship_plan_line
+      WHERE plan_date = %s AND line_status = 'Proposed'
+  """, (plan_date,))
+  for r in cursor.fetchall():
+    cursor.execute("""
+        UPDATE dbo.pc_ship_plan_line
+        SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+    """, (actor, plan_date, r['nx_order_numb'], r['nx_sku']))
+    _log_event(cursor, plan_date, r['nx_order_numb'], r['nx_sku'],
+               'Confirmed', actor=actor, note='auto-confirmed at publish')
+  cursor.execute("""
+      SELECT TOP 1 proposal_id FROM dbo.pc_agent_proposal
+      WHERE plan_date = %s AND status = 'PROPOSED'
+      ORDER BY generated_at DESC
+  """, (plan_date,))
+  prop = cursor.fetchone()
+  if not prop:
+    return None
+  pid = prop['proposal_id']
+  cursor.execute("""
+      SELECT nx_order_numb, nx_sku, tier, line_status
+      FROM dbo.pc_ship_plan_line WHERE plan_date = %s
+  """, (plan_date,))
+  plan = {(r['nx_order_numb'], r['nx_sku']): r for r in cursor.fetchall()}
+  cursor.execute("""
+      SELECT nx_order_numb, nx_sku, proposed_tier
+      FROM dbo.pc_agent_proposal_line WHERE proposal_id = %s
+  """, (pid,))
+  kept = retiered = dropped = 0
+  proposed_keys = set()
+  for r in cursor.fetchall():
+    key = (r['nx_order_numb'], r['nx_sku'])
+    proposed_keys.add(key)
+    pl = plan.get(key)
+    if pl and pl['line_status'] in _COUNTS_AGAINST_CAP:
+      outcome = 'KEPT' if pl['tier'] == r['proposed_tier'] else 'RETIERED'
+      kept += outcome == 'KEPT'
+      retiered += outcome == 'RETIERED'
+    else:
+      outcome, dropped = 'DROPPED', dropped + 1
+    cursor.execute("""
+        UPDATE dbo.pc_agent_proposal_line SET outcome = %s
+        WHERE proposal_id = %s AND nx_order_numb = %s AND nx_sku = %s
+    """, (outcome, pid, key[0], key[1]))
+  added = 0
+  for key, pl in plan.items():
+    if key in proposed_keys or pl['line_status'] not in _COUNTS_AGAINST_CAP:
+      continue
+    added += 1
+    cursor.execute("""
+        INSERT INTO dbo.pc_agent_proposal_line
+            (proposal_id, nx_order_numb, nx_sku, rank_no, proposed_tier,
+             reason, outcome)
+        VALUES (%s, %s, %s, 0, %s, 'not proposed by the agent', 'ADDED_BY_PC')
+    """, (pid, key[0], key[1], pl['tier'] or 'Next'))
+  if kept + retiered == 0:
+    status = 'REJECTED'
+  elif dropped == 0 and retiered == 0 and added == 0:
+    status = 'ACCEPTED'
+  else:
+    status = 'MODIFIED'
+  cursor.execute("""
+      UPDATE dbo.pc_agent_proposal
+      SET status = %s, reviewed_by = %s, reviewed_at = GETDATE()
+      WHERE proposal_id = %s
+  """, (status, actor, pid))
+  return {'proposal_id': pid, 'status': status, 'kept': kept,
+          'retiered': retiered, 'dropped': dropped, 'added_by_pc': added}
+
+
+@anvil.server.callable
+def ship_plan_get_proposal(plan_date):
+  """Latest proposal for the day (any status) — header + lines, for the
+  'Agent proposal' popup and the retro."""
+  plan_date = _parse_date(plan_date)
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT TOP 1 * FROM dbo.pc_agent_proposal
+        WHERE plan_date = %s ORDER BY generated_at DESC
+    """, (plan_date,))
+    hdr = cursor.fetchone()
+    if not hdr:
+      return {'status': 'success', 'proposal': None, 'lines': []}
+    cursor.execute("""
+        SELECT * FROM dbo.pc_agent_proposal_line
+        WHERE proposal_id = %s ORDER BY rank_no
+    """, (hdr['proposal_id'],))
+    return {'status': 'success', 'proposal': serialize_row(hdr),
+            'lines': [serialize_row(r) for r in cursor.fetchall()]}
   except Exception as e:
     return {'status': 'error', 'message': f'{e}'}
   finally:

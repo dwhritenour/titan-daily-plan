@@ -10,6 +10,10 @@ runtime_options:
   server_spec: {base: python310-minimal}
   version: 3
 secrets:
+  AGENT_API_KEY:
+    type: secret
+    value:
+      BQADJ4QSVTTRO7VT: {? '' : VdfciA3gPSF3+KQGPGVcxTS2VikFgKSsym7ViGP3c2tKmN+9ptU2/9mSvtgV6x9AVFibvhZWC7uzha1DLWNN8vBAh+LRao9LoMwTVaYnG3f3d8TwQzZgdb8KN6glhsrk8XgKbh5pvPh7KbRjMjAk1nSajuR0HTXwQoyvR5SUxHb/dS70dXSFtaBpCI+IcUiS636xvnRvZecF2Oq0zg0=}
   NEXUS_DATABASE:
     type: secret
     value: {BQADJ4QSVTTRO7VT: 32ioKJUEHcII0J1eGqQ/r/D46sic3hxI0DtBu3hX4XrAYiaZjIpxfP2Qrd7Lf4aYqHJvTQyo7dmdgvH/lruw0LKPLHYmY0hPbUJmfXBBRfCQCVa1FqV54VoXmSiVj/Qm5uHd/g==}

@@ -71,6 +71,16 @@ class ship_plan(ship_planTemplate):
       self.dd_flag.set_event_handler('change', self._filters_changed)
     if hasattr(self, 'btn_flag_legend'):
       self.btn_flag_legend.set_event_handler('click', self._show_flag_legend)
+    # --- AI agent (proposal engine, 051/052; designer links guarded) ---
+    self._proposal = None
+    if hasattr(self, 'lk_proposal'):
+      self.lk_proposal.set_event_handler('click', self._show_proposal)
+    if hasattr(self, 'lk_accept_all'):
+      self.lk_accept_all.set_event_handler('click', self._accept_all_proposed)
+      self.lk_accept_all.visible = False
+    if hasattr(self, 'lk_run_agent'):
+      self.lk_run_agent.set_event_handler('click', self._run_agent_now)
+      self.lk_run_agent.visible = self.is_pc
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
     # read PLAN_HORIZON_DAYS itself, so a saved change applies on the
@@ -152,6 +162,7 @@ class ship_plan(ship_planTemplate):
     self._render_capacity(plan['planned_inches'],
                           plan.get('stretch_inches', 0))
     self._render_lines(plan['lines'])
+    self._render_proposal(plan)
     self._render_candidates(result['candidates'])
 
   def refresh_candidates(self, **event_args):
@@ -535,9 +546,10 @@ class ship_plan(ship_planTemplate):
         it['on_snooze'] = self._snooze_line
         it['on_remove'] = self._remove_line
         it['on_priority'] = self._priority_dialog
+        it['on_confirm'] = self._confirm_line
       else:
         it['on_recalc'] = it['on_snooze'] = it['on_remove'] = None
-        it['on_priority'] = None
+        it['on_priority'] = it['on_confirm'] = None
     self.rp_plan_lines.items = shown
 
   # =================================================================
@@ -774,3 +786,113 @@ class ship_plan(ship_planTemplate):
     self._render_capacity(result['planned_inches'],
                           result.get('stretch_inches', 0))
     self._render_lines(result['lines'])
+
+  # =================================================================
+  # AI agent — proposal (051/052). The agent is another proposer: its
+  # lines arrive as Proposed; PC confirms (per line or all) or removes.
+  # =================================================================
+  def _render_proposal(self, plan):
+    self._proposal = plan.get('proposal')
+    n_open = int(plan.get('n_proposed_open') or 0)
+    if hasattr(self, 'lk_accept_all'):
+      self.lk_accept_all.visible = self.is_pc and n_open > 0
+      self.lk_accept_all.text = f'Accept all {n_open} proposed'
+    if hasattr(self, 'lk_proposal'):
+      p = self._proposal
+      if p:
+        when = (p.get('generated_at') or '')[11:16]
+        self.lk_proposal.text = (f"Agent proposal {when} · {p.get('n_lines', 0)} lines · "
+                                 f"{p.get('status', '')}")
+        self.lk_proposal.visible = True
+      else:
+        self.lk_proposal.text = 'No agent proposal yet'
+        self.lk_proposal.visible = True
+
+  @staticmethod
+  def _pline(text, size=15, bold=False, color=None):
+    lbl = Label(text=text, font_size=size, bold=bold,
+                spacing_above='none', spacing_below='none')
+    if color:
+      lbl.foreground = color
+    return lbl
+
+  def _show_proposal(self, **event_args):
+    r = anvil.server.call('ship_plan_get_proposal', self.plan_date)
+    if r.get('status') != 'success' or not r.get('proposal'):
+      alert('No agent proposal for this day yet.')
+      return
+    p, lines = r['proposal'], r['lines']
+    panel = ColumnPanel(spacing_above='none', spacing_below='none')
+    panel.add_component(self._pline(
+      f"Agent proposal — {self.plan_date}  ·  {p.get('status')}", size=17, bold=True))
+    panel.add_component(self._pline(
+      f"Proposed {float(p.get('proposed_inches') or 0):,.0f} of "
+      f"{float(p.get('capacity_inches') or 0):,.0f} work-inches "
+      f"(generated {(p.get('generated_at') or '')[:16]}, {p.get('agent_version') or ''})",
+      color='#595959'))
+    if p.get('rationale'):
+      panel.add_component(self._pline(' ', size=6))
+      for para in str(p['rationale']).split('\n'):
+        if para.strip():
+          panel.add_component(self._pline(para.strip(), size=14))
+    else:
+      panel.add_component(self._pline(
+        'Narrative not written yet (the agent service adds it after the run).',
+        size=13, color='#8a8a8a'))
+    panel.add_component(self._pline(' ', size=6))
+    panel.add_component(self._pline('Lines', size=15, bold=True))
+    for l in lines:
+      if int(l.get('rank_no') or 0) == 0:
+        txt = f"+ {l['nx_order_numb']} {l['nx_sku']} — added by PC"
+      else:
+        txt = (f"{l['rank_no']}. {l['nx_order_numb']} {l['nx_sku']} — "
+               f"{l.get('proposed_tier')} · {l.get('reason') or ''}")
+      out = l.get('outcome')
+      if out:
+        txt += f"   [{out}]"
+      panel.add_component(self._pline(txt, size=13,
+                                      color='#8a8a8a' if out == 'DROPPED' else None))
+    alert(content=panel, title='Agent proposal', buttons=[('Close', None)], large=True)
+
+  def _confirm_line(self, item):
+    r = anvil.server.call('ship_plan_confirm_line', self.plan_date,
+                          item['nx_order_numb'], item['nx_sku'])
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Confirm failed'))
+    self.load_day()
+
+  def _accept_all_proposed(self, **event_args):
+    n = int((self._proposal or {}).get('n_lines') or 0)
+    if not confirm(f'Accept every Proposed line on {self.plan_date}? '
+                   'Each becomes Planned with the tier the agent set.'):
+      return
+    r = anvil.server.call('ship_plan_confirm_all_proposed', self.plan_date)
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Accept-all failed'))
+    self.load_day()
+
+  def _run_agent_now(self, **event_args):
+    """Manual trigger (PC/Dave) — the same deterministic fill the 06:30
+    service run performs; useful before the service is scheduled and for
+    a re-run after a big feed change. Supersedes the earlier proposal but
+    keeps anything PC already confirmed."""
+    if not confirm(f'Run the agent for {self.plan_date} now? '
+                   'Its earlier still-Proposed lines are replaced; '
+                   'confirmed lines are kept.'):
+      return
+    r = anvil.server.call('ship_plan_agent_propose', self.plan_date)
+    if r.get('status') == 'error':
+      alert(r.get('message', 'Agent run failed'))
+    elif r.get('status') == 'skipped':
+      alert(r.get('message', 'Skipped'))
+    else:
+      msg = (f"Proposed {r.get('n_proposed', 0)} lines + {r.get('n_stretch', 0)} stretch — "
+             f"{r.get('proposed_inches', 0):,.0f} of {r.get('target_inches', 0):,.0f} "
+             f"target in ({int(float(r.get('fill_pct', 0.8)) * 100)}% of "
+             f"{r.get('capacity_inches', 0):,.0f}). "
+             f"{r.get('n_gated', 0)} gated, {r.get('n_skipped', 0)} beyond stretch, "
+             f"{r.get('n_oversize', 0)} oversize (bigger than the whole day).")
+      if r.get('snapshot_warning'):
+        msg += f"\n\nSnapshot warning: {r['snapshot_warning']}"
+      alert(msg)
+    self.load_day()
