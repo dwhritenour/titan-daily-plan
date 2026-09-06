@@ -26,6 +26,18 @@ secrets:
   NEXUS_USERNAME:
     type: secret
     value: {BQADJ4QSVTTRO7VT: 7whoFX0DeaMuoI/GfIn/O5k2yJqlLegZWymiklf87qmxo072T/kXw2rBSRfp0n3u69cja52TCSzsCwCUCHJh4MgtgOPTvaLccWspawROYGpdBlX+asubSkZGNwFdmOXDXP8xXLgHfBo=}
+  TWILIO_ACCOUNT_SID:
+    type: secret
+    value:
+      BQADJ4QSVTTRO7VT: {? '' : VPJiGA2g1BiKHgFgUpwE3Hs64zfGK8gG75AYZetWErb9icdWJ7cLLrU10DD/ZqtqsRDVO+KzBtfUws2XySUQwLqqw25dK2gg+o3OeLekKmUyQeCui/YlzNOZbZv4WUriciwdsG4bjmYsyaouRtAD2OBp1RxZpq7+RVZBiOrrP7G8PiW/ucbZ99qf7vOAlXSv6s9BRJT8P2G7nq7+41xh7Ne6Oy5IWjsHIbk3ePr+zT8pHWm3PQ==}
+  TWILIO_AUTH_TOKEN:
+    type: secret
+    value:
+      BQADJ4QSVTTRO7VT: {? '' : tNxLpPJnyMXu94hlRHbMNFdUBI5TKT4I6h0pKvAypwIuFAMKpmwp33p9687KPGi+7AA4sIiir+azHRupawBlWATqxYpbdVXXnZATQ1Ojg+q3mk5FoDBoXEdWnCOA0PbHZ8C2qSjXyHhmyBwwOechsIFVAX8quAvdNVDypue6lH3E3MZ7BN+r07tylRLZvCUhPLD7s+q3wLcu5pdHttB9tRTNDXVjqQxKe4YkL5M9diXNpg==}
+  TWILIO_PHONE_NUMBER:
+    type: secret
+    value:
+      BQADJ4QSVTTRO7VT: {? '' : mn1l7TVbxfuZ5DHmiQbNEeEz8Chs7JNpIgnbxxoSeJ84m+4rmd80dO3LCb5+TEjz2cY7KluPgRRaSiHb2lV/wcUF8adgZy98tyPKm/zKI6BHMFtqxu2NbYTf9FCTHf7WP5gK7rWBuGeinioIFndJ+dte2sJ+y4QGLO3+pfh8w4n3HVsd+NaS3l4ioAfZ5eWIS+eQBL80VHEiYqd/GtcwlQ==}
 services:
 - client_config: {enable_v2: true}
   server_config: {}
