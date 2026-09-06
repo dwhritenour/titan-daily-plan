@@ -721,6 +721,9 @@ class ship_plan(ship_planTemplate):
     r = anvil.server.call('ship_plan_publish', self.plan_date)
     if r.get('status') != 'success':
       alert(r.get('message', 'Publish failed'))
+    elif r.get('snapshot_warning'):
+      # 051: the plan IS published; only the agent's history record failed.
+      alert(r['snapshot_warning'] + '\n\nTell Dave — the plan itself is fine.')
     self.load_day()
 
   # =================================================================

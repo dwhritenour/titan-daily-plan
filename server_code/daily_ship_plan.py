@@ -1180,9 +1180,69 @@ def ship_plan_recalc_line(plan_date, order, sku):
 
 
 @anvil.server.callable
+def _snapshot_flags(cursor, plan_date, revision_no, weight_set_id):
+  """Migration 051: freeze the WHOLE candidate pool (planned + not) with
+  its codes, gate state, score and per-flag weights AS OF NOW. Flags are
+  computed at read time and never stored, so this is the only record of
+  what the ranking looked like when the plan went out — the agent's
+  step-12 backtests replay from it. Idempotent per (plan_date, revision)."""
+  cursor.execute("""
+      INSERT INTO dbo.pc_plan_flag_snapshot
+          (plan_date, revision_no, nx_order_numb, nx_sku, was_planned, tier,
+           is_gated, gate_codes, priority_score, flag_codes,
+           ship_by_date, qty_open, load_inches, capacity_weight_set_id)
+      SELECT %s, %s, p.nx_order_numb, p.nx_sku, p.was_planned, p.tier,
+             ISNULL(fs.is_gated, 0), fs.gate_codes,
+             ISNULL(fs.priority_score, 0), fs.flag_codes,
+             p.ship_by_date, p.qty_open, p.load_inches, %s
+      FROM (
+          SELECT l.nx_order_numb, l.nx_sku, 1 AS was_planned, l.tier,
+                 l.ship_by_date, l.qty_planned AS qty_open, l.load_inches
+          FROM dbo.pc_ship_plan_line l
+          WHERE l.plan_date = %s
+            AND l.line_status IN ('Planned','Proposed','Confirmed')
+          UNION ALL
+          SELECT c.nx_order_numb, c.nx_sku, 0, NULL,
+                 c.ship_by_date, c.qty_open, c.load_inches
+          FROM dbo.vw_pc_ship_candidates c
+          WHERE NOT EXISTS (
+              SELECT 1 FROM dbo.pc_ship_plan_line l2
+              WHERE l2.plan_date = %s
+                AND l2.nx_order_numb = c.nx_order_numb
+                AND l2.nx_sku = c.nx_sku
+                AND l2.line_status IN ('Planned','Proposed','Confirmed'))
+      ) p
+      LEFT JOIN dbo.vw_pc_order_flag_scores fs
+             ON fs.nx_order_numb = p.nx_order_numb AND fs.nx_sku = p.nx_sku
+      WHERE NOT EXISTS (
+          SELECT 1 FROM dbo.pc_plan_flag_snapshot s
+          WHERE s.plan_date = %s AND s.revision_no = %s
+            AND s.nx_order_numb = p.nx_order_numb AND s.nx_sku = p.nx_sku)
+  """, (plan_date, revision_no, weight_set_id, plan_date, plan_date,
+        plan_date, revision_no))
+  n_rows = cursor.rowcount
+  cursor.execute("""
+      INSERT INTO dbo.pc_plan_flag_snapshot_detail
+          (snapshot_id, flag_code, weight_at_time, note)
+      SELECT s.snapshot_id, f.flag_code, f.weight, LEFT(f.note, 500)
+      FROM dbo.pc_plan_flag_snapshot s
+      JOIN dbo.vw_pc_order_flags f
+        ON f.nx_order_numb = s.nx_order_numb AND f.nx_sku = s.nx_sku
+      WHERE s.plan_date = %s AND s.revision_no = %s
+        AND NOT EXISTS (
+            SELECT 1 FROM dbo.pc_plan_flag_snapshot_detail d
+            WHERE d.snapshot_id = s.snapshot_id AND d.flag_code = f.flag_code)
+  """, (plan_date, revision_no))
+  return n_rows
+
+
+@anvil.server.callable
 def ship_plan_publish(plan_date):
   """Stamp capacity (the number sales saw) and flip Draft -> Published.
-  The plan stays editable after — real life happens; edits keep logging."""
+  The plan stays editable after — real life happens; edits keep logging.
+  051: after the publish commits, the flag snapshot is taken in its OWN
+  transaction — a snapshot problem must never un-publish a plan; it comes
+  back as snapshot_warning for the client to show."""
   plan_date = _parse_date(plan_date)
   actor = _current_actor()
   conn = get_connection()
@@ -1202,10 +1262,26 @@ def ship_plan_publish(plan_date):
                new_value=f"capacity {cap['capacity_inches_effective']:.0f} in",
                actor=actor, note=cap['capacity_detail'][:500])
     conn.commit()
-    return {'status': 'success', 'capacity': cap}
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Publish failed: {e}'}
+  finally:
+    conn.close()
+  # --- flag snapshot (051), separate transaction --------------------
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("SELECT revision_no, weight_set_id FROM dbo.pc_ship_plan "
+                   "WHERE plan_date = %s", (plan_date,))
+    row = cursor.fetchone() or {}
+    n = _snapshot_flags(cursor, plan_date, int(row.get('revision_no') or 0),
+                        row.get('weight_set_id'))
+    conn.commit()
+    return {'status': 'success', 'capacity': cap, 'snapshot_rows': n}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'success', 'capacity': cap,
+            'snapshot_warning': f'Published, but the flag snapshot failed: {e}'}
   finally:
     conn.close()
 
