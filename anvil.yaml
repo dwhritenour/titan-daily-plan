@@ -26,6 +26,10 @@ secrets:
   NEXUS_USERNAME:
     type: secret
     value: {BQADJ4QSVTTRO7VT: 7whoFX0DeaMuoI/GfIn/O5k2yJqlLegZWymiklf87qmxo072T/kXw2rBSRfp0n3u69cja52TCSzsCwCUCHJh4MgtgOPTvaLccWspawROYGpdBlX+asubSkZGNwFdmOXDXP8xXLgHfBo=}
+  RETRO_ARBITER_PIN:
+    type: secret
+    value:
+      BQADJ4QSVTTRO7VT: {? '' : U0aaFSjS6T+Ouvi7UMYN0jRh5vBDUe1J99zJYfDyllO/kDhlTbeZ6w7SsVtEWkzgokdiETlzbB63Pr7jQ2zhB3w25Tu/valvEm7eT8GcRx1TmLDQbD3wXn3SjD+UqZcHN3P4XDGP8Flnztkjetr0Llzuse5SxqncMX5qlDLsbC9sjMzMnOtrJ0PeU9T2sHJrJWaeDurC}
   TWILIO_ACCOUNT_SID:
     type: secret
     value:

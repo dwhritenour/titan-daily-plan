@@ -42,13 +42,13 @@ Author: Dave Whritenour / Claude AI Assistant
 Project: Titan Flow Control - Year of Automation
 """
 
-import anvil.server
+import anvil.server w
 import anvil.secrets
 from datetime import datetime, date, timedelta
 
 from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
-_get_params, _agent_key_ok, serialize_row,
-make_serializable)
+                              _get_params, _agent_key_ok, serialize_row,
+                              make_serializable)
 
 _RETRO_VERSION = 'retro-1.0'
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
