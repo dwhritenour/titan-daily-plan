@@ -10,8 +10,11 @@ Spec: documents/Retro_v1_Spec_2026-09-07.md. Schema: migrations 051 + 053.
 
 What the records can prove (no Assembly App yet, kiosk Start/Complete
 events unused since 08-21):
-    SHIPPED   line gone from the open book, item status 15, or balance
-              below the published qty (sales_orders_due, hourly)
+    SHIPPED   line gone from the open book, or balance below the
+              published qty (sales_orders_due, hourly). Item status 15
+              ('Material Received/Shipped') is deliberately NOT used: the
+              status at publish is not snapshotted yet, and 86 lines sat
+              at 15 before the first plan existed (2026-09-07 test).
     WORKED    a work order for the line completed since the plan day, or
               a WO Assign/Start/Complete event on the plan day
     REMOVED   plan event Removed / TierChange after publish - with a reason
@@ -42,15 +45,15 @@ Author: Dave Whritenour / Claude AI Assistant
 Project: Titan Flow Control - Year of Automation
 """
 
-import anvil.server w
+import anvil.server
 import anvil.secrets
 from datetime import datetime, date, timedelta
 
 from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
-                              _get_params, _agent_key_ok, serialize_row,
-                              make_serializable)
+_get_params, _agent_key_ok, serialize_row,
+make_serializable)
 
-_RETRO_VERSION = 'retro-1.0'
+_RETRO_VERSION = 'retro-1.0.1'
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -214,7 +217,11 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       b = book.get(key)
       w = wos.get(key)
       bal = float(b['balance'] or 0) if b else 0.0
-      shipped = (b is None) or (b['item_status'] == '15') or (bal < qty0 - 0.001)
+      # 2026-09-07 test: item status 15 (Material Received/Shipped) is NOT a
+      # shipped signal by itself - 86 candidate lines sat at 15 before the
+      # plan existed. Until the snapshot records the status at publish,
+      # shipped = the line left the open book or its balance dropped.
+      shipped = (b is None) or (bal < qty0 - 0.001)
       worked = bool(w and (w['done_since'] or w['touched']))
       rem = removals.get(key)
       late = (s['ship_by_date'] and s['ship_by_date'] < plan_date)
@@ -231,8 +238,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       if shipped:
         row.update(case='SHIPPED', observed=True, resolution='EXPLAINED',
                    explanation=base + ('; line left the open book' if b is None else
-                                       f"; balance {qty0:,.0f} -> {bal:,.0f}"
-                                       + (' (status 15)' if b['item_status'] == '15' else '')))
+                                       f"; balance {qty0:,.0f} -> {bal:,.0f}"))
         if tier != 'Stretch':
           moved_in += load
       elif worked:
@@ -293,7 +299,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       qty0 = float(s['qty_open'] or 0)
       b = book.get(key)
       bal = float(b['balance'] or 0) if b else 0.0
-      shipped = (b is None) or (b['item_status'] == '15') or (bal < qty0 - 0.001)
+      shipped = (b is None) or (bal < qty0 - 0.001)      # status 15 alone: no
       if not shipped:
         continue
       n_unplanned_all += 1

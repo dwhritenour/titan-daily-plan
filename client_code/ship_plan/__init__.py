@@ -962,19 +962,20 @@ class ship_plan(ship_planTemplate):
     hdr, rows, queue = r.get('header'), r.get('variances') or [], r.get('dave_queue') or []
     day = r['plan_date']
     panel = ColumnPanel(spacing_above='none', spacing_below='none')
+    self._retro_panel = panel      # x-close-alert must be raised on the CONTENT
 
     # --- header + day navigation ----------------------------------------
     nav = FlowPanel(spacing_above='none', spacing_below='none')
     prev_lk = Link(text='◀ prev day', font_size=13)
     next_lk = Link(text='next day ▶', font_size=13)
-    prev_lk.set_event_handler('click', lambda **e: self._retro_step(day, -1, prev_lk))
-    next_lk.set_event_handler('click', lambda **e: self._retro_step(day, +1, next_lk))
+    prev_lk.set_event_handler('click', lambda **e: self._retro_step(day, -1, panel))
+    next_lk.set_event_handler('click', lambda **e: self._retro_step(day, +1, panel))
     nav.add_component(Label(text=f'Retro — {day}', font_size=17, bold=True))
     nav.add_component(prev_lk)
     nav.add_component(next_lk)
     if self.is_pc:
       run_lk = Link(text='run retro now', font_size=13, foreground='#595959')
-      run_lk.set_event_handler('click', lambda **e: self._retro_run_now(day, run_lk))
+      run_lk.set_event_handler('click', lambda **e: self._retro_run_now(day, panel))
       nav.add_component(run_lk)
     panel.add_component(nav)
     if not hdr:
@@ -1055,7 +1056,7 @@ class ship_plan(ship_planTemplate):
           f" · rank {v.get('question_rank')}", size=13, color='#595959'))
         if self.is_pc:
           ask_lk = Link(text='ask anyway', font_size=12)
-          ask_lk.set_event_handler('click', lambda vid=v['variance_id'], lk=ask_lk, **e: self._retro_ask_anyway(vid, day, lk))
+          ask_lk.set_event_handler('click', lambda vid=v['variance_id'], **e: self._retro_ask_anyway(vid, day, panel))
           row.add_component(ask_lk)
         panel.add_component(row)
 
