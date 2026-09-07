@@ -10,5 +10,6 @@ unique_ids:
   modules: {}
   scripts: {}
   server_modules:
+    daily_plan_retro: '1788796547704535203357196.94714'
     daily_ship_plan: '1787664623550535807975063.2075'
     db_config: '1787664724217840339488662.1838'
