@@ -1772,6 +1772,14 @@ def _agent_propose_impl(plan_date=None, force=False):
     if hdr and hdr['plan_status'] == 'Published' and not force:
       return {'status': 'skipped',
               'message': f'{plan_date} is already published.'}
+    # 2026-09-07 (Labor Day): no roster -> 0 capacity -> a 0-line proposal
+    # and a text to four people. No capacity = no plan day; say so and stop
+    # BEFORE touching the header or superseding anything.
+    cap_probe = _capacity_for(cursor, plan_date, prefer_estimate=True)
+    if float(cap_probe.get('capacity_inches_effective') or 0) <= 0 and not force:
+      return {'status': 'skipped', 'plan_date': plan_date.isoformat(),
+              'message': (f'{plan_date}: no capacity (holiday or nobody on the '
+                          f'roster) - nothing proposed. {cap_probe.get("capacity_detail", "")}')}
     _ensure_header(cursor, plan_date, actor)
     cursor.execute("SELECT weight_set_id FROM dbo.pc_ship_plan "
                    "WHERE plan_date = %s", (plan_date,))
