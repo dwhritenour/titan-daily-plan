@@ -45,7 +45,7 @@ class retro(retroTemplate):
     if hasattr(self, 'lk_closed'):
       self.lk_closed.set_event_handler('click', self._toggle_closed)
     if hasattr(self, 'lk_run'):
-      self.lk_run.text = 'run retro now'
+      self.lk_run.text = 'Run Retro Now'
       self.lk_run.visible = self.is_pc
       self.lk_run.set_event_handler('click', self._run_now)
     self.load()
