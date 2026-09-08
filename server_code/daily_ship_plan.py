@@ -274,16 +274,36 @@ def _log_event(cursor, plan_date, order, sku, event_type,
         (actor or _current_actor()), (note[:500] if note else None)))
 
 
+def _stamp_work_orders(cursor, plan_date):
+  """Migration 056 (2026-09-08): carry the published plan onto the work
+  orders — plan_date / plan_tier / plan_position — so the Production App
+  releases top-to-bottom and the Assembly App sees Must/Next/Stretch
+  through vw_pc_department_queue. The logic lives in ONE place,
+  dbo.sp_stamp_plan_work_orders (clears stale stamps for the day, then
+  stamps every live work order behind a planned line). Silent no-op
+  until 056 is applied. Returns {'cleared', 'stamped'} or None."""
+  cursor.execute("SELECT OBJECT_ID('dbo.sp_stamp_plan_work_orders') AS o")
+  if (cursor.fetchone() or {}).get('o') is None:
+    return None
+  cursor.execute("EXEC dbo.sp_stamp_plan_work_orders @plan_date = %s", (plan_date,))
+  row = cursor.fetchone() or {}
+  return {'cleared': int(row.get('cleared') or 0), 'stamped': int(row.get('stamped') or 0)}
+
+
 def _bump_revision(cursor, plan_date, actor):
   """If the day's plan is already PUBLISHED, count this change as a
   revision — displayed as 'PUBLISHED 8:52 · rev 3'. Draft edits are not
-  revisions; the agreement only exists once it's published."""
+  revisions; the agreement only exists once it's published.
+  056: a revision re-stamps the day's work orders (added / removed lines
+  reach the Production App at once)."""
   cursor.execute("""
       UPDATE dbo.pc_ship_plan
       SET revision_no = revision_no + 1,
           last_revised_at = GETDATE(), last_revised_by = %s
       WHERE plan_date = %s AND plan_status = 'Published'
   """, (actor or _current_actor(), plan_date))
+  if cursor.rowcount:
+    _stamp_work_orders(cursor, plan_date)
 
 
 def _get_params(cursor):
@@ -1295,15 +1315,29 @@ def ship_plan_publish(plan_date):
     n = _snapshot_flags(cursor, plan_date, int(row.get('revision_no') or 0),
                         row.get('weight_set_id'))
     conn.commit()
-    return {'status': 'success', 'capacity': cap, 'snapshot_rows': n,
-            'proposal_outcome': proposal_outcome}
+    result = {'status': 'success', 'capacity': cap, 'snapshot_rows': n,
+              'proposal_outcome': proposal_outcome}
   except Exception as e:
     conn.rollback()
-    return {'status': 'success', 'capacity': cap,
-            'proposal_outcome': proposal_outcome,
-            'snapshot_warning': f'Published, but the flag snapshot failed: {e}'}
+    result = {'status': 'success', 'capacity': cap,
+              'proposal_outcome': proposal_outcome,
+              'snapshot_warning': f'Published, but the flag snapshot failed: {e}'}
   finally:
     conn.close()
+  # --- work-order stamp (056), separate transaction, best effort -----
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    stamp = _stamp_work_orders(cursor, plan_date)
+    conn.commit()
+    if stamp is not None:
+      result['wo_stamp'] = stamp
+  except Exception as e:
+    conn.rollback()
+    result['stamp_warning'] = f'Published, but the work-order stamp failed: {e}'
+  finally:
+    conn.close()
+  return result
 
 
 # =============================================================================
