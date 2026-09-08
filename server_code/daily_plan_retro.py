@@ -64,7 +64,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.2.0'
+_RETRO_VERSION = 'retro-1.2.1'
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -169,6 +169,19 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     snap = cursor.fetchall()
     planned = [s for s in snap if s['was_planned']]
     unplanned_pool = [s for s in snap if not s['was_planned']]
+
+    # v1.2.1 (Dave, 2026-09-08): plan POSITION = the order the floor saw.
+    # Same ordering as sp_stamp_plan_work_orders (tier, position, load DESC)
+    # so the first retro question is about the line released first.
+    cursor.execute("""
+        SELECT nx_order_numb, nx_sku,
+               ROW_NUMBER() OVER (ORDER BY CASE tier WHEN 'Must' THEN 0
+                                                     WHEN 'Next' THEN 1 ELSE 2 END,
+                                           position, load_inches DESC) AS pos
+        FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND line_status IN ('Planned', 'Proposed', 'Confirmed')
+    """, (plan_date,))
+    plan_pos = {(r['nx_order_numb'], r['nx_sku']): int(r['pos']) for r in cursor.fetchall()}
 
     # --- what the records say now -------------------------------------
     cursor.execute("""
@@ -291,6 +304,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
               + (f", flags {s['flag_codes']}" if s.get('flag_codes') else ''))
       row = {'order': key[0], 'sku': key[1], 'tier': tier, 'load': load,
              'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
+             'pos': plan_pos.get(key, 10 ** 6),
              'expected': 'SHIPPED', 'expected_value': qty0,
              'actual_value': (None if b is None else bal),
              'observed': False, 'case': None, 'routed_to': None,
@@ -420,8 +434,11 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     order_key = {'UNTOUCHED': 0, 'REMOVED_NO_REASON': 1, 'UNPLANNED_SHIP': 2,
                  'CANCELLED': 3, 'QTY_CHANGED': 4, 'DATE_MOVED': 5}
     def _rank(r):
+      # v1.2.1: planned lines rank by PLAN POSITION (the order the floor
+      # saw on the Production grid), not by priority_score - one 'most
+      # important' order for the day. Unplanned/demand rows keep score, load.
       return (order_key.get(r['case'], 9), 0 if r['tier'] == 'Must' else 1,
-              -r['score'], -r['load'])
+              r.get('pos', 10 ** 6), -r['score'], -r['load'])
     askable = sorted([r for r in rows if r['question']], key=_rank)
     sales_q = [r for r in askable if r['routed_to'] == 'SALES']
     pc_q = [r for r in askable if r['routed_to'] != 'SALES']
