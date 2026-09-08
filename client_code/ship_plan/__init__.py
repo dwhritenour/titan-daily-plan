@@ -36,6 +36,17 @@ class ship_plan(ship_planTemplate):
   def __init__(self, **properties):
     self.init_components(**properties)
 
+    # Deep links from the morning texts (2026-09-07): #retro = PC/Sales
+    # answer their retro questions, #retrev = Dave confirms readings.
+    # Same pattern as the Hub app's #pick / #dock routes.
+    _hash = get_url_hash()
+    if _hash == 'retro':
+      open_form('retro')
+      return
+    if _hash == 'retrev':
+      open_form('retro_review')
+      return
+
     # --- role gate (Wk-2: Sales = read-only) -------------------------
     # TODO(Dave/Chuck): wire to the app's real role source, same pattern
     # as the other PC forms. is_pc=False hides every mutating control.
@@ -84,8 +95,11 @@ class ship_plan(ship_planTemplate):
       self.lk_run_agent.visible = self.is_pc
     if hasattr(self, 'lk_retro'):
       self.lk_retro.text = 'Retro'              # code owns the label
-      self.lk_retro.set_event_handler('click', self._show_retro)
+      self.lk_retro.set_event_handler('click', lambda **e: open_form('retro'))
       self.lk_retro.visible = True              # everyone reads the retro
+    if hasattr(self, 'lk_retro_review'):
+      self.lk_retro_review.text = 'Retro review'
+      self.lk_retro_review.set_event_handler('click', lambda **e: open_form('retro_review'))
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
     # read PLAN_HORIZON_DAYS itself, so a saved change applies on the
@@ -938,279 +952,3 @@ class ship_plan(ship_planTemplate):
         msg += f"\n\nSnapshot warning: {r['snapshot_warning']}"
       alert(msg)
     self.load_day()
-
-  # ===========================================================================
-  # RETRO (2026-09-07) — the back half of the agent cycle, built in code as a
-  # popup off ONE designer link: lk_retro in flow_plan_actions (text is set
-  # here). Everyone sees every question and answer (collaboration lever);
-  # the confirm step is Dave's, gated by the RETRO_ARBITER_PIN secret.
-  # ===========================================================================
-
-  _RETRO_CASE_TXT = {'UNTOUCHED': 'no recorded activity',
-                     'REMOVED_NO_REASON': 'removed, no reason recorded',
-                     'REMOVED_WITH_REASON': 'removed with reason',
-                     'UNPLANNED_SHIP': 'shipped, not on the plan',
-                     'DATE_MOVED': 'ship-by moved', 'SHIPPED': 'shipped',
-                     'WORKED': 'worked', 'UNTOUCHED_STRETCH': 'stretch, not reached'}
-
-  def _show_retro(self, plan_date=None, **event_args):
-    r = anvil.server.call('retro_get_day', plan_date)
-    if r.get('status') != 'success':
-      alert(r.get('message', 'Retro load failed'))
-      return
-    self._retro_who = getattr(self, '_retro_who', None)
-    hdr, rows, queue = r.get('header'), r.get('variances') or [], r.get('dave_queue') or []
-    day = r['plan_date']
-    panel = ColumnPanel(spacing_above='none', spacing_below='none')
-    self._retro_panel = panel      # x-close-alert must be raised on the CONTENT
-
-    # --- header + day navigation ----------------------------------------
-    nav = FlowPanel(spacing_above='none', spacing_below='none')
-    prev_lk = Link(text='◀ prev day', font_size=13)
-    next_lk = Link(text='next day ▶', font_size=13)
-    prev_lk.set_event_handler('click', lambda **e: self._retro_step(day, -1, panel))
-    next_lk.set_event_handler('click', lambda **e: self._retro_step(day, +1, panel))
-    nav.add_component(Label(text=f'Retro — {day}', font_size=17, bold=True))
-    nav.add_component(prev_lk)
-    nav.add_component(next_lk)
-    if self.is_pc:
-      run_lk = Link(text='run retro now', font_size=13, foreground='#595959')
-      run_lk.set_event_handler('click', lambda **e: self._retro_run_now(day, panel))
-      nav.add_component(run_lk)
-    panel.add_component(nav)
-    if not hdr:
-      panel.add_component(self._pline(
-        'No retro for this day yet — it runs each weekday morning for the '
-        'previous published day (or tap "run retro now").', size=14, color='#8a8a8a'))
-      alert(content=panel, title='Retro', buttons=[('Close', None)], large=True)
-      self._retro_after_close()
-      return
-    moved = int(hdr.get('n_shipped') or 0) + int(hdr.get('n_worked') or 0)
-    line = (f"{moved} of {hdr.get('n_planned', 0)} planned lines moved "
-            f"({float(hdr.get('moved_inches') or 0):,.0f} of "
-            f"{float(hdr.get('planned_inches') or 0):,.0f} in)")
-    if hdr.get('reserve_used_pct') is not None:
-      line += (f" · rush reserve used {float(hdr['reserve_used_pct']):.0f}% "
-               f"({float(hdr.get('unplanned_inches') or 0):,.0f} of "
-               f"{float(hdr.get('reserve_inches') or 0):,.0f} in)")
-    panel.add_component(self._pline(line, size=14, color='#595959'))
-    panel.add_component(self._pline(
-      f"{hdr.get('n_untouched', 0)} no activity · {hdr.get('n_removed_reason', 0)} removed "
-      f"w/ reason · {hdr.get('n_removed_noreason', 0)} removed w/o · "
-      f"{hdr.get('n_date_moved', 0)} dates moved · {hdr.get('n_unplanned_ship', 0)} unplanned "
-      f"shipments · {hdr.get('n_questions_asked', 0)} asked", size=13, color='#8a8a8a'))
-
-    # --- narrative (tap to expand) --------------------------------------
-    if hdr.get('narrative'):
-      narr = ColumnPanel(visible=False, spacing_above='none', spacing_below='none')
-      for para in str(hdr['narrative']).split('\n'):
-        if para.strip():
-          narr.add_component(self._pline(para.strip(), size=14))
-      tog = Link(text='Show narrative', font_size=13)
-      def _toggle(**e):
-        narr.visible = not narr.visible
-        tog.text = 'Hide narrative' if narr.visible else 'Show narrative'
-      tog.set_event_handler('click', _toggle)
-      panel.add_component(tog)
-      panel.add_component(narr)
-
-    # --- who is answering -----------------------------------------------
-    people = (r.get('answerers') or {})
-    names = list(people.get('PC') or []) + list(people.get('SALES') or []) + ['Dave', 'Other']
-    who_row = FlowPanel(spacing_above='small', spacing_below='none')
-    who_row.add_component(Label(text='I am:', font_size=14, bold=True))
-    dd_who = DropDown(items=names, selected_value=(self._retro_who if self._retro_who in names
-                                                   else names[0]))
-    dd_who.set_event_handler('change', lambda **e: setattr(self, '_retro_who', dd_who.selected_value))
-    who_row.add_component(dd_who)
-    panel.add_component(who_row)
-    self._retro_who = dd_who.selected_value
-
-    # --- questions (asked) ------------------------------------------------
-    asked = [v for v in rows if v.get('asked_at')]
-    panel.add_component(self._pline(' ', size=6))
-    panel.add_component(self._pline(f'Questions ({len(asked)})', size=15, bold=True))
-    if not asked:
-      panel.add_component(self._pline('No questions today.', size=13, color='#8a8a8a'))
-    for v in asked:
-      panel.add_component(self._retro_question_card(v, dd_who))
-
-    # --- awaiting Dave ------------------------------------------------------
-    panel.add_component(self._pline(' ', size=6))
-    panel.add_component(self._pline(f'Awaiting Dave ({len(queue)})', size=15, bold=True))
-    if not queue:
-      panel.add_component(self._pline('Nothing to confirm.', size=13, color='#8a8a8a'))
-    for q in queue:
-      panel.add_component(self._retro_confirm_card(q, r.get('causes') or []))
-
-    # --- not asked today ----------------------------------------------------
-    not_asked = [v for v in rows if v.get('question_text') and not v.get('asked_at')]
-    if not_asked:
-      panel.add_component(self._pline(' ', size=6))
-      panel.add_component(self._pline(f'Not asked today ({len(not_asked)})', size=15, bold=True))
-      for v in not_asked:
-        row = FlowPanel(spacing_above='none', spacing_below='none')
-        row.add_component(self._pline(
-          f"[{v.get('routed_to') or 'PC'}] {v['nx_order_numb']} / {v['nx_sku']} — "
-          f"{self._RETRO_CASE_TXT.get(v.get('variance_case'), v.get('variance_case'))}"
-          f" · rank {v.get('question_rank')}", size=13, color='#595959'))
-        if self.is_pc:
-          ask_lk = Link(text='ask anyway', font_size=12)
-          ask_lk.set_event_handler('click', lambda vid=v['variance_id'], **e: self._retro_ask_anyway(vid, day, panel))
-          row.add_component(ask_lk)
-        panel.add_component(row)
-
-    # --- everything else (closed silently) -----------------------------------
-    closed = [v for v in rows if not v.get('question_text')]
-    if closed:
-      panel.add_component(self._pline(' ', size=6))
-      cl = ColumnPanel(visible=False, spacing_above='none', spacing_below='none')
-      for v in closed:
-        cl.add_component(self._pline(
-          f"{v['nx_order_numb']} / {v['nx_sku']} — "
-          f"{self._RETRO_CASE_TXT.get(v.get('variance_case'), v.get('variance_case'))}: "
-          f"{v.get('system_explanation') or ''}", size=12, color='#8a8a8a'))
-      tog2 = Link(text=f'Show the {len(closed)} lines that need no question', font_size=13)
-      tog2.set_event_handler('click', lambda **e: setattr(cl, 'visible', not cl.visible))
-      panel.add_component(tog2)
-      panel.add_component(cl)
-
-    # --- this fortnight's confirmed causes --------------------------------------
-    wk = r.get('week_causes') or []
-    if wk:
-      panel.add_component(self._pline(' ', size=6))
-      panel.add_component(self._pline('Confirmed causes, last 14 days', size=15, bold=True))
-      for c in wk:
-        txt = f"{c['cause_key']} × {c['n']}"
-        if int(c['n']) >= 3:
-          txt += '   ● rule candidate'
-        panel.add_component(self._pline(txt, size=13,
-                                        color='#a16207' if int(c['n']) >= 3 else None))
-    alert(content=panel, title='Retro', buttons=[('Close', None)], large=True)
-    self._retro_after_close()
-
-  def _retro_after_close(self):
-    """Navigation inside the popup closes it (x-close-alert) and queues the
-    next day; the blocking alert() returns here and we reopen."""
-    nxt = getattr(self, '_retro_next', None)
-    self._retro_next = None
-    if nxt:
-      self._show_retro(nxt)
-
-  def _retro_question_card(self, v, dd_who):
-    card = ColumnPanel(spacing_above='small', spacing_below='none')
-    to = v.get('routed_to') or 'PC'
-    card.add_component(self._pline(
-      f"[{to} → {v.get('asked_to') or ''}]  {v['nx_order_numb']} / {v['nx_sku']}  · "
-      f"{self._RETRO_CASE_TXT.get(v.get('variance_case'), v.get('variance_case'))}",
-      size=13, bold=True, color='#1b5e20' if to == 'SALES' else '#0d47a1'))
-    card.add_component(self._pline(v.get('question_text') or '', size=14))
-    if v.get('system_explanation'):
-      card.add_component(self._pline(v['system_explanation'], size=12, color='#8a8a8a'))
-    if v.get('answer_text'):
-      card.add_component(self._pline(
-        f"Answer ({v.get('answered_by')}, {(v.get('answered_at') or '')[:16]}): {v['answer_text']}",
-        size=13, color='#595959'))
-      if v.get('reading_confirmed_at'):
-        card.add_component(self._pline(
-          f"Dave's reading: {v.get('confirmed_reading')}  [{v.get('evidence_class')} · "
-          f"{v.get('cause_key')} · {v.get('resolution')}]", size=13, color='#1b5e20'))
-      elif v.get('proposed_reading'):
-        card.add_component(self._pline(
-          f"Agent's reading (awaiting Dave): {v['proposed_reading']}  "
-          f"[{v.get('proposed_evidence_class')} · {v.get('proposed_cause_key')}]",
-          size=13, color='#a16207'))
-      else:
-        card.add_component(self._pline('Reading pending (a minute or two).', size=12,
-                                       color='#8a8a8a'))
-    elif v.get('resolution') == 'CLOSED_UNKNOWN':
-      card.add_component(self._pline('Closed as Unknown — no answer in time.', size=13,
-                                     color='#8a8a8a'))
-    else:
-      ta = TextArea(placeholder='Your answer — plain words, what happened', height=70)
-      btn = Button(text='Submit answer', role='outlined-button')
-      def _submit(**e):
-        who = dd_who.selected_value
-        if who == 'Other':
-          who = None
-        res = anvil.server.call('retro_answer', v['variance_id'], ta.text, who)
-        if res.get('status') != 'success':
-          alert(res.get('message', 'Could not save the answer'))
-          return
-        ta.enabled = btn.enabled = False
-        btn.text = 'Answered — the agent will read it in a minute'
-      btn.set_event_handler('click', _submit)
-      card.add_component(ta)
-      card.add_component(btn)
-    return card
-
-  def _retro_confirm_card(self, q, causes):
-    card = ColumnPanel(spacing_above='small', spacing_below='none')
-    card.add_component(self._pline(
-      f"{q['plan_date']}  {q['nx_order_numb']} / {q['nx_sku']}  · "
-      f"{self._RETRO_CASE_TXT.get(q.get('variance_case'), q.get('variance_case'))}  "
-      f"[{q.get('routed_to')}]", size=13, bold=True))
-    card.add_component(self._pline(f"Q: {q.get('question_text')}", size=12, color='#8a8a8a'))
-    card.add_component(self._pline(
-      f"Answer ({q.get('answered_by')}): {q.get('answer_text')}", size=13))
-    if not q.get('proposed_reading'):
-      card.add_component(self._pline('Agent reading pending — refresh in a minute.',
-                                     size=12, color='#8a8a8a'))
-      return card
-    tb_reading = TextBox(text=q.get('proposed_reading') or '')
-    dd_ev = DropDown(items=['Verified', 'Probable', 'Unverified', 'Disputed', 'Unknown'],
-                     selected_value=q.get('proposed_evidence_class') or 'Probable')
-    dd_cause = DropDown(items=[(f"{c['cause_key']} — {c['label']}", c['cause_key']) for c in causes],
-                        selected_value=q.get('proposed_cause_key'))
-    dd_res = DropDown(items=['EXPLAINED', 'EXCEPTION', 'RULE_CANDIDATE', 'CLOSED_UNKNOWN', 'DISPUTED'],
-                      selected_value='EXPLAINED')
-    tb_pin = TextBox(placeholder="Dave's PIN", hide_text=True)
-    btn = Button(text='Confirm reading', role='filled-button')
-    def _confirm(**e):
-      res = anvil.server.call('retro_confirm', q['variance_id'], tb_reading.text,
-                              dd_ev.selected_value, dd_cause.selected_value,
-                              dd_res.selected_value, tb_pin.text)
-      if res.get('status') != 'success':
-        alert(res.get('message', 'Confirm failed'))
-        return
-      for c in (tb_reading, dd_ev, dd_cause, dd_res, tb_pin, btn):
-        c.enabled = False
-      btn.text = 'Confirmed' + (f" ({res['warning']})" if res.get('warning') else '')
-    btn.set_event_handler('click', _confirm)
-    card.add_component(self._pline('Reading (edit if the agent got it wrong):', size=12,
-                                   color='#595959'))
-    card.add_component(tb_reading)
-    row = FlowPanel(spacing_above='none', spacing_below='none')
-    for c in (dd_ev, dd_cause, dd_res, tb_pin, btn):
-      row.add_component(c)
-    card.add_component(row)
-    return card
-
-  def _retro_step(self, day, delta, comp):
-    d = date(int(day[:4]), int(day[5:7]), int(day[8:10])) + timedelta(days=delta)
-    while d.weekday() >= 5:
-      d += timedelta(days=delta)
-    self._retro_next = d.isoformat()
-    comp.raise_event('x-close-alert')
-
-  def _retro_run_now(self, day, comp):
-    if not confirm(f'Run the retro for {day} now? Unanswered questions for that '
-                   'day are rebuilt; answers already given are kept.'):
-      return
-    res = anvil.server.call('retro_run', day, True)
-    if res.get('status') == 'success':
-      alert(f"Retro done: {res['n_questions']} question(s) of {res['n_askable']} askable; "
-            f"{res['counts'].get('SHIPPED', 0)} shipped, {res['counts'].get('WORKED', 0)} worked, "
-            f"{res['counts'].get('UNTOUCHED', 0)} no activity. (The narrative and the text "
-            "come from the service run.)")
-    else:
-      alert(res.get('message', 'Retro failed'))
-    self._retro_next = day
-    comp.raise_event('x-close-alert')
-
-  def _retro_ask_anyway(self, variance_id, day, comp):
-    res = anvil.server.call('retro_ask_anyway', variance_id)
-    if res.get('status') != 'success':
-      alert(res.get('message', 'Could not ask'))
-    self._retro_next = day
-    comp.raise_event('x-close-alert')
