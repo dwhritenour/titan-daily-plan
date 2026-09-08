@@ -25,7 +25,8 @@ class retro(retroTemplate):
                'REMOVED_WITH_REASON': 'removed with reason',
                'UNPLANNED_SHIP': 'shipped, not on the plan',
                'DATE_MOVED': 'ship-by moved', 'SHIPPED': 'shipped',
-               'WORKED': 'worked', 'UNTOUCHED_STRETCH': 'stretch, not reached'}
+               'WORKED': 'worked', 'UNTOUCHED_STRETCH': 'stretch, not reached',
+               'CANCELLED': 'cancelled after publish', 'QTY_CHANGED': 'quantity changed'}
   _SIDES = ['All', 'Production Control', 'Sales']
 
   def __init__(self, plan_date=None, **properties):

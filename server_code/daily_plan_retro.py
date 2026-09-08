@@ -22,7 +22,17 @@ events unused since 08-21):
               N=3 recurrence); without one it earns a question
     UNTOUCHED none of the above (Must/Next earn a PC question; Stretch is
               optional by definition and closes silently)
-    DATE_MOVED    ship-by on the open line != ship-by at publish   -> Sales
+    DATE_MOVED    ship-by on the open line != ship-by at publish, or a
+              due_date change in work_order_changes (old -> new, when)
+              -> Sales. Suppresses the PC question on the same line.
+    CANCELLED     SO_Canceled / SO_Removed in work_order_changes since
+              publish: the line left the open book but did NOT ship
+              (v1.2, 2026-09-08 - before this it counted as SHIPPED)
+    QTY_CHANGED   quantity FIELD_CHANGE since publish, no SO_Shipped: the
+              balance dropped because Order Entry changed it, not a ship
+    Evidence (v1.2): dbo.work_order_changes - the EM job diffs every work
+    order against its sales-order line every 15 min (SO_Shipped with the
+    time, SO_Canceled, SO_Removed, FIELD_CHANGE due_date / quantity).
     UNPLANNED_SHIP shipped on the day, not planned, load >= threshold -> Sales
 Every inferred outcome enters the ledger as evidence 'Probable' at best;
 'Verified' needs a person (Dave confirms the reading - always Dave).
@@ -54,7 +64,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.1.0'
+_RETRO_VERSION = 'retro-1.2.0'
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -146,6 +156,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         WHERE plan_date = %s
     """, (plan_date,))
     hdr = cursor.fetchone() or {}
+    published_at = hdr.get('published_at')
     cap_in = float(hdr.get('capacity_inches') or 0)
     reserve_in = round(cap_in * (1.0 - rp['fill_pct']), 2) if cap_in else None
 
@@ -186,6 +197,34 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     """, (plan_date, plan_date))
     wos = {(r['o'], r['s']): r for r in cursor.fetchall()}
 
+    # --- what Order Entry changed since publish (v1.2) -----------------
+    # dbo.work_order_changes: the EM job diffs every work order against its
+    # sales-order line every 15 min. Time-stamped evidence the open book
+    # cannot give: SO_Shipped (when), SO_Canceled / SO_Removed (gone but
+    # NOT shipped), FIELD_CHANGE due_date / quantity (old -> new, when).
+    since = published_at or datetime.combine(plan_date, datetime.min.time())
+    cursor.execute("""
+        SELECT wo.sales_order_number AS o, wo.part_number AS s,
+               c.change_type, c.field_name, c.old_value, c.new_value, c.detected_at
+        FROM dbo.work_order_changes c
+        JOIN dbo.work_orders wo ON wo.work_order_id = c.work_order_id
+        WHERE c.detected_at >= %s
+          AND (c.change_type IN ('SO_Shipped', 'SO_Canceled', 'SO_Removed')
+               OR (c.change_type = 'FIELD_CHANGE'
+                   AND c.field_name IN ('due_date', 'quantity')))
+        ORDER BY c.detected_at
+    """, (since,))
+    changes = {}
+    for c in cursor.fetchall():
+      changes.setdefault((c['o'], c['s']), []).append(c)
+
+    def _chg(key, *types, field=None):
+      return [c for c in changes.get(key, ())
+              if c['change_type'] in types and (field is None or c['field_name'] == field)]
+
+    def _hm(dt):
+      return dt.strftime('%H:%M') if dt else '?'
+
     cursor.execute("""
         SELECT nx_order_numb, nx_sku, event_type, actor, note, new_value, event_time
         FROM dbo.pc_plan_line_events
@@ -194,7 +233,6 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         ORDER BY event_time
     """, (plan_date,))
     removals = {}
-    published_at = hdr.get('published_at')
     for e in cursor.fetchall():
       if published_at and e['event_time'] and e['event_time'] < published_at:
         continue                       # pre-publish edits are the plan, not a variance
@@ -203,7 +241,8 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     # --- classify every planned line ----------------------------------
     rows, counts = [], {'SHIPPED': 0, 'WORKED': 0, 'REMOVED_WITH_REASON': 0,
                         'REMOVED_NO_REASON': 0, 'UNTOUCHED': 0,
-                        'UNTOUCHED_STRETCH': 0, 'DATE_MOVED': 0, 'UNPLANNED_SHIP': 0}
+                        'UNTOUCHED_STRETCH': 0, 'DATE_MOVED': 0, 'UNPLANNED_SHIP': 0,
+                        'CANCELLED': 0, 'QTY_CHANGED': 0}
     planned_in = moved_in = 0.0
     n_stretch = 0
     for s in planned:
@@ -222,10 +261,31 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       # shipped signal by itself - 86 candidate lines sat at 15 before the
       # plan existed. Until the snapshot records the status at publish,
       # shipped = the line left the open book or its balance dropped.
-      shipped = (b is None) or (bal < qty0 - 0.001)
+      shp = _chg(key, 'SO_Shipped')
+      cxl = _chg(key, 'SO_Canceled', 'SO_Removed')
+      qch = _chg(key, 'FIELD_CHANGE', field='quantity')
+      dch = _chg(key, 'FIELD_CHANGE', field='due_date')
+      # v1.2: the change log outranks the open-book inference. A line that
+      # left the book because Order Entry cancelled it did not ship; a
+      # balance that dropped because the quantity was edited did not ship.
+      cancelled = bool(cxl) and not shp
+      qty_edited = bool(qch) and not shp and b is not None
+      shipped = bool(shp) or ((b is None or bal < qty0 - 0.001)
+                              and not cancelled and not qty_edited)
       worked = bool(w and (w['done_since'] or w['touched']))
       rem = removals.get(key)
       late = (s['ship_by_date'] and s['ship_by_date'] < plan_date)
+      # date moved: the change log (old -> new, when) or the open book
+      new_ship_by = None
+      if dch:
+        try:
+          new_ship_by = date.fromisoformat((dch[-1]['new_value'] or '')[:10])
+        except ValueError:
+          new_ship_by = None
+      if new_ship_by is None and b is not None and b['ship_by'] and s['ship_by_date'] \
+      and b['ship_by'] != s['ship_by_date']:
+        new_ship_by = b['ship_by']
+      date_moved = bool(new_ship_by and s['ship_by_date'] and new_ship_by != s['ship_by_date'])
       base = (f"{tier} on {_fmt_day(plan_date)}, {load:,.0f} in"
               + (f", late since {s['ship_by_date']:%m-%d}" if late else '')
               + (f", flags {s['flag_codes']}" if s.get('flag_codes') else ''))
@@ -236,12 +296,31 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
              'observed': False, 'case': None, 'routed_to': None,
              'explanation': base, 'question': None, 'asked_to': None,
              'cause_key': None, 'resolution': 'OPEN', 'removed_by_role': None}
-      if shipped:
+      if cancelled:
+        c0 = cxl[-1]
+        row.update(case='CANCELLED', observed=True, routed_to='SALES',
+                   explanation=base + f"; {c0['change_type']} at {_hm(c0['detected_at'])} "
+                   "per the work-order change log - left the book, did not ship",
+                   question=(f"Order {key[0]} / {key[1]} was {tier} on {_fmt_day(plan_date)} "
+                             f"and was cancelled/removed at {_hm(c0['detected_at'])} after the plan "
+                             "was published. Customer cancellation, or an entry change?"))
+      elif shipped:
         row.update(case='SHIPPED', observed=True, resolution='EXPLAINED',
-                   explanation=base + ('; line left the open book' if b is None else
+                   explanation=base + (f"; shipped {_hm(shp[-1]['detected_at'])} per the "
+                                       "work-order change log" if shp else
+                                       '; line left the open book' if b is None else
                                        f"; balance {qty0:,.0f} -> {bal:,.0f}"))
         if tier != 'Stretch':
           moved_in += load
+      elif qty_edited:
+        q0 = qch[-1]
+        row.update(case='QTY_CHANGED', observed=True, routed_to='SALES',
+                   explanation=base + f"; quantity {q0['old_value']} -> {q0['new_value']} at "
+                   f"{_hm(q0['detected_at'])} per the work-order change log - not a shipment",
+                   question=(f"Order {key[0]} / {key[1]} quantity changed from {q0['old_value']} "
+                             f"to {q0['new_value']} at {_hm(q0['detected_at'])} after "
+                             f"{_fmt_day(plan_date)}'s plan was published. Customer change, "
+                             "or an entry correction?"))
       elif worked:
         row.update(case='WORKED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
                    explanation=base + f"; work order {w['wo_status']}"
@@ -265,6 +344,12 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       elif tier == 'Stretch':
         row.update(case='UNTOUCHED_STRETCH', expected='WORKED_ON', resolution='EXPLAINED',
                    explanation=base + '; Stretch line not reached (no question)')
+      elif date_moved:
+        # v1.2: Sales moved the date after publish - the PC question
+        # ('what stopped it?') is stale; the DATE_MOVED row below asks Sales.
+        row.update(case='UNTOUCHED', expected='WORKED_ON', resolution='EXPLAINED',
+                   explanation=base + f"; no activity, but ship-by moved to {new_ship_by:%m/%d} "
+                   "after publish - Sales is asked instead")
       else:
         row.update(case='UNTOUCHED', expected='WORKED_ON', routed_to='PC',
                    explanation=base + '; no shipment and no work-order activity recorded',
@@ -276,15 +361,18 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       rows.append(row)
 
       # date moved is a SECOND row for the same line (different 'expected')
-      if b is not None and s['ship_by_date'] and b['ship_by'] and b['ship_by'] != s['ship_by_date']:
+      if date_moved and not cancelled:
         counts['DATE_MOVED'] += 1
+        when = f" at {_hm(dch[-1]['detected_at'])}" if dch else ''
         rows.append({'order': key[0], 'sku': key[1], 'tier': tier, 'load': load,
                      'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
                      'expected': 'DATE_HELD', 'expected_value': None, 'actual_value': None,
-                     'observed': False, 'case': 'DATE_MOVED', 'routed_to': 'SALES',
-                     'explanation': f"ship-by at publish {s['ship_by_date']:%m/%d}, now {b['ship_by']:%m/%d}",
+                     'observed': bool(dch), 'case': 'DATE_MOVED', 'routed_to': 'SALES',
+                     'explanation': (f"ship-by at publish {s['ship_by_date']:%m/%d}, now "
+                                     f"{new_ship_by:%m/%d}" + (f", changed{when} per the "
+                                                               "work-order change log" if dch else '')),
                      'question': (f"Order {key[0]} / {key[1]} ship-by moved from "
-                                  f"{s['ship_by_date']:%m/%d} to {b['ship_by']:%m/%d} after "
+                                  f"{s['ship_by_date']:%m/%d} to {new_ship_by:%m/%d}{when} after "
                                   f"{_fmt_day(plan_date)}'s plan was published. Customer change, "
                                   "or an entry correction?"),
                      'asked_to': None, 'cause_key': None, 'resolution': 'OPEN',
@@ -300,7 +388,12 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       qty0 = float(s['qty_open'] or 0)
       b = book.get(key)
       bal = float(b['balance'] or 0) if b else 0.0
-      shipped = (b is None) or (bal < qty0 - 0.001)      # status 15 alone: no
+      shp = _chg(key, 'SO_Shipped')
+      if _chg(key, 'SO_Canceled', 'SO_Removed') and not shp:
+        continue                       # v1.2: cancelled, not shipped
+      if _chg(key, 'FIELD_CHANGE', field='quantity') and not shp and b is not None:
+        continue                       # v1.2: quantity edited, not shipped
+      shipped = bool(shp) or (b is None) or (bal < qty0 - 0.001)   # status 15 alone: no
       if not shipped:
         continue
       n_unplanned_all += 1
@@ -316,13 +409,16 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                                      + ('gated at publish' if s['is_gated'] else f"score {int(s['priority_score'] or 0)}")
                                      + '; shipped anyway'),
                      'question': (f"Order {key[0]} / {key[1]} ({load:,.0f} in) shipped on "
-                                  f"{_fmt_day(plan_date)} without being on the plan. Was this a "
+                                  f"{_fmt_day(plan_date)}"
+                                  + (f" at {_hm(shp[-1]['detected_at'])}" if shp else '')
+                                  + " without being on the plan. Was this a "
                                   "customer-requested rush, and when was it requested?"),
                      'asked_to': None, 'cause_key': None, 'resolution': 'OPEN',
                      'removed_by_role': None})
 
     # --- ration the questions: max_q total, min_sales floor ------------
-    order_key = {'UNTOUCHED': 0, 'REMOVED_NO_REASON': 1, 'UNPLANNED_SHIP': 2, 'DATE_MOVED': 3}
+    order_key = {'UNTOUCHED': 0, 'REMOVED_NO_REASON': 1, 'UNPLANNED_SHIP': 2,
+                 'CANCELLED': 3, 'QTY_CHANGED': 4, 'DATE_MOVED': 5}
     def _rank(r):
       return (order_key.get(r['case'], 9), 0 if r['tier'] == 'Must' else 1,
               -r['score'], -r['load'])
