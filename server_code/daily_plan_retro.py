@@ -27,8 +27,9 @@ events unused since 08-21):
 Every inferred outcome enters the ledger as evidence 'Probable' at best;
 'Verified' needs a person (Dave confirms the reading - always Dave).
 
-Callables (the Retro form):
-    retro_get_day(plan_date)                 header + all variances + cause list
+Callables (the #retro and #retrev forms):
+    retro_get_day(plan_date)                 header + all variances + day list
+    retro_get_review()                       Dave's queue across days + recent + causes
     retro_answer(variance_id, answer, who)   free text, verbatim
     retro_confirm(variance_id, reading, evidence_class, cause_key,
                   resolution, pin)           Dave only (RETRO_ARBITER_PIN secret)
@@ -53,7 +54,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.0.1'
+_RETRO_VERSION = 'retro-1.1.0'
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -503,13 +504,97 @@ def retro_get_day(plan_date=None):
     week = [serialize_row(r) for r in cursor.fetchall()]
     cursor.execute("SELECT MIN(plan_date) AS lo, MAX(plan_date) AS hi FROM dbo.pc_plan_retro")
     rng = cursor.fetchone() or {}
+    cursor.execute("""
+        SELECT TOP 15 r.plan_date,
+               (SELECT COUNT(*) FROM dbo.pc_plan_variance v
+                WHERE v.plan_date = r.plan_date AND v.asked_at IS NOT NULL
+                  AND v.answer_text IS NULL AND v.resolution = 'OPEN') AS n_open
+        FROM dbo.pc_plan_retro r ORDER BY r.plan_date DESC
+    """)
+    days = [{'plan_date': make_serializable(d['plan_date']), 'n_open': int(d['n_open'] or 0)}
+            for d in cursor.fetchall()]
+    n_open = {'PC': 0, 'SALES': 0}
+    for v in rows:
+      if v.get('asked_at') and not v.get('answer_text') and v.get('resolution') == 'OPEN':
+        n_open['SALES' if v.get('routed_to') == 'SALES' else 'PC'] += 1
     return {'status': 'success', 'plan_date': plan_date.isoformat(),
             'header': serialize_row(hdr) if hdr else None,
             'variances': rows, 'dave_queue': queue, 'causes': causes,
             'week_causes': week, 'params': {k: v for k, v in rp.items()},
             'answerers': {'PC': rp['pc_owners'], 'SALES': rp['sales_owners']},
+            'days': days, 'n_open': n_open,
             'first_day': make_serializable(rng.get('lo')),
             'last_day': make_serializable(rng.get('hi'))}
+  except Exception as e:
+    return {'status': 'error', 'message': f'{e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def retro_get_review():
+  """Dave's #retrev form: every answered-but-unconfirmed question across
+  all days (the queue), the last confirmed ones, the cause list, the
+  14-day cause counts, and which days still owe answers."""
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.variance_case,
+               v.routed_to, v.tier, v.load_inches, v.system_explanation, v.question_text,
+               v.asked_to, v.answer_text, v.answered_by, v.answered_at,
+               v.proposed_reading, v.proposed_evidence_class, v.proposed_cause_key,
+               k.label AS proposed_cause_label, v.resolution
+        FROM dbo.pc_plan_variance v
+        LEFT JOIN dbo.pc_plan_cause_keys k ON k.cause_key = v.proposed_cause_key
+        WHERE v.answer_text IS NOT NULL AND v.reading_confirmed_at IS NULL
+        ORDER BY v.answered_at
+    """)
+    queue = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT TOP 20 v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.variance_case,
+               v.routed_to, v.answer_text, v.answered_by, v.confirmed_reading,
+               v.evidence_class, v.cause_key, v.resolution, v.reading_confirmed_at
+        FROM dbo.pc_plan_variance v
+        WHERE v.reading_confirmed_at IS NOT NULL
+        ORDER BY v.reading_confirmed_at DESC
+    """)
+    recent = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT plan_date,
+               SUM(CASE WHEN asked_at IS NOT NULL THEN 1 ELSE 0 END) AS n_asked,
+               SUM(CASE WHEN asked_at IS NOT NULL AND answer_text IS NULL
+                         AND resolution = 'OPEN' THEN 1 ELSE 0 END) AS n_unanswered,
+               SUM(CASE WHEN answer_text IS NOT NULL AND reading_confirmed_at IS NULL
+                        THEN 1 ELSE 0 END) AS n_awaiting_dave
+        FROM dbo.pc_plan_variance
+        WHERE plan_date >= DATEADD(day, -21, CAST(GETDATE() AS DATE))
+        GROUP BY plan_date ORDER BY plan_date DESC
+    """)
+    days = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT cause_key, label, side, variance_kind FROM dbo.pc_plan_cause_keys
+        WHERE is_active = 1 ORDER BY sort_order
+    """)
+    causes = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT v.cause_key, k.label, COUNT(*) AS n
+        FROM dbo.pc_plan_variance v
+        LEFT JOIN dbo.pc_plan_cause_keys k ON k.cause_key = v.cause_key
+        WHERE v.cause_key IS NOT NULL AND v.reading_confirmed_at IS NOT NULL
+          AND v.evidence_class IN ('Verified','Probable')
+          AND v.plan_date >= DATEADD(day, -14, CAST(GETDATE() AS DATE))
+        GROUP BY v.cause_key, k.label ORDER BY n DESC
+    """)
+    week = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT rule_id, title, status, cause_key, recurrence_count, proposed_at
+        FROM dbo.pc_plan_rule_register
+        WHERE status IN ('PROPOSED','NEEDS_BUILD') ORDER BY proposed_at DESC
+    """)
+    rules = [serialize_row(r) for r in cursor.fetchall()]
+    return {'status': 'success', 'queue': queue, 'recent': recent, 'days': days,
+            'causes': causes, 'week_causes': week, 'rule_candidates': rules}
   except Exception as e:
     return {'status': 'error', 'message': f'{e}'}
   finally:

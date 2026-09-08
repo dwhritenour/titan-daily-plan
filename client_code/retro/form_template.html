@@ -1,0 +1,31 @@
+<anvil-form container="HtmlTemplate" prop:html="@theme:standard-page.html">
+  <anvil-component type="ColumnPanel" name="content_panel" container:slot="default">
+    <!-- Header row: back-link, title, day picker, refresh, run-now -->
+    <anvil-component type="FlowPanel" name="flow_header" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"5",null]}' container:grid_position="HDRROW,HDRCOL" container:full_width_row="true">
+      <anvil-component type="Link" name="lk_plan" prop:text="← Daily Plan" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+      <anvil-component type="Label" name="lbl_title" prop:text="Retro" prop:bold="true" prop:font_size="22" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}'></anvil-component>
+      <anvil-component type="DropDown" name="dd_day" container:width="220"></anvil-component>
+      <anvil-component type="Button" name="btn_refresh" prop:text="Refresh" prop:role="outlined-button"></anvil-component>
+      <anvil-component type="Link" name="lk_run" prop:text="run retro now" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+    </anvil-component>
+    <!-- Summary block -->
+    <anvil-component type="Label" name="lbl_summary" prop:bold="false" prop:spacing='{"margin":["5",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="SUMROW,SUMCOL" container:full_width_row="true"></anvil-component>
+    <anvil-component type="Label" name="lbl_open" prop:bold="false" prop:spacing='{"margin":["0",null,"5",null],"padding":["0",null,"0",null]}' container:grid_position="OPNROW,OPNCOL" container:full_width_row="true"></anvil-component>
+    <!-- Narrative: link toggles the read-only text area -->
+    <anvil-component type="Link" name="lk_narrative" prop:text="Show narrative" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="NRLROW,NRLCOL" container:full_width_row="true"></anvil-component>
+    <anvil-component type="TextArea" name="ta_narrative" prop:auto_expand="true" prop:enabled="false" prop:visible="false" prop:font_size="13" prop:role="outlined" prop:spacing='{"margin":["5",null,"5",null]}' container:grid_position="NRAROW,NRACOL" container:full_width_row="true"></anvil-component>
+    <!-- Viewer / side filters -->
+    <anvil-component type="FlowPanel" name="flow_filters" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"5",null]}' container:grid_position="FLTROW,FLTCOL" container:full_width_row="true">
+      <anvil-component type="Label" name="lbl_who_prompt" prop:text="I am:" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+      <anvil-component type="DropDown" name="dd_who" container:width="220"></anvil-component>
+      <anvil-component type="Label" name="lbl_side_prompt" prop:text="Show:" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}'></anvil-component>
+      <anvil-component type="DropDown" name="dd_side" container:width="220"></anvil-component>
+    </anvil-component>
+    <!-- One card per open question -->
+    <anvil-component type="RepeatingPanel" name="rp_questions" prop:item_template="Titan_Daily_Plan.retro.RetroQuestionRow" prop:spacing='{"margin":["0",null,"5",null]}' container:grid_position="RPQROW,RPQCOL" container:full_width_row="true"></anvil-component>
+    <!-- Closed / no-question lines: link toggles the read-only text area -->
+    <anvil-component type="Link" name="lk_closed" prop:text="Show lines that need no question" prop:spacing='{"margin":["5",null,"0",null]}' container:grid_position="CLKROW,CLKCOL" container:full_width_row="true"></anvil-component>
+    <anvil-component type="TextArea" name="ta_closed" prop:auto_expand="true" prop:enabled="false" prop:visible="false" prop:font_size="13" prop:role="outlined" prop:spacing='{"margin":["5",null,"10",null]}' container:grid_position="CLAROW,CLACOL" container:full_width_row="true"></anvil-component>
+  </anvil-component>
+  <anvil-component type="Label" name="lbl_app_title" prop:text="Titan Daily Plan Retro" prop:bold="true" prop:font_size="26" prop:icon="fa:comments-o" container:slot="title"></anvil-component>
+</anvil-form>

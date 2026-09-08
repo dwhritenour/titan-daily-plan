@@ -1,0 +1,12 @@
+<anvil-form container="ColumnPanel" prop:role="outlined-card" prop:spacing='{"margin":["5",null,"5",null]}'>
+  <anvil-component type="Label" name="lbl_head" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RQHEAD,RQCOL01" container:full_width_row="true"></anvil-component>
+  <anvil-component type="Label" name="lbl_question" prop:bold="false" prop:spacing='{"margin":["3",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RQQUES,RQCOL02" container:full_width_row="true"></anvil-component>
+  <anvil-component type="Label" name="lbl_context" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RQCTXT,RQCOL03" container:full_width_row="true"></anvil-component>
+  <anvil-component type="Label" name="lbl_answer" prop:foreground="#595959" prop:spacing='{"margin":["3",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RQANSL,RQCOL04" container:full_width_row="true"></anvil-component>
+  <anvil-component type="TextArea" name="ta_answer" prop:placeholder="What happened — plain words are fine" prop:height="70" prop:font_size="13" prop:role="outlined" prop:spacing='{"margin":["5",null,"5",null]}' container:grid_position="RQANST,RQCOL05" container:full_width_row="true"></anvil-component>
+  <anvil-component type="FlowPanel" name="flow_row_actions" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="RQACTS,RQCOL06" container:full_width_row="true">
+    <anvil-component type="Button" name="btn_submit" prop:text="Submit answer" prop:role="outlined-button"></anvil-component>
+    <anvil-component type="Button" name="btn_ask" prop:text="Ask anyway" prop:role="outlined-button"></anvil-component>
+    <anvil-component type="Label" name="lbl_status" prop:font_size="11" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+  </anvil-component>
+</anvil-form>

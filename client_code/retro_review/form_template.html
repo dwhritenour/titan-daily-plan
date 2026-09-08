@@ -1,0 +1,25 @@
+<anvil-form container="HtmlTemplate" prop:html="@theme:standard-page.html">
+  <anvil-component type="ColumnPanel" name="content_panel" container:slot="default">
+    <!-- Header row: back-link, title, refresh, reviewer PIN -->
+    <anvil-component type="FlowPanel" name="flow_header" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"5",null]}' container:grid_position="HDRROW,HDRCOL" container:full_width_row="true">
+      <anvil-component type="Link" name="lk_plan" prop:text="← Daily Plan" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+      <anvil-component type="Label" name="lbl_title" prop:text="Retro review" prop:bold="true" prop:font_size="22" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}'></anvil-component>
+      <anvil-component type="Button" name="btn_refresh" prop:text="Refresh" prop:role="outlined-button"></anvil-component>
+      <anvil-component type="TextBox" name="tb_pin" prop:placeholder="PIN" prop:hide_text="true" prop:font_size="13" prop:role="outlined" container:width="72"></anvil-component>
+    </anvil-component>
+    <!-- Summary line -->
+    <anvil-component type="Label" name="lbl_summary" prop:bold="false" prop:spacing='{"margin":["5",null,"5",null],"padding":["0",null,"0",null]}' container:grid_position="SUMROW,SUMCOL" container:full_width_row="true"></anvil-component>
+    <!-- One card per answered question awaiting review -->
+    <anvil-component type="RepeatingPanel" name="rp_queue" prop:item_template="Titan_Daily_Plan.retro_review.RetroReviewRow" prop:spacing='{"margin":["0",null,"5",null]}' container:grid_position="RPQROW,RPQCOL" container:full_width_row="true"></anvil-component>
+    <!-- Days -->
+    <anvil-component type="Label" name="lbl_days_head" prop:text="Days" prop:bold="true" prop:font_size="13" prop:spacing='{"margin":["10",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="DAYHDR,DAYHCL" container:full_width_row="true"></anvil-component>
+    <anvil-component type="TextArea" name="ta_days" prop:auto_expand="true" prop:enabled="false" prop:font_size="13" prop:role="outlined" prop:spacing='{"margin":["3",null,"5",null]}' container:grid_position="DAYTXT,DAYTCL" container:full_width_row="true"></anvil-component>
+    <!-- Recent readings -->
+    <anvil-component type="Label" name="lbl_recent_head" prop:text="Recent readings" prop:bold="true" prop:font_size="13" prop:spacing='{"margin":["10",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RCNHDR,RCNHCL" container:full_width_row="true"></anvil-component>
+    <anvil-component type="TextArea" name="ta_recent" prop:auto_expand="true" prop:enabled="false" prop:font_size="13" prop:role="outlined" prop:spacing='{"margin":["3",null,"5",null]}' container:grid_position="RCNTXT,RCNTCL" container:full_width_row="true"></anvil-component>
+    <!-- Causes, last 14 days -->
+    <anvil-component type="Label" name="lbl_causes_head" prop:text="Causes, last 14 days" prop:bold="true" prop:font_size="13" prop:spacing='{"margin":["10",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="CAUHDR,CAUHCL" container:full_width_row="true"></anvil-component>
+    <anvil-component type="TextArea" name="ta_causes" prop:auto_expand="true" prop:enabled="false" prop:font_size="13" prop:role="outlined" prop:spacing='{"margin":["3",null,"10",null]}' container:grid_position="CAUTXT,CAUTCL" container:full_width_row="true"></anvil-component>
+  </anvil-component>
+  <anvil-component type="Label" name="lbl_app_title" prop:text="Titan Daily Plan Retro Review" prop:bold="true" prop:font_size="26" prop:icon="fa:check-square-o" container:slot="title"></anvil-component>
+</anvil-form>
