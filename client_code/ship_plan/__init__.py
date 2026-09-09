@@ -366,7 +366,7 @@ class ship_plan(ship_planTemplate):
     if self._stretch:
       # Stretch is "if capacity permits" — it never counts against the
       # cap, so it rides OUTSIDE the Planned number and the meter fill.
-      txt += f"  · +{self._stretch:,.0f} stretch"
+      txt += f"  · +{self._stretch:,.0f} if time"
     self.lbl_capacity_line.text = txt
     self._draw_capacity_bar()
     self.lbl_crew.text = cap.get('capacity_detail', '')
@@ -616,7 +616,7 @@ class ship_plan(ship_planTemplate):
     buttons = []
     if sug:
       buttons.append((f"Snooze to {sug}", 'snooze'))
-    buttons += [("Mark Stretch", 'stretch'),
+    buttons += [("Mark If time", 'stretch'),
                 ("Leave Unplaced", 'unplaced'), ("Keep anyway", 'keep')]
     choice = alert(msg, title="Over capacity", buttons=buttons, large=True)
     for sku in skus:
@@ -643,8 +643,8 @@ class ship_plan(ship_planTemplate):
       r = anvil.server.call('ship_plan_get_reasons')
       ok = r.get('status') == 'success'
       self._reasons = (r.get('reasons') or []) if ok else []
-    dd_tier = DropDown(items=[('Must today', 'Must'), ('Next', 'Next'),
-                              ('Stretch — if capacity permits', 'Stretch')],
+    dd_tier = DropDown(items=[('Priority', 'Must'), ('Next', 'Next'),
+                              ('If time — if capacity permits', 'Stretch')],
                        selected_value=item.get('tier') or 'Next')
     dd_reason = DropDown(
       items=[('— no reason set —', '')] +
@@ -940,11 +940,11 @@ class ship_plan(ship_planTemplate):
     elif r.get('status') == 'skipped':
       alert(r.get('message', 'Skipped'))
     else:
-      msg = (f"Proposed {r.get('n_proposed', 0)} lines + {r.get('n_stretch', 0)} stretch — "
+      msg = (f"Proposed {r.get('n_proposed', 0)} lines + {r.get('n_stretch', 0)} if-time — "
              f"{r.get('proposed_inches', 0):,.0f} of {r.get('target_inches', 0):,.0f} "
              f"target in ({int(float(r.get('fill_pct', 0.8)) * 100)}% of "
              f"{r.get('capacity_inches', 0):,.0f}). "
-             f"{r.get('n_gated', 0)} gated, {r.get('n_skipped', 0)} beyond stretch, "
+             f"{r.get('n_gated', 0)} gated, {r.get('n_skipped', 0)} beyond if-time, "
              f"{r.get('n_split_needed', 0)} need a split decision (bigger than a day "
              f"or than {r.get('max_line_inches', 0):,.0f} in), "
              f"{r.get('n_zero_touch_skipped', 0)} zero-touch left off.")

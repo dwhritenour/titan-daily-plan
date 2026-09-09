@@ -68,8 +68,8 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     if status == 'Planned':
       tier = item.get('tier') or 'Next'
       bg, fg = TIER_COLORS.get(tier, TIER_COLORS['Next'])
-      chip_text = {'Must': 'MUST TODAY', 'Next': 'NEXT',
-                   'Stretch': 'STRETCH'}.get(tier, tier.upper())
+      chip_text = {'Must': 'PRIORITY', 'Next': 'NEXT',
+                   'Stretch': 'IF TIME'}.get(tier, tier.upper())
     self.lbl_status.text = chip_text
     self.lbl_status.background = bg
     self.lbl_status.foreground = fg
