@@ -730,7 +730,64 @@ class ship_plan(ship_planTemplate):
       alert(r.get('message', 'Remove failed'))
     self.load_day()
 
+  def _partial_order_gate(self):
+    """WHOLE-ORDER RULE (Dave, 2026-09-13): before Publish, list every
+    order on the plan whose same-due-date lines are not all on it. One
+    tap adds the rest (same tier as the order's planned lines); 'Publish
+    anyway' is allowed and logged (PartialAck) so the retro can tell knew
+    from missed. Returns (proceed, acknowledged_groups)."""
+    r = anvil.server.call('ship_plan_partial_orders', self.plan_date)
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Partial-order check failed') +
+            '\n\nPublishing without the check.')
+      return True, []
+    groups = r.get('groups') or []
+    if not groups:
+      return True, []
+    lines_txt = []
+    for g in groups:
+      parts = []
+      for l in g['lines']:
+        s = f"{l['sku']} ({float(l['inches']):,.0f} in)"
+        if l.get('elsewhere'):
+          s += f" — {l['elsewhere']}"
+        parts.append(s)
+      lines_txt.append(f"Order {g['order']} (due {g['due_date']}, "
+                       f"{g['tier']}): {len(g['lines'])} line(s) off the plan, "
+                       f"{float(g['missing_inches']):,.0f} in\n    " + '\n    '.join(parts))
+    n_addable = sum(g.get('n_addable', 0) for g in groups)
+    msg = ("WHOLE-ORDER RULE — these orders are only partly on the plan. "
+           "Assembly techs run each order as one job; a partial order on "
+           "the board means it will not ship.\n\n" + '\n\n'.join(lines_txt))
+    buttons = []
+    if n_addable:
+      buttons.append((f"Add the rest ({n_addable} line(s))", 'add'))
+    buttons += [("Publish anyway", 'go'), ("Cancel", None)]
+    choice = alert(msg, title='Partial orders on this plan', buttons=buttons,
+                   large=True)
+    if choice == 'add':
+      n_ok = 0
+      for g in groups:
+        if not g.get('n_addable'):
+          continue
+        res = anvil.server.call('ship_plan_add_order', self.plan_date,
+                                g['order'], g['tier'], None, g['due_date'])
+        if res.get('status') == 'success':
+          n_ok += len(res.get('added') or [])
+        else:
+          alert(f"{g['order']}: {res.get('message', 'add failed')}")
+      Notification(f"{n_ok} line(s) added — review the plan, then Publish.",
+                   timeout=5).show()
+      return False, []
+    if choice == 'go':
+      return True, groups
+    return False, []
+
   def _publish_click(self, **event_args):
+    proceed, partial_ack = self._partial_order_gate()
+    if not proceed:
+      self.load_day()
+      return
     cap = self._capacity or {}
     planned = sum(float(l['load_inches']) for l in self._lines
                   if l['line_status'] in ('Planned', 'Proposed', 'Confirmed'))
@@ -749,7 +806,7 @@ class ship_plan(ship_planTemplate):
       "The capacity number is stamped on the plan — it's the number "
       "sales sees."):
       return
-    r = anvil.server.call('ship_plan_publish', self.plan_date)
+    r = anvil.server.call('ship_plan_publish', self.plan_date, partial_ack)
     if r.get('status') != 'success':
       alert(r.get('message', 'Publish failed'))
     elif r.get('snapshot_warning'):

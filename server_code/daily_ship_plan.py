@@ -913,11 +913,14 @@ def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None,
 
 
 @anvil.server.callable
-def ship_plan_add_order(plan_date, order, tier='Next', reason=None):
+def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
+                        due_date=None):
   """Add EVERY open SKU of a sales order to the day — one transaction.
   Per-line Added events plus one OrderAdded summary; a single cap check
   at the end (the client runs one dialog for the whole order, not one
-  per line). SKUs already on the plan are skipped, not errors."""
+  per line). SKUs already on the plan are skipped, not errors.
+  due_date (2026-09-13, whole-order rule): only the lines with that
+  DETAIL ship-by date - the publish check's "Add the rest"."""
   plan_date = _parse_date(plan_date)
   if tier not in ('Must', 'Next', 'Stretch'):
     return {'status': 'error', 'message': f'Bad tier {tier}.'}
@@ -925,10 +928,17 @@ def ship_plan_add_order(plan_date, order, tier='Next', reason=None):
   conn = get_connection()
   try:
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT DISTINCT nx_sku FROM dbo.vw_pc_ship_candidate_rows
-        WHERE nx_order_numb = %s
-    """, (order,))
+    if due_date:
+      cursor.execute("""
+          SELECT DISTINCT nx_sku FROM dbo.vw_pc_ship_candidate_rows
+          WHERE nx_order_numb = %s
+            AND CAST(nx_dship_by_date AS DATE) = %s
+      """, (order, _parse_date(due_date)))
+    else:
+      cursor.execute("""
+          SELECT DISTINCT nx_sku FROM dbo.vw_pc_ship_candidate_rows
+          WHERE nx_order_numb = %s
+      """, (order,))
     skus = [r['nx_sku'] for r in cursor.fetchall()]
     if not skus:
       return {'status': 'error',
@@ -995,6 +1005,96 @@ def ship_plan_add_order(plan_date, order, tier='Next', reason=None):
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Add order failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def ship_plan_partial_orders(plan_date):
+  """WHOLE-ORDER RULE (Dave, 2026-09-13) - the plan invariant, checked at
+  Publish for whoever built the plan (agent or person): every order on
+  the day whose open lines with the SAME detail ship-by date are not all
+  on it. Returns the missing lines per (order, due date) so the client
+  can offer 'Add the rest'. Lines already planned on another day or
+  snoozed are reported with where they went (PC decided; not auto-added).
+  Hidden lines (charges, services - pc_plan_exclusions) are not lines."""
+  plan_date = _parse_date(plan_date)
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    # The candidate-rows view carries a per-row size parser; pin the few
+    # orders on this plan into a temp table once (pooled connection: drop
+    # it before and after).
+    cursor.execute("IF OBJECT_ID('tempdb..#cr') IS NOT NULL DROP TABLE #cr")
+    cursor.execute("""
+        SELECT nx_order_numb, nx_sku, nx_sku_desc, bucket,
+               nx_qty_balance_due, work_inches,
+               CAST(nx_dship_by_date AS DATE) AS due_date
+        INTO #cr
+        FROM dbo.vw_pc_ship_candidate_rows
+        WHERE nx_order_numb IN (SELECT nx_order_numb FROM dbo.pc_ship_plan_line
+                                WHERE plan_date = %s
+                                  AND line_status IN ('Planned', 'Proposed', 'Confirmed'))
+    """, (plan_date,))
+    cursor.execute("""
+        SELECT r.nx_order_numb, r.due_date, r.nx_sku,
+               MAX(r.nx_sku_desc) AS sku_desc, MAX(r.bucket) AS bucket,
+               SUM(r.nx_qty_balance_due) AS qty, SUM(r.work_inches) AS inches,
+               (SELECT TOP 1 CONVERT(VARCHAR(10), ISNULL(x.snooze_to_date, x.plan_date), 120)
+                             + ' ' + x.line_status
+                FROM dbo.pc_ship_plan_line x
+                WHERE x.nx_order_numb = r.nx_order_numb AND x.nx_sku = r.nx_sku
+                  AND x.plan_date <> %s
+                  AND ((x.plan_date >= CAST(GETDATE() AS DATE)
+                        AND x.line_status IN ('Planned', 'Proposed', 'Confirmed'))
+                    OR (x.line_status = 'Snoozed'
+                        AND ISNULL(x.snooze_to_date, x.plan_date) >= CAST(GETDATE() AS DATE)))
+                ORDER BY x.plan_date DESC) AS elsewhere,
+               (SELECT MIN(CASE p.tier WHEN 'Must' THEN 0 WHEN 'Next' THEN 1 ELSE 2 END)
+                FROM dbo.pc_ship_plan_line p
+                JOIN #cr pr ON pr.nx_order_numb = p.nx_order_numb AND pr.nx_sku = p.nx_sku
+                WHERE p.plan_date = %s AND p.nx_order_numb = r.nx_order_numb
+                  AND p.line_status IN ('Planned', 'Proposed', 'Confirmed')
+                  AND pr.due_date = r.due_date) AS tier_rank
+        FROM #cr r
+        WHERE EXISTS (SELECT 1
+                      FROM dbo.pc_ship_plan_line p
+                      JOIN #cr pr ON pr.nx_order_numb = p.nx_order_numb AND pr.nx_sku = p.nx_sku
+                      WHERE p.plan_date = %s AND p.nx_order_numb = r.nx_order_numb
+                        AND p.line_status IN ('Planned', 'Proposed', 'Confirmed')
+                        AND pr.due_date = r.due_date)
+          AND NOT EXISTS (SELECT 1 FROM dbo.pc_ship_plan_line p2
+                          WHERE p2.plan_date = %s AND p2.nx_order_numb = r.nx_order_numb
+                            AND p2.nx_sku = r.nx_sku
+                            AND p2.line_status IN ('Planned', 'Proposed', 'Confirmed'))
+        GROUP BY r.nx_order_numb, r.due_date, r.nx_sku
+        ORDER BY r.nx_order_numb, r.due_date, r.nx_sku
+    """, (plan_date, plan_date, plan_date, plan_date))
+    rows = cursor.fetchall()
+    cursor.execute("IF OBJECT_ID('tempdb..#cr') IS NOT NULL DROP TABLE #cr")
+    by_group = {}
+    for r in rows:
+      k = (r['nx_order_numb'], str(r['due_date'])[:10])
+      g = by_group.setdefault(k, {'order': k[0], 'due_date': k[1], 'lines': [],
+                                  'missing_inches': 0.0, 'tier': 'Next'})
+      g['lines'].append({'sku': r['nx_sku'], 'desc': r['sku_desc'], 'bucket': r['bucket'],
+                         'qty': float(r['qty'] or 0), 'inches': float(r['inches'] or 0),
+                         'elsewhere': r['elsewhere']})
+      g['missing_inches'] += float(r['inches'] or 0)
+      g['tier'] = {0: 'Must', 1: 'Next'}.get(r['tier_rank'], 'Stretch')
+    groups = list(by_group.values())
+    for g in groups:
+      g['missing_inches'] = round(g['missing_inches'], 1)
+      g['n_addable'] = sum(1 for l in g['lines'] if not l['elsewhere'])
+    return {'status': 'success', 'plan_date': plan_date.isoformat(),
+            'n_partial': len(groups), 'groups': groups}
+  except Exception as e:
+    try:
+      conn.rollback()
+      conn.cursor().execute("IF OBJECT_ID('tempdb..#cr') IS NOT NULL DROP TABLE #cr")
+    except Exception:
+      pass
+    return {'status': 'error', 'message': f'Partial-order check failed: {e}'}
   finally:
     conn.close()
 
@@ -1274,18 +1374,31 @@ def _snapshot_flags(cursor, plan_date, revision_no, weight_set_id):
 
 
 @anvil.server.callable
-def ship_plan_publish(plan_date):
+def ship_plan_publish(plan_date, partial_ack=None):
   """Stamp capacity (the number sales saw) and flip Draft -> Published.
   The plan stays editable after — real life happens; edits keep logging.
   051: after the publish commits, the flag snapshot is taken in its OWN
   transaction — a snapshot problem must never un-publish a plan; it comes
-  back as snapshot_warning for the client to show."""
+  back as snapshot_warning for the client to show.
+  partial_ack (2026-09-13): the partial orders the publisher chose to
+  publish anyway, logged as one PartialAck event per order so the retro
+  can tell 'knew' from 'missed'."""
   plan_date = _parse_date(plan_date)
   actor = _current_actor()
   conn = get_connection()
   try:
     cursor = conn.cursor()
     cap = _capacity_for(cursor, plan_date)
+    for g in (partial_ack or []):
+      try:
+        _log_event(cursor, plan_date, g.get('order'), None, 'PartialAck',
+                   new_value=f"{len(g.get('lines') or [])} lines left off, "
+                   f"{float(g.get('missing_inches') or 0):,.0f} in",
+                   actor=actor,
+                   note='published anyway; due ' + str(g.get('due_date') or '') + ': '
+                   + ', '.join(l.get('sku', '') for l in (g.get('lines') or []))[:400])
+      except Exception:
+        pass                      # the acknowledgement must never block a publish
     cursor.execute("""
         UPDATE dbo.pc_ship_plan
         SET plan_status = 'Published', capacity_inches = %s,
@@ -1872,46 +1985,112 @@ def _agent_propose_impl(plan_date=None, force=False):
     for r in cursor.fetchall():
       rows_by_key.setdefault((r['nx_order_numb'], r['nx_sku']), []).append(r)
 
-    # --- the fill ---------------------------------------------------
-    # First-fit in priority order: a line that does not fit is passed
-    # over, never blocks the ones behind it. SPLIT DECISIONS (not
-    # proposed, raised by the narrative): a line bigger than the whole
-    # day (seen live: 1,955-in gasket lines) or bigger than
-    # AGENT_MAX_LINE_PCT of the fill target (seen live: one 1,631-in line
-    # = 82% of the day). Stretch is decided AFTER the fill, against the
-    # final slack (capacity - used): the next-best deferred lines that
-    # would fit if no rush arrives - the reserve is a target, not a cap.
+    # --- the fill: WHOLE-ORDER GROUPS (rule, Dave 2026-09-13) ---------
+    # If one line of a sales order is proposed, every other open line
+    # with the SAME detail ship-by date is proposed with it. Assembly
+    # techs run each order as a mini-project; a partial order on the
+    # board is chaos. So the ATOM is the group (order, ship_by_date):
+    #   - zero-touch and gated siblings RIDE ALONG (visible at zero /
+    #     visible blockers - e21 backorders what cannot ship). They are
+    #     never picked on their own: a group needs a DRIVER (ungated,
+    #     non-zero line) to be proposed at all.
+    #   - a sibling PC snoozed, or planned on another day, BLOCKS the
+    #     group - PC already decided; reported, never overridden.
+    #   - a ship-complete order (nx_order_type 'S') with a gated sibling
+    #     is BLOCKED: nothing on it can ship until the gate clears.
+    #   - a group bigger than the whole day, or than AGENT_MAX_LINE_PCT
+    #     of the fill target, is a SPLIT DECISION for PC - not proposed.
+    #   - first-fit by the group's best ungated line (the candidate order
+    #     already is score DESC, ship-by, load DESC); tier by its drivers
+    #     (Must = A01/A02 on any driver, else Next). Stretch is decided
+    #     AFTER the fill against the final slack - whole groups only.
     max_line = target * ap['max_line_pct']
-    picks, deferred, gated, split_needed = [], [], [], []
-    skipped_zero = 0
+    cursor.execute("""
+        SELECT pl.nx_order_numb, pl.nx_sku, pl.plan_date, pl.line_status,
+               pl.snooze_to_date
+        FROM dbo.pc_ship_plan_line pl
+        WHERE (pl.plan_date <> %s AND pl.plan_date >= CAST(GETDATE() AS DATE)
+               AND pl.line_status IN ('Planned', 'Proposed', 'Confirmed'))
+           OR (pl.line_status = 'Snoozed'
+               AND ISNULL(pl.snooze_to_date, pl.plan_date) >= CAST(GETDATE() AS DATE))
+    """, (plan_date,))
+    elsewhere = {(r['nx_order_numb'], r['nx_sku']): r for r in cursor.fetchall()}
+    cursor.execute("""
+        SELECT DISTINCT nx_order_numb FROM dbo.sales_orders_due
+        WHERE RTRIM(nx_order_type) = 'S'
+    """)
+    ship_complete = {r['nx_order_numb'] for r in cursor.fetchall()}
+
+    def _gkey(c):
+      return (c['nx_order_numb'], str(c.get('ship_by_date') or '')[:10])
+    groups, group_order = {}, []
     for c in cands:
-      if c.get('is_gated'):
-        gated.append(c)
+      k = _gkey(c)
+      if k not in groups:
+        groups[k] = []
+        group_order.append(k)
+      groups[k].append(c)
+
+    picks, deferred, gated, split_needed, blocked = [], [], [], [], []
+    skipped_zero = n_groups = 0
+    for k in group_order:
+      members = groups[k]
+      order = k[0]
+      drivers = [m for m in members
+                 if not m.get('is_gated')
+                 and (float(m.get('load_inches') or 0) > 0 or ap['include_zero_touch'])]
+      if not drivers:
+        if all(m.get('is_gated') for m in members):
+          gated.extend(members)
+        else:
+          skipped_zero += len(members)   # pure pick-and-ship order: not the agent's to propose
         continue
-      load = float(c.get('load_inches') or 0)
-      codes = c.get('flag_codes') or ''
-      if c.get('bucket') == 'ZERO' and not ap['include_zero_touch']:
-        skipped_zero += 1
+      load = sum(float(m.get('load_inches') or 0) for m in members)
+      for m in members:
+        m['group_inches'] = load
+        m['group_n'] = len(members)
+        m['rides_along'] = not any(m is d for d in drivers)
+      blk = [m for m in members if (order, m['nx_sku']) in elsewhere]
+      if blk:
+        e = elsewhere[(order, blk[0]['nx_sku'])]
+        when = str(e.get('snooze_to_date') or e.get('plan_date') or '')[:10]
+        why = (f"sibling {blk[0]['nx_sku']} already "
+               f"{'snoozed to' if e['line_status'] == 'Snoozed' else 'planned on'} {when}")
+        for m in members:
+          m['block_reason'] = why
+        blocked.extend(members)
+        continue
+      gm = [m for m in members if m.get('is_gated')]
+      if gm and order in ship_complete:
+        why = f"ship-complete order; {gm[0]['nx_sku']} gated {gm[0].get('gate_codes') or ''}".strip()
+        for m in members:
+          m['block_reason'] = why
+        blocked.extend(members)
         continue
       if load > cap_in + 1e-9 or load > max_line + 1e-9:
-        c['split_reason'] = ('bigger than the whole day' if load > cap_in
-                             else f"over {int(ap['max_line_pct'] * 100)}% of the fill target")
-        split_needed.append(c)
+        why = ('order bigger than the whole day' if load > cap_in
+               else f"order over {int(ap['max_line_pct'] * 100)}% of the fill target")
+        for m in members:
+          m['split_reason'] = why
+        split_needed.extend(members)
         continue
+      codes = ' '.join((m.get('flag_codes') or '') for m in drivers)
+      tier = 'Must' if ('A01' in codes or 'A02' in codes) else 'Next'
       if used + load <= target + 1e-9:
-        tier = 'Must' if ('A01' in codes or 'A02' in codes) else 'Next'
-        picks.append((c, tier))
+        picks.extend((m, tier) for m in members)
         used += load
+        n_groups += 1
       else:
-        deferred.append(c)
+        deferred.append(members)
     slack = cap_in - used
-    stretch = []
-    for c in deferred:
-      if len(stretch) >= ap['stretch_lines']:
+    stretch, n_stretch_groups = [], 0
+    for members in deferred:
+      if n_stretch_groups >= ap['stretch_lines']:
         break
-      if float(c.get('load_inches') or 0) <= slack + 1e-9:
-        stretch.append((c, 'Stretch'))
-    skipped = len(deferred) - len(stretch)
+      if float(members[0].get('group_inches') or 0) <= slack + 1e-9:
+        stretch.extend((m, 'Stretch') for m in members)
+        n_stretch_groups += 1
+    skipped = sum(len(g) for g in deferred) - len(stretch)
     oversize = split_needed          # name kept for the response below
 
     # --- record the proposal ----------------------------------------
@@ -1927,7 +2106,17 @@ def _agent_propose_impl(plan_date=None, force=False):
     for c, tier in picks + stretch:
       rank += 1
       order, sku = c['nx_order_numb'], c['nx_sku']
-      reason = _agent_reason(c, tier, notes.get((order, sku), []))
+      due = str(c.get('ship_by_date') or '')[:10]
+      if c.get('rides_along'):
+        how = (f"gated {c.get('gate_codes') or ''}".strip() if c.get('is_gated')
+               else 'zero-touch')
+        reason = (f"{tier}: rides with order {order} — whole-order rule, due {due} "
+                  f"({how}) — {float(c.get('load_inches') or 0):,.1f} in")[:500]
+      else:
+        reason = _agent_reason(c, tier, notes.get((order, sku), []))
+        if int(c.get('group_n') or 1) > 1:
+          reason = (reason + f" · order {int(c['group_n'])} lines, "
+                    f"{float(c.get('group_inches') or 0):,.0f} in together")[:500]
       cursor.execute("""
           INSERT INTO dbo.pc_agent_proposal_line
               (proposal_id, nx_order_numb, nx_sku, rank_no, proposed_tier,
@@ -1958,11 +2147,18 @@ def _agent_propose_impl(plan_date=None, force=False):
 
     oversize_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
                      'load_inches': float(o.get('load_inches') or 0),
+                     'group_inches': float(o.get('group_inches') or 0),
                      'qty_open': float(o.get('qty_open') or 0),
                      'score': int(o.get('priority_score') or 0),
                      'ship_by': o.get('ship_by_date'), 'flags': o.get('flag_codes'),
                      'why': o.get('split_reason')}
                     for o in oversize[:15]]
+    blocked_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
+                    'load_inches': float(o.get('load_inches') or 0),
+                    'group_inches': float(o.get('group_inches') or 0),
+                    'score': int(o.get('priority_score') or 0),
+                    'ship_by': o.get('ship_by_date'), 'why': o.get('block_reason')}
+                   for o in blocked[:15]]
     snapshot_warning = None
     try:
       _snapshot_flags(cursor, plan_date, -1, weight_set_id)
@@ -1982,6 +2178,9 @@ def _agent_propose_impl(plan_date=None, force=False):
             'max_line_inches': round(max_line, 1), 'slack_inches': round(slack, 1),
             'n_zero_touch_skipped': skipped_zero,
             'n_candidates': len(cands), 'horizon_end': end.isoformat(),
+            'rule': 'WHOLE_ORDER', 'n_groups': n_groups,
+            'n_stretch_groups': n_stretch_groups,
+            'n_blocked': len(blocked), 'blocked': blocked_out,
             'lines': out_lines, 'gated': gated_out, 'oversize': oversize_out,
             'snapshot_warning': snapshot_warning}
   except Exception as e:

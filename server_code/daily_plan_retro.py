@@ -64,7 +64,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.2.1'
+_RETRO_VERSION = 'retro-1.3.0'   # 1.3: PARTIAL_ORDER (whole-order rule)
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -255,7 +255,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     rows, counts = [], {'SHIPPED': 0, 'WORKED': 0, 'REMOVED_WITH_REASON': 0,
                         'REMOVED_NO_REASON': 0, 'UNTOUCHED': 0,
                         'UNTOUCHED_STRETCH': 0, 'DATE_MOVED': 0, 'UNPLANNED_SHIP': 0,
-                        'CANCELLED': 0, 'QTY_CHANGED': 0}
+                        'CANCELLED': 0, 'QTY_CHANGED': 0, 'PARTIAL_ORDER': 0}
     planned_in = moved_in = 0.0
     n_stretch = 0
     for s in planned:
@@ -392,10 +392,52 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                      'asked_to': None, 'cause_key': None, 'resolution': 'OPEN',
                      'removed_by_role': None})
 
+    # --- WHOLE-ORDER RULE (Dave, 2026-09-13): partial orders at publish ---
+    # From the snapshot alone: a planned line's same-due-date siblings that
+    # were NOT on the plan. One ledger row per missing sibling, case
+    # PARTIAL_ORDER, routed to PC, no question (measured, not asked - the
+    # Publish check already offered "Add the rest"). A PartialAck event at
+    # publish means PC knew and chose to; the row says so and closes as
+    # EXPLAINED. A sibling that shipped anyway is NOT an UNPLANNED_SHIP
+    # (no rush question to Sales) - it is this.
+    cursor.execute("""
+        SELECT DISTINCT nx_order_numb FROM dbo.pc_plan_line_events
+        WHERE plan_date = %s AND event_type = 'PartialAck'
+    """, (plan_date,))
+    acked = {r['nx_order_numb'] for r in cursor.fetchall()}
+    planned_groups = {(s['nx_order_numb'], str(s['ship_by_date'] or '')[:10])
+                      for s in planned}
+    partial_keys = set()
+    for s in unplanned_pool:
+      gk = (s['nx_order_numb'], str(s['ship_by_date'] or '')[:10])
+      if gk not in planned_groups:
+        continue
+      key = (s['nx_order_numb'], s['nx_sku'])
+      partial_keys.add(key)
+      load = float(s['load_inches'] or 0)
+      b = book.get(key)
+      shipped_anyway = bool(_chg(key, 'SO_Shipped')) or b is None
+      knew = key[0] in acked
+      counts['PARTIAL_ORDER'] += 1
+      rows.append({'order': key[0], 'sku': key[1], 'tier': None, 'load': load,
+                   'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
+                   'expected': 'ON_PLAN', 'expected_value': float(s['qty_open'] or 0),
+                   'actual_value': (None if b is None else float(b['balance'] or 0)),
+                   'observed': shipped_anyway, 'case': 'PARTIAL_ORDER', 'routed_to': 'PC',
+                   'explanation': (f"whole-order rule: sibling of a planned line (order "
+                                   f"{key[0]}, due {gk[1]}) was left off the plan, {load:,.0f} in"
+                                   + ('; PC published anyway (acknowledged)' if knew else '')
+                                   + ('; shipped anyway' if shipped_anyway else '; did not ship')),
+                   'question': None, 'asked_to': None, 'cause_key': None,
+                   'resolution': ('EXPLAINED' if knew else 'OPEN'),
+                   'removed_by_role': None})
+
     # --- demand side: shipped without being planned --------------------
     unplanned_in, n_unplanned_all = 0.0, 0
     for s in unplanned_pool:
       key = (s['nx_order_numb'], s['nx_sku'])
+      if key in partial_keys:
+        continue                       # whole-order rule: that is a PARTIAL_ORDER row
       load = float(s['load_inches'] or 0)
       if load <= 0:
         continue                       # zero-touch never counts against the reserve
@@ -432,7 +474,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
 
     # --- ration the questions: max_q total, min_sales floor ------------
     order_key = {'UNTOUCHED': 0, 'REMOVED_NO_REASON': 1, 'UNPLANNED_SHIP': 2,
-                 'CANCELLED': 3, 'QTY_CHANGED': 4, 'DATE_MOVED': 5}
+                 'CANCELLED': 3, 'QTY_CHANGED': 4, 'DATE_MOVED': 5, 'PARTIAL_ORDER': 6}
     def _rank(r):
       # v1.2.1: planned lines rank by PLAN POSITION (the order the floor
       # saw on the Production grid), not by priority_score - one 'most
