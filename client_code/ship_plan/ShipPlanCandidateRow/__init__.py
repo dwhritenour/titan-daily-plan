@@ -4,6 +4,9 @@ import anvil.server
 from datetime import date
 
 
+QTY_TIP = ('e21 ordered quantity (orditem.qty - what is due by release). The number in parentheses is e21 balance due, shown only when the two disagree: a stale balance from an e21 editing path, not a shipment. Have order entry re-accept the line in e21 - the packing slip ships the balance.')
+
+
 class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
   """One (order, SKU) group in the candidates pane (releases already
   collapsed by vw_pc_ship_candidates).
@@ -32,7 +35,19 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     self.lbl_order.text = item['nx_order_numb']
     self.lbl_what.text = f"{item.get('sku_desc') or item['nx_sku']}"
     self.lbl_sub.text = f"{item.get('shipto_code') or ''} · {item.get('part_line') or item.get('bucket', '')}"
-    self.lbl_qty.text = f"{item['qty_open']:g}"
+    # Qty = e21 ORDERED (orditem.qty); "(balance)" only when e21's balance
+    # due disagrees (065 / C05).
+    ordered = item.get('qty_ordered')
+    balance = float(item['qty_open'])
+    if ordered is None:
+      self.lbl_qty.text = f"{balance:g}"
+    elif abs(float(ordered) - balance) > 0.005:
+      self.lbl_qty.text = f"{float(ordered):g} ({balance:g})"
+      self.lbl_qty.foreground = '#C62828'
+      self.lbl_qty.bold = True
+      self.lbl_qty.tooltip = QTY_TIP
+    else:
+      self.lbl_qty.text = f"{float(ordered):g}"
     self.lbl_load.text = f"{item['load_inches']:,.1f} in"
     self.lbl_load.tooltip = (f"{item['load_minutes']:,.0f} min total, "
                              f"{item['surcharge_minutes']:,.0f} min surcharge, "
@@ -62,6 +77,8 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     # Flag system (040/041): gates first, then A/B codes, then glyphs.
     gate_codes = (item.get('gate_codes') or '').replace(',', ' ')
     flag_list = item.get('flags') or []
+    if any(f.get('code') == 'C05' for f in flag_list):   # 065
+      glyphs.append('⚠ QTY')
     ab_codes = ' '.join(f['code'] for f in flag_list
                         if f['code'][:1] in ('A', 'B'))
     parts = []

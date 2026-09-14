@@ -531,7 +531,12 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     sql = ("SELECT TOP %d c.*, ISNULL(fs.is_gated, 0) AS is_gated, "
            "fs.gate_codes, "
            "ISNULL(fs.priority_score, 0) AS priority_score, "
-           "fs.flag_codes " % max(1, min(int(limit), 1000))) + from_sql
+           "fs.flag_codes, "
+           # 065 / C05: e21 ordered qty (orditem.qty) beside the balance
+           "(SELECT SUM(s.nx_qty_ordered) FROM dbo.sales_orders_due s "
+           " WHERE s.nx_order_numb = c.nx_order_numb "
+           "   AND s.nx_sku = c.nx_sku) AS qty_ordered "
+           % max(1, min(int(limit), 1000))) + from_sql
     if where:
       sql += " WHERE " + " AND ".join(where)
     sql += (" ORDER BY is_gated, priority_score DESC, "
@@ -601,9 +606,10 @@ def ship_plan_get_plan(plan_date):
     header = cursor.fetchone()
 
     cursor.execute("""
-        SELECT l.*, live.live_qty, pr.description AS reason_desc
+        SELECT l.*, live.live_qty, live.live_ordered, pr.description AS reason_desc
         FROM dbo.pc_ship_plan_line l
-        OUTER APPLY (SELECT SUM(s.nx_qty_balance_due) AS live_qty
+        OUTER APPLY (SELECT SUM(s.nx_qty_balance_due) AS live_qty,
+                            SUM(s.nx_qty_ordered)     AS live_ordered   -- 065: C05
                      FROM dbo.sales_orders_due s
                      WHERE s.nx_order_numb = l.nx_order_numb
                        AND s.nx_sku = l.nx_sku) live
@@ -629,6 +635,15 @@ def ship_plan_get_plan(plan_date):
           row['drift'] = None
       else:
         row['drift'] = None
+      # 065 / C05: e21 balance due vs ordered disagree -> stale balance on
+      # an e21 editing path (never a partial: e21 restates the line). The
+      # Qty column shows "ordered (balance)"; PC re-accepts the line.
+      ordered = row.get('live_ordered')
+      if (live is not None and ordered is not None
+          and abs(float(live) - float(ordered)) > 0.005):
+        row['qty_warn'] = f"balance {float(live):g} vs ordered {float(ordered):g}"
+      else:
+        row['qty_warn'] = None
       lines.append(row)
 
     planned_total = sum(float(l['load_inches']) for l in lines

@@ -24,6 +24,9 @@ TIER_COLORS = {
 }
 
 
+QTY_TIP = ('e21 ordered quantity (orditem.qty - what is due by release). The number in parentheses is e21 balance due, shown only when the two disagree: a stale balance from an e21 editing path, not a shipment. Have order entry re-accept the line in e21 - the packing slip ships the balance.')
+
+
 class ShipPlanLineRow(ShipPlanLineRowTemplate):
   """One plan line. Designer components: lbl_order, lbl_what, lbl_sub,
   lbl_qty, lbl_shipby, lbl_load, lbl_status, lk_drift,
@@ -55,7 +58,20 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     if status == 'Proposed' and item.get('proposed_by') == 'agent':
       sub = 'AGENT PROPOSED  · ' + sub      # word, not just the blue chip
     self.lbl_sub.text = sub
-    self.lbl_qty.text = f"{float(item['qty_planned']):g}"
+    # Qty = e21 ORDERED (orditem.qty); "(balance)" only when e21's balance
+    # due disagrees (065 / C05). Falls back to the planned qty when the
+    # line has left the feed (drift 'gone').
+    ordered = item.get('live_ordered')
+    balance = item.get('live_qty')
+    if ordered is None:
+      self.lbl_qty.text = f"{float(item['qty_planned']):g}"
+    elif item.get('qty_warn'):
+      self.lbl_qty.text = f"{float(ordered):g} ({float(balance):g})"
+      self.lbl_qty.foreground = '#C62828'
+      self.lbl_qty.bold = True
+      self.lbl_qty.tooltip = QTY_TIP
+    else:
+      self.lbl_qty.text = f"{float(ordered):g}"
     self.lbl_shipby.text = (item.get('ship_by_date') or '')[:10]
     self.lbl_load.text = f"{float(item['load_inches']):,.1f} in"
     self.lbl_load.tooltip = (f"{float(item['load_minutes']):,.0f} min "
