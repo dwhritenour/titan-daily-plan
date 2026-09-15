@@ -66,7 +66,7 @@ class retro_review(retro_reviewTemplate):
     if hasattr(self, 'ta_recent'):
       rec = r.get('recent') or []
       self.ta_recent.text = '\n'.join(
-        f"{c['plan_date']}  {c['nx_order_numb']}{('-' + c['nx_item_no']) if c.get('nx_item_no') else ''} / {c['nx_sku']}  [{c.get('routed_to')}]  "
+        f"{c['plan_date']}  {c['nx_order_numb']}{('-' + (c.get('nx_rel_numb') or '') + '-' + c['nx_item_no']) if c.get('nx_item_no') else ''} / {c['nx_sku']}  [{c.get('routed_to')}]  "
         f"{c.get('confirmed_reading')}  — {c.get('evidence_class')} · {c.get('cause_key')} · "
         f"{c.get('resolution')}" for c in rec) or 'No confirmed readings yet.'
     if hasattr(self, 'ta_causes'):

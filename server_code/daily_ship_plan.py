@@ -283,11 +283,10 @@ def _log_event(cursor, plan_date, order, sku, event_type,
 
 
 def _line_label(order, rel, item, sku=None):
-  """'595613-20' (release shown only when it is not 001), + ' / SKU'."""
-  r = (rel or '').strip()
-  s = f"{order}-{(item or '').strip()}" if item else f"{order}"
-  if r and r != '001':
-    s = f"{order}-{r}-{(item or '').strip()}"
+  """'595613-001-20' - order, RELEASE, item, always all three (Dave
+  2026-09-15: a release shown only sometimes reads as an error), + ' / SKU'."""
+  r, i = (rel or '').strip(), (item or '').strip()
+  s = f"{order}-{r}-{i}" if (r or i) else f"{order}"
   return f"{s} / {sku}" if sku else s
 
 

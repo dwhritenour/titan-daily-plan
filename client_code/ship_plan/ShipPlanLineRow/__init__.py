@@ -45,9 +45,8 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     # 066: the row IS the e21 line - '595613-20' (release only when not 001)
     rel = (item.get('nx_rel_numb') or '').strip()
     itm = (item.get('nx_item_no') or '').strip()
-    self.lbl_order.text = (f"{item['nx_order_numb']}-{rel}-{itm}" if rel and rel != '001'
-                           else f"{item['nx_order_numb']}-{itm}" if itm
-                           else item['nx_order_numb'])
+    self.lbl_order.text = (f"{item['nx_order_numb']}-{rel}-{itm}" if (rel or itm)
+                           else item['nx_order_numb'])      # always order-release-item
     self.lbl_order.tooltip = f"order {item['nx_order_numb']}, release {rel or '?'}, item {itm or '?'}"
     self.lbl_what.text = item['nx_sku']
     sub = item.get('shipto_code') or ''

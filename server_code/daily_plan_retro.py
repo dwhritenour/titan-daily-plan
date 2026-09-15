@@ -87,11 +87,9 @@ def _look(by_item, by_sku, s):
 
 
 def _line_txt(s):
-  """'595613-20 / YS61S0600' (release shown only when not 001)."""
+  """'595613-001-20 / YS61S0600' - order, release, item, always all three."""
   o, r, i = _lk(s)
-  base = f"{o}-{i}" if i else f"{o}"
-  if r and r != '001':
-    base = f"{o}-{r}-{i}"
+  base = f"{o}-{r}-{i}" if (r or i) else f"{o}"
   return f"{base} / {s['nx_sku']}"
 
 

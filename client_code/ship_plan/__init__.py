@@ -12,9 +12,7 @@ def line_label(item, with_sku=True):
   o = item.get('nx_order_numb') or item.get('order') or ''
   r = (item.get('nx_rel_numb') or item.get('rel') or '').strip()
   i = (item.get('nx_item_no') or item.get('item') or '').strip()
-  s = f"{o}-{i}" if i else f"{o}"
-  if r and r != '001':
-    s = f"{o}-{r}-{i}"
+  s = f"{o}-{r}-{i}" if (r or i) else f"{o}"     # always order-release-item
   sku = item.get('nx_sku') or item.get('sku')
   return f"{s} / {sku}" if (with_sku and sku) else s
 

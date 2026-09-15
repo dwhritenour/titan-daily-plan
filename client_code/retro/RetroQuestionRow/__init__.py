@@ -30,7 +30,7 @@ class RetroQuestionRow(RetroQuestionRowTemplate):
     asked = bool(v.get('asked_at'))
     answered = bool(v.get('answer_text'))
 
-    head = (f"[{side}]  {v.get('nx_order_numb')}{('-' + v['nx_item_no']) if v.get('nx_item_no') else ''}"
+    head = (f"[{side}]  {v.get('nx_order_numb')}{('-' + (v.get('nx_rel_numb') or '') + '-' + v['nx_item_no']) if v.get('nx_item_no') else ''}"
             f" / {v.get('nx_sku')}  ·  {v.get('case_text', '')}")
     if not asked:
       head += f"   —  not asked today (rank {v.get('question_rank')})"
