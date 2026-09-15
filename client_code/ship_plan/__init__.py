@@ -6,6 +6,19 @@ from datetime import date, datetime, timedelta
 from .ShipPlanParamsPanel import ShipPlanParamsPanel
 
 
+def line_label(item, with_sku=True):
+  """066: the e21 line - '595613-20' (release shown only when not 001),
+  + ' / SKU'. Works for plan lines, candidates and variance rows."""
+  o = item.get('nx_order_numb') or item.get('order') or ''
+  r = (item.get('nx_rel_numb') or item.get('rel') or '').strip()
+  i = (item.get('nx_item_no') or item.get('item') or '').strip()
+  s = f"{o}-{i}" if i else f"{o}"
+  if r and r != '001':
+    s = f"{o}-{r}-{i}"
+  sku = item.get('nx_sku') or item.get('sku')
+  return f"{s} / {sku}" if (with_sku and sku) else s
+
+
 class ship_plan(ship_planTemplate):
   """
     Daily Ship Plan — Week-2 release (PC builds/publishes; Sales read-only).
@@ -576,12 +589,14 @@ class ship_plan(ship_planTemplate):
   # =================================================================
   def _add_line(self, item):
     result = anvil.server.call('ship_plan_add_line', self.plan_date,
-                               item['nx_order_numb'], item['nx_sku'])
+                               item['nx_order_numb'], item['nx_rel_numb'],
+                               item['nx_item_no'])
     if result.get('status') != 'success':
       alert(result.get('message', 'Add failed'))
       return
     if result.get('over_capacity'):
-      self._cap_hit_dialog(item['nx_order_numb'], [item['nx_sku']], result)
+      self._cap_hit_dialog(item['nx_order_numb'],
+                           [(item['nx_rel_numb'], item['nx_item_no'])], result)
     self.load_day()
 
   def _add_order(self, item):
@@ -594,21 +609,29 @@ class ship_plan(ship_planTemplate):
       return
     added = result.get('added') or []
     skipped = result.get('skipped') or []
-    note = f"{order}: {len(added)} item(s) added"
+    note = f"{order}: {len(added)} line(s) added"
     if skipped:
       note += f", {len(skipped)} already on the plan"
     Notification(note, timeout=4).show()
     if result.get('over_capacity'):
-      self._cap_hit_dialog(order, added, result)
+      # 066: the lines just added are re-read from the plan (the server
+      # returns labels); the dialog acts on every active line of the order
+      self.load_day()
+      keys = [(l['nx_rel_numb'], l['nx_item_no']) for l in self._lines
+              if l['nx_order_numb'] == order
+              and l['line_status'] in ('Planned', 'Proposed', 'Confirmed')]
+      self._cap_hit_dialog(order, keys, result)
     self.load_day()
 
-  def _cap_hit_dialog(self, order, skus, result):
+  def _cap_hit_dialog(self, order, keys, result):
     """DECISION §4: snooze / Mark Stretch / explicit Unplaced / keep —
     never a silent drop. The line(s) are already added when we get here.
     Mark Stretch re-tiers them so they stop counting against the cap —
-    "if capacity permits" made literal."""
+    "if capacity permits" made literal. 066: keys = [(rel, item), ...]."""
     sug = result.get('suggested_day')
-    what = order if len(skus) != 1 else f"{order} / {skus[0]}"
+    what = (order if len(keys) != 1
+            else line_label({'nx_order_numb': order, 'nx_rel_numb': keys[0][0],
+                             'nx_item_no': keys[0][1]}, with_sku=False))
     msg = (f"This puts {self.plan_date} at "
            f"{result['planned_inches']:,.0f} / "
            f"{result['capacity_inches']:,.0f} work-inches "
@@ -619,16 +642,16 @@ class ship_plan(ship_planTemplate):
     buttons += [("Mark If time", 'stretch'),
                 ("Leave Unplaced", 'unplaced'), ("Keep anyway", 'keep')]
     choice = alert(msg, title="Over capacity", buttons=buttons, large=True)
-    for sku in skus:
+    for rel, item in keys:
       if choice == 'snooze' and sug:
         r = anvil.server.call('ship_plan_snooze_line', self.plan_date,
-                              order, sku, sug)
+                              order, rel, item, sug)
       elif choice == 'stretch':
         r = anvil.server.call('ship_plan_set_priority', self.plan_date,
-                              order, sku, tier='Stretch')
+                              order, rel, item, tier='Stretch')
       elif choice == 'unplaced':
         r = anvil.server.call('ship_plan_mark_unplaced', self.plan_date,
-                              order, sku, 'over capacity at add')
+                              order, rel, item, 'over capacity at add')
       else:
         return  # 'keep' (or dismissed): stays Planned, bar red — PC's call
       if r.get('status') != 'success':
@@ -659,7 +682,7 @@ class ship_plan(ship_planTemplate):
     pnl.add_component(dd_reason)
     pnl.add_component(Label(text='Note', bold=True))
     pnl.add_component(tb_note)
-    if not confirm(f"Priority — {item['nx_order_numb']} / {item['nx_sku']}",
+    if not confirm(f"Priority — {line_label(item)}",
                    content=pnl):
       return
     if (dd_reason.selected_value == 'OTHER'
@@ -668,7 +691,8 @@ class ship_plan(ship_planTemplate):
             'Nothing saved; open ★ again.')
       return
     r = anvil.server.call('ship_plan_set_priority', self.plan_date,
-                          item['nx_order_numb'], item['nx_sku'],
+                          item['nx_order_numb'], item['nx_rel_numb'],
+                          item['nx_item_no'],
                           tier=dd_tier.selected_value,
                           reason=dd_reason.selected_value,
                           note=tb_note.text or '')
@@ -678,7 +702,8 @@ class ship_plan(ship_planTemplate):
 
   def _recalc_line(self, item):
     r = anvil.server.call('ship_plan_recalc_line', self.plan_date,
-                          item['nx_order_numb'], item['nx_sku'])
+                          item['nx_order_numb'], item['nx_rel_numb'],
+                          item['nx_item_no'])
     if r.get('status') != 'success':
       alert(r.get('message', 'Refresh failed'))
     else:
@@ -689,7 +714,7 @@ class ship_plan(ship_planTemplate):
   def _snooze_line(self, item):
     tb = TextBox(text=item.get('snooze_suggestion') or '',
                  placeholder='YYYY-MM-DD')
-    if not confirm(f"Snooze {item['nx_order_numb']} / {item['nx_sku']} "
+    if not confirm(f"Snooze {line_label(item)} "
                    "to which day?", content=tb):
       return
     try:
@@ -698,7 +723,8 @@ class ship_plan(ship_planTemplate):
       alert('Enter a date as YYYY-MM-DD.')
       return
     r = anvil.server.call('ship_plan_snooze_line', self.plan_date,
-                          item['nx_order_numb'], item['nx_sku'], to_date)
+                          item['nx_order_numb'], item['nx_rel_numb'],
+                          item['nx_item_no'], to_date)
     if r.get('status') != 'success':
       alert(r.get('message', 'Snooze failed'))
     self.load_day()
@@ -717,7 +743,7 @@ class ship_plan(ship_planTemplate):
       content = ColumnPanel()
       content.add_component(cb_all)
       content.add_component(tb)
-    if not confirm(f"Remove {order} / {item['nx_sku']} from this plan?",
+    if not confirm(f"Remove {line_label(item)} from this plan?",
                    content=content):
       return
     if cb_all and cb_all.checked:
@@ -725,7 +751,8 @@ class ship_plan(ship_planTemplate):
                             order, tb.text or None)
     else:
       r = anvil.server.call('ship_plan_remove_line', self.plan_date,
-                            order, item['nx_sku'], tb.text or None)
+                            order, item['nx_rel_numb'], item['nx_item_no'],
+                            tb.text or None)
     if r.get('status') != 'success':
       alert(r.get('message', 'Remove failed'))
     self.load_day()
@@ -748,7 +775,7 @@ class ship_plan(ship_planTemplate):
     for g in groups:
       parts = []
       for l in g['lines']:
-        s = f"{l['sku']} ({float(l['inches']):,.0f} in)"
+        s = f"{l.get('label') or ''} / {l['sku']} ({float(l['inches']):,.0f} in)"
         if l.get('elsewhere'):
           s += f" — {l['elsewhere']}"
         parts.append(s)
@@ -838,7 +865,7 @@ class ship_plan(ship_planTemplate):
     for e in r['events']:
       what = ''
       if e['nx_order_numb']:
-        what = (f"{e['nx_order_numb']}/{e['nx_sku']}" if e['nx_sku']
+        what = (line_label(e) if e['nx_sku']
                 else e['nx_order_numb'])   # order-level events have no SKU
       change = ''
       if e['old_value'] and e['new_value']:
@@ -919,9 +946,9 @@ class ship_plan(ship_planTemplate):
     panel.add_component(self._pline('Lines', size=15, bold=True))
     for l in lines:
       if int(l.get('rank_no') or 0) == 0:
-        txt = f"+ {l['nx_order_numb']} {l['nx_sku']} — added by PC"
+        txt = f"+ {line_label(l)} — added by PC"
       else:
-        txt = (f"{l['rank_no']}. {l['nx_order_numb']} {l['nx_sku']} — "
+        txt = (f"{l['rank_no']}. {line_label(l)} — "
                f"{l.get('proposed_tier')} · {l.get('reason') or ''}")
       out = l.get('outcome')
       if out:
@@ -932,7 +959,8 @@ class ship_plan(ship_planTemplate):
 
   def _confirm_line(self, item):
     r = anvil.server.call('ship_plan_confirm_line', self.plan_date,
-                          item['nx_order_numb'], item['nx_sku'])
+                          item['nx_order_numb'], item['nx_rel_numb'],
+                          item['nx_item_no'])
     if r.get('status') != 'success':
       alert(r.get('message', 'Confirm failed'))
     self.load_day()

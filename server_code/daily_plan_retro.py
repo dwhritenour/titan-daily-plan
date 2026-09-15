@@ -64,13 +64,36 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.3.0'   # 1.3: PARTIAL_ORDER (whole-order rule)
+_RETRO_VERSION = 'retro-1.4.0'   # 1.4 (066): e21-line grain, ordered qty; 1.3: PARTIAL_ORDER
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
+
+def _lk(s):
+  """Line key of a snapshot / plan / variance row: (order, rel, item).
+  Pre-066 rows carry rel/item = '' - see _look()."""
+  return (s['nx_order_numb'], (s.get('nx_rel_numb') or ''), (s.get('nx_item_no') or ''))
+
+
+def _look(by_item, by_sku, s):
+  """Item-grain lookup with a (order, sku) fallback for pre-066 rows."""
+  k = _lk(s)
+  if k[2]:
+    return by_item.get(k)
+  return by_sku.get((s['nx_order_numb'], s['nx_sku']))
+
+
+def _line_txt(s):
+  """'595613-20 / YS61S0600' (release shown only when not 001)."""
+  o, r, i = _lk(s)
+  base = f"{o}-{i}" if i else f"{o}"
+  if r and r != '001':
+    base = f"{o}-{r}-{i}"
+  return f"{base} / {s['nx_sku']}"
+
 
 def _prev_business_day(d=None):
   d = (d or date.today()) - timedelta(days=1)
@@ -161,8 +184,8 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     reserve_in = round(cap_in * (1.0 - rp['fill_pct']), 2) if cap_in else None
 
     cursor.execute("""
-        SELECT nx_order_numb, nx_sku, was_planned, tier, is_gated, priority_score,
-               flag_codes, ship_by_date, qty_open, load_inches
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, was_planned, tier,
+               is_gated, priority_score, flag_codes, ship_by_date, qty_open, load_inches
         FROM dbo.pc_plan_flag_snapshot
         WHERE plan_date = %s AND revision_no = %s
     """, (plan_date, rev))
@@ -174,28 +197,44 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     # Same ordering as sp_stamp_plan_work_orders (tier, position, load DESC)
     # so the first retro question is about the line released first.
     cursor.execute("""
-        SELECT nx_order_numb, nx_sku,
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
                ROW_NUMBER() OVER (ORDER BY CASE tier WHEN 'Must' THEN 0
                                                      WHEN 'Next' THEN 1 ELSE 2 END,
                                            position, load_inches DESC) AS pos
         FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND line_status IN ('Planned', 'Proposed', 'Confirmed')
     """, (plan_date,))
-    plan_pos = {(r['nx_order_numb'], r['nx_sku']): int(r['pos']) for r in cursor.fetchall()}
+    plan_pos, plan_pos_sku = {}, {}
+    for r in cursor.fetchall():
+      plan_pos[_lk(r)] = int(r['pos'])
+      plan_pos_sku.setdefault((r['nx_order_numb'], r['nx_sku']), int(r['pos']))
 
     # --- what the records say now -------------------------------------
+    # 066: one row per e21 line; "balance" = the ORDERED quantity (orditem.qty),
+    # the same basis as the snapshot's qty_open. An (order, sku) aggregate
+    # serves pre-066 snapshot rows.
     cursor.execute("""
-        SELECT nx_order_numb, nx_sku,
-               SUM(nx_qty_balance_due) AS balance,
-               MAX(nx_item_status)     AS item_status,
-               MIN(CAST(COALESCE(nx_dship_by_date, nx_hship_by_date) AS DATE)) AS ship_by
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
+               ISNULL(nx_qty_ordered, nx_qty_balance_due) AS balance,
+               nx_item_status AS item_status,
+               CAST(COALESCE(nx_dship_by_date, nx_hship_by_date) AS DATE) AS ship_by
         FROM dbo.sales_orders_due
-        GROUP BY nx_order_numb, nx_sku
     """)
-    book = {(r['nx_order_numb'], r['nx_sku']): r for r in cursor.fetchall()}
+    book, book_sku = {}, {}
+    for r in cursor.fetchall():
+      book[_lk(r)] = r
+      a = book_sku.get((r['nx_order_numb'], r['nx_sku']))
+      if a is None:
+        book_sku[(r['nx_order_numb'], r['nx_sku'])] = dict(r)
+      else:
+        a['balance'] = float(a['balance'] or 0) + float(r['balance'] or 0)
+        a['item_status'] = max(a['item_status'] or '', r['item_status'] or '')
+        if r['ship_by'] and (a['ship_by'] is None or r['ship_by'] < a['ship_by']):
+          a['ship_by'] = r['ship_by']
 
     cursor.execute("""
-        SELECT wo.sales_order_number AS o, wo.part_number AS s,
+        SELECT wo.sales_order_number AS o, wo.sales_order_rel AS rel,
+               CAST(wo.sales_order_line AS VARCHAR(10)) AS item, wo.part_number AS s,
                MAX(CASE WHEN wo.status IN ('Complete','Shipped - Verify','Closed - Verify')
                          AND wo.completed_at >= %s THEN 1 ELSE 0 END) AS done_since,
                MAX(CASE WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END)   AS touched,
@@ -206,9 +245,17 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
               AND e.event_type IN ('Assign','Start','Complete','Restart')
               AND CAST(e.event_at AS DATE) = %s
         WHERE wo.status <> 'Cancelled'
-        GROUP BY wo.sales_order_number, wo.part_number
+        GROUP BY wo.sales_order_number, wo.sales_order_rel, wo.sales_order_line, wo.part_number
     """, (plan_date, plan_date))
-    wos = {(r['o'], r['s']): r for r in cursor.fetchall()}
+    wos, wos_sku = {}, {}
+    for r in cursor.fetchall():
+      wos[(r['o'], r['rel'], r['item'])] = r
+      a = wos_sku.get((r['o'], r['s']))
+      if a is None:
+        wos_sku[(r['o'], r['s'])] = dict(r)
+      else:
+        a['done_since'] = max(a['done_since'], r['done_since'])
+        a['touched'] = max(a['touched'], r['touched'])
 
     # --- what Order Entry changed since publish (v1.2) -----------------
     # dbo.work_order_changes: the EM job diffs every work order against its
@@ -217,7 +264,8 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     # NOT shipped), FIELD_CHANGE due_date / quantity (old -> new, when).
     since = published_at or datetime.combine(plan_date, datetime.min.time())
     cursor.execute("""
-        SELECT wo.sales_order_number AS o, wo.part_number AS s,
+        SELECT wo.sales_order_number AS o, wo.sales_order_rel AS rel,
+               CAST(wo.sales_order_line AS VARCHAR(10)) AS item, wo.part_number AS s,
                c.change_type, c.field_name, c.old_value, c.new_value, c.detected_at
         FROM dbo.work_order_changes c
         JOIN dbo.work_orders wo ON wo.work_order_id = c.work_order_id
@@ -227,29 +275,35 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                    AND c.field_name IN ('due_date', 'quantity')))
         ORDER BY c.detected_at
     """, (since,))
-    changes = {}
+    changes, changes_sku = {}, {}
     for c in cursor.fetchall():
-      changes.setdefault((c['o'], c['s']), []).append(c)
+      changes.setdefault((c['o'], c['rel'], c['item']), []).append(c)
+      changes_sku.setdefault((c['o'], c['s']), []).append(c)
 
-    def _chg(key, *types, field=None):
-      return [c for c in changes.get(key, ())
+    def _chg(s, *types, field=None):
+      k = _lk(s)
+      lst = changes.get(k, ()) if k[2] else changes_sku.get((s['nx_order_numb'], s['nx_sku']), ())
+      return [c for c in lst
               if c['change_type'] in types and (field is None or c['field_name'] == field)]
 
     def _hm(dt):
       return dt.strftime('%H:%M') if dt else '?'
 
     cursor.execute("""
-        SELECT nx_order_numb, nx_sku, event_type, actor, note, new_value, event_time
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, event_type, actor, note,
+               new_value, event_time
         FROM dbo.pc_plan_line_events
         WHERE plan_date = %s AND event_type IN ('Removed','TierChange','OrderRemoved')
           AND nx_order_numb IS NOT NULL
         ORDER BY event_time
     """, (plan_date,))
-    removals = {}
+    removals, removals_sku = {}, {}
     for e in cursor.fetchall():
       if published_at and e['event_time'] and e['event_time'] < published_at:
         continue                       # pre-publish edits are the plan, not a variance
-      removals[(e['nx_order_numb'], e['nx_sku'])] = e
+      if e.get('nx_item_no'):
+        removals[_lk(e)] = e
+      removals_sku[(e['nx_order_numb'], e['nx_sku'])] = e
 
     # --- classify every planned line ----------------------------------
     rows, counts = [], {'SHIPPED': 0, 'WORKED': 0, 'REMOVED_WITH_REASON': 0,
@@ -259,7 +313,8 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     planned_in = moved_in = 0.0
     n_stretch = 0
     for s in planned:
-      key = (s['nx_order_numb'], s['nx_sku'])
+      key = (s['nx_order_numb'], s['nx_sku'])       # display / ledger key
+      lkey = _lk(s)                                  # 066: the e21 line
       tier = s['tier'] or 'Next'
       load = float(s['load_inches'] or 0)
       qty0 = float(s['qty_open'] or 0)
@@ -267,17 +322,17 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         n_stretch += 1
       else:
         planned_in += load
-      b = book.get(key)
-      w = wos.get(key)
+      b = _look(book, book_sku, s)
+      w = _look(wos, wos_sku, s)
       bal = float(b['balance'] or 0) if b else 0.0
       # 2026-09-07 test: item status 15 (Material Received/Shipped) is NOT a
       # shipped signal by itself - 86 candidate lines sat at 15 before the
       # plan existed. Until the snapshot records the status at publish,
       # shipped = the line left the open book or its balance dropped.
-      shp = _chg(key, 'SO_Shipped')
-      cxl = _chg(key, 'SO_Canceled', 'SO_Removed')
-      qch = _chg(key, 'FIELD_CHANGE', field='quantity')
-      dch = _chg(key, 'FIELD_CHANGE', field='due_date')
+      shp = _chg(s, 'SO_Shipped')
+      cxl = _chg(s, 'SO_Canceled', 'SO_Removed')
+      qch = _chg(s, 'FIELD_CHANGE', field='quantity')
+      dch = _chg(s, 'FIELD_CHANGE', field='due_date')
       # v1.2: the change log outranks the open-book inference. A line that
       # left the book because Order Entry cancelled it did not ship; a
       # balance that dropped because the quantity was edited did not ship.
@@ -286,7 +341,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       shipped = bool(shp) or ((b is None or bal < qty0 - 0.001)
                               and not cancelled and not qty_edited)
       worked = bool(w and (w['done_since'] or w['touched']))
-      rem = removals.get(key)
+      rem = removals.get(lkey) if lkey[2] else removals_sku.get(key)
       late = (s['ship_by_date'] and s['ship_by_date'] < plan_date)
       # date moved: the change log (old -> new, when) or the open book
       new_ship_by = None
@@ -302,9 +357,10 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       base = (f"{tier} on {_fmt_day(plan_date)}, {load:,.0f} in"
               + (f", late since {s['ship_by_date']:%m-%d}" if late else '')
               + (f", flags {s['flag_codes']}" if s.get('flag_codes') else ''))
-      row = {'order': key[0], 'sku': key[1], 'tier': tier, 'load': load,
+      row = {'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+             'line': _line_txt(s), 'tier': tier, 'load': load,
              'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
-             'pos': plan_pos.get(key, 10 ** 6),
+             'pos': (plan_pos.get(lkey) if lkey[2] else plan_pos_sku.get(key)) or 10 ** 6,
              'expected': 'SHIPPED', 'expected_value': qty0,
              'actual_value': (None if b is None else bal),
              'observed': False, 'case': None, 'routed_to': None,
@@ -315,7 +371,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         row.update(case='CANCELLED', observed=True, routed_to='SALES',
                    explanation=base + f"; {c0['change_type']} at {_hm(c0['detected_at'])} "
                    "per the work-order change log - left the book, did not ship",
-                   question=(f"Order {key[0]} / {key[1]} was {tier} on {_fmt_day(plan_date)} "
+                   question=(f"Order {_line_txt(s)} was {tier} on {_fmt_day(plan_date)} "
                              f"and was cancelled/removed at {_hm(c0['detected_at'])} after the plan "
                              "was published. Customer cancellation, or an entry change?"))
       elif shipped:
@@ -331,7 +387,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         row.update(case='QTY_CHANGED', observed=True, routed_to='SALES',
                    explanation=base + f"; quantity {q0['old_value']} -> {q0['new_value']} at "
                    f"{_hm(q0['detected_at'])} per the work-order change log - not a shipment",
-                   question=(f"Order {key[0]} / {key[1]} quantity changed from {q0['old_value']} "
+                   question=(f"Order {_line_txt(s)} quantity changed from {q0['old_value']} "
                              f"to {q0['new_value']} at {_hm(q0['detected_at'])} after "
                              f"{_fmt_day(plan_date)}'s plan was published. Customer change, "
                              "or an entry correction?"))
@@ -353,7 +409,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
           row.update(case='REMOVED_NO_REASON', expected='WORKED_ON', routed_to=role,
                      removed_by_role=role,
                      explanation=base + f"; {rem['event_type']} at {when} by {rem['actor']}, no reason recorded",
-                     question=(f"Order {key[0]} / {key[1]} was removed from {_fmt_day(plan_date)}'s "
+                     question=(f"Order {_line_txt(s)} was removed from {_fmt_day(plan_date)}'s "
                                f"plan at {when} with no reason recorded. What was the reason?"))
       elif tier == 'Stretch':
         row.update(case='UNTOUCHED_STRETCH', expected='WORKED_ON', resolution='EXPLAINED',
@@ -367,7 +423,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       else:
         row.update(case='UNTOUCHED', expected='WORKED_ON', routed_to='PC',
                    explanation=base + '; no shipment and no work-order activity recorded',
-                   question=(f"Order {key[0]} / {key[1]} was {tier} on {_fmt_day(plan_date)} "
+                   question=(f"Order {_line_txt(s)} was {tier} on {_fmt_day(plan_date)} "
                              f"({load:,.0f} in" + (f", late since {s['ship_by_date']:%m-%d}" if late else '')
                              + ") and shows no shipment or work-order activity. "
                              "Was it started? If not, what stopped it?"))
@@ -378,14 +434,15 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       if date_moved and not cancelled:
         counts['DATE_MOVED'] += 1
         when = f" at {_hm(dch[-1]['detected_at'])}" if dch else ''
-        rows.append({'order': key[0], 'sku': key[1], 'tier': tier, 'load': load,
+        rows.append({'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+                     'line': _line_txt(s), 'tier': tier, 'load': load,
                      'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
                      'expected': 'DATE_HELD', 'expected_value': None, 'actual_value': None,
                      'observed': bool(dch), 'case': 'DATE_MOVED', 'routed_to': 'SALES',
                      'explanation': (f"ship-by at publish {s['ship_by_date']:%m/%d}, now "
                                      f"{new_ship_by:%m/%d}" + (f", changed{when} per the "
                                                                "work-order change log" if dch else '')),
-                     'question': (f"Order {key[0]} / {key[1]} ship-by moved from "
+                     'question': (f"Order {_line_txt(s)} ship-by moved from "
                                   f"{s['ship_by_date']:%m/%d} to {new_ship_by:%m/%d}{when} after "
                                   f"{_fmt_day(plan_date)}'s plan was published. Customer change, "
                                   "or an entry correction?"),
@@ -413,13 +470,15 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       if gk not in planned_groups:
         continue
       key = (s['nx_order_numb'], s['nx_sku'])
-      partial_keys.add(key)
+      lkey = _lk(s)
+      partial_keys.add(lkey)
       load = float(s['load_inches'] or 0)
-      b = book.get(key)
-      shipped_anyway = bool(_chg(key, 'SO_Shipped')) or b is None
+      b = _look(book, book_sku, s)
+      shipped_anyway = bool(_chg(s, 'SO_Shipped')) or b is None
       knew = key[0] in acked
       counts['PARTIAL_ORDER'] += 1
-      rows.append({'order': key[0], 'sku': key[1], 'tier': None, 'load': load,
+      rows.append({'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+                   'line': _line_txt(s), 'tier': None, 'load': load,
                    'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
                    'expected': 'ON_PLAN', 'expected_value': float(s['qty_open'] or 0),
                    'actual_value': (None if b is None else float(b['balance'] or 0)),
@@ -436,18 +495,19 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     unplanned_in, n_unplanned_all = 0.0, 0
     for s in unplanned_pool:
       key = (s['nx_order_numb'], s['nx_sku'])
-      if key in partial_keys:
+      lkey = _lk(s)
+      if lkey in partial_keys:
         continue                       # whole-order rule: that is a PARTIAL_ORDER row
       load = float(s['load_inches'] or 0)
       if load <= 0:
         continue                       # zero-touch never counts against the reserve
       qty0 = float(s['qty_open'] or 0)
-      b = book.get(key)
+      b = _look(book, book_sku, s)
       bal = float(b['balance'] or 0) if b else 0.0
-      shp = _chg(key, 'SO_Shipped')
-      if _chg(key, 'SO_Canceled', 'SO_Removed') and not shp:
+      shp = _chg(s, 'SO_Shipped')
+      if _chg(s, 'SO_Canceled', 'SO_Removed') and not shp:
         continue                       # v1.2: cancelled, not shipped
-      if _chg(key, 'FIELD_CHANGE', field='quantity') and not shp and b is not None:
+      if _chg(s, 'FIELD_CHANGE', field='quantity') and not shp and b is not None:
         continue                       # v1.2: quantity edited, not shipped
       shipped = bool(shp) or (b is None) or (bal < qty0 - 0.001)   # status 15 alone: no
       if not shipped:
@@ -456,7 +516,8 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       unplanned_in += load
       if load >= rp['unplanned_min']:
         counts['UNPLANNED_SHIP'] += 1
-        rows.append({'order': key[0], 'sku': key[1], 'tier': None, 'load': load,
+        rows.append({'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+                     'line': _line_txt(s), 'tier': None, 'load': load,
                      'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
                      'expected': 'ON_PLAN', 'expected_value': qty0,
                      'actual_value': (None if b is None else bal), 'observed': True,
@@ -464,7 +525,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                      'explanation': (f"not on {_fmt_day(plan_date)}'s plan, {load:,.0f} in, "
                                      + ('gated at publish' if s['is_gated'] else f"score {int(s['priority_score'] or 0)}")
                                      + '; shipped anyway'),
-                     'question': (f"Order {key[0]} / {key[1]} ({load:,.0f} in) shipped on "
+                     'question': (f"Order {_line_txt(s)} ({load:,.0f} in) shipped on "
                                   f"{_fmt_day(plan_date)}"
                                   + (f" at {_hm(shp[-1]['detected_at'])}" if shp else '')
                                   + " without being on the plan. Was this a "
@@ -504,26 +565,30 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         WHERE plan_date = %s AND answer_text IS NULL AND reading_confirmed_at IS NULL
     """, (plan_date,))
     cursor.execute("""
-        SELECT nx_order_numb, nx_sku, expected FROM dbo.pc_plan_variance WHERE plan_date = %s
+        SELECT nx_order_numb, nx_sku, nx_rel_numb, nx_item_no, expected
+        FROM dbo.pc_plan_variance WHERE plan_date = %s
     """, (plan_date,))
-    kept = {(r['nx_order_numb'], r['nx_sku'], r['expected']) for r in cursor.fetchall()}
+    kept = {(r['nx_order_numb'], r['nx_sku'], r['nx_rel_numb'] or '', r['nx_item_no'] or '',
+             r['expected']) for r in cursor.fetchall()}
     n_ins = 0
     for r in rows:
-      if (r['order'], r['sku'], r['expected']) in kept:
+      if (r['order'], r['sku'], r.get('rel') or '', r.get('item') or '', r['expected']) in kept:
         continue
       asked = bool(r.get('asked'))
       cursor.execute("""
           INSERT INTO dbo.pc_plan_variance
-              (plan_date, nx_order_numb, nx_sku, expected, expected_value, actual_value,
+              (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
+               expected, expected_value, actual_value,
                actual_observed, variance_kind, routed_to, system_explanation,
                question_text, asked_to, asked_at, cause_key, resolution, resolved_at,
                variance_case, tier, load_inches, question_rank, removed_by_role,
                evidence_class)
-          VALUES (%s, %s, %s, %s, %s, %s, %s, 'UNCLASSIFIED', %s, %s,
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'UNCLASSIFIED', %s, %s,
                   %s, %s, CASE WHEN %s = 1 THEN GETDATE() END, %s, %s,
                   CASE WHEN %s = 1 THEN GETDATE() END,
                   %s, %s, %s, %s, %s, %s)
-      """, (plan_date, r['order'], r['sku'], r['expected'], r['expected_value'],
+      """, (plan_date, r['order'], r['sku'], (r.get('rel') or None), (r.get('item') or None),
+            r['expected'], r['expected_value'],
             r['actual_value'], 1 if r['observed'] else 0, r['routed_to'],
             r['explanation'][:500], (r['question'][:500] if r['question'] else None),
             (r['asked_to'] if asked else None), (1 if asked else 0),
@@ -573,13 +638,16 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       'unplanned_inches': round(unplanned_in, 1), 'reserve_inches': reserve_in,
       'reserve_used_pct': reserve_used,
       'n_questions': len(chosen), 'n_askable': len(askable), 'rows_written': n_ins,
-      'questions': [{'order': r['order'], 'sku': r['sku'], 'case': r['case'],
+      'questions': [{'order': r['order'], 'sku': r['sku'], 'item': r.get('item'),
+                     'line': r.get('line'), 'case': r['case'],
                      'to': r['routed_to'], 'owners': r['asked_to'], 'rank': r['rank'],
                      'text': r['question']} for r in chosen],
-      'not_asked': [{'order': r['order'], 'sku': r['sku'], 'case': r['case'],
+      'not_asked': [{'order': r['order'], 'sku': r['sku'], 'item': r.get('item'),
+                     'line': r.get('line'), 'case': r['case'],
                      'to': r['routed_to'], 'rank': r['rank'], 'text': r['question']}
                     for r in askable if r not in chosen],
-      'lines': [{'order': r['order'], 'sku': r['sku'], 'tier': r['tier'], 'load': r['load'],
+      'lines': [{'order': r['order'], 'sku': r['sku'], 'item': r.get('item'),
+                 'line': r.get('line'), 'tier': r['tier'], 'load': r['load'],
                  'case': r['case'], 'explanation': r['explanation']}
                 for r in rows if r['expected'] != 'DATE_HELD']})
   except Exception as e:
@@ -634,7 +702,8 @@ def retro_get_day(plan_date=None):
     """, (plan_date,))
     rows = [serialize_row(r) for r in cursor.fetchall()]
     cursor.execute("""
-        SELECT v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.variance_case,
+        SELECT v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.nx_rel_numb,
+               v.nx_item_no, v.variance_case,
                v.routed_to, v.question_text, v.answer_text, v.answered_by, v.answered_at,
                v.proposed_reading, v.proposed_evidence_class, v.proposed_cause_key
         FROM dbo.pc_plan_variance v
@@ -695,7 +764,8 @@ def retro_get_review():
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.variance_case,
+        SELECT v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.nx_rel_numb,
+               v.nx_item_no, v.variance_case,
                v.routed_to, v.tier, v.load_inches, v.system_explanation, v.question_text,
                v.asked_to, v.answer_text, v.answered_by, v.answered_at,
                v.proposed_reading, v.proposed_evidence_class, v.proposed_cause_key,
@@ -707,7 +777,8 @@ def retro_get_review():
     """)
     queue = [serialize_row(r) for r in cursor.fetchall()]
     cursor.execute("""
-        SELECT TOP 20 v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.variance_case,
+        SELECT TOP 20 v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.nx_rel_numb,
+               v.nx_item_no, v.variance_case,
                v.routed_to, v.answer_text, v.answered_by, v.confirmed_reading,
                v.evidence_class, v.cause_key, v.resolution, v.reading_confirmed_at
         FROM dbo.pc_plan_variance v

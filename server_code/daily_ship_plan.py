@@ -38,6 +38,12 @@ Tables written: pc_ship_plan, pc_ship_plan_line, pc_ship_plan_line_source,
               pc_plan_line_events, pc_plan_parameters,
               pc_assembler_day_override, pc_special_customers
 
+066 (2026-09-15, Dave): the plan line IS the e21 line - identity =
+    (plan_date, nx_order_numb, nx_rel_numb, nx_item_no); nx_sku is an
+    attribute. Line callables take (plan_date, order, rel, item, ...).
+    Planning quantity = nx_qty_ordered (e21 orditem.qty); balance due is
+    display + the C05 warning only. One candidate row per e21 line.
+
 Database: SQL Server (nexus) via pymssql
 Uses centralized db_config for credentials (Anvil Secrets)
 
@@ -260,18 +266,29 @@ def _parse_date(d):
 
 
 def _log_event(cursor, plan_date, order, sku, event_type,
-               old_value=None, new_value=None, actor=None, note=None):
+               old_value=None, new_value=None, actor=None, note=None,
+               rel=None, item=None):
   """Append one pc_plan_line_events row. ALWAYS called inside the same
-  transaction as the mutation it records."""
+  transaction as the mutation it records. 066: rel/item identify the
+  e21 line; order-level events leave them None."""
   cursor.execute("""
       INSERT INTO dbo.pc_plan_line_events
-          (plan_date, nx_order_numb, nx_sku, event_type,
+          (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no, event_type,
            old_value, new_value, actor, note)
-      VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-  """, (plan_date, order, sku, event_type,
+      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+  """, (plan_date, order, sku, rel, item, event_type,
         (str(old_value)[:200] if old_value is not None else None),
         (str(new_value)[:200] if new_value is not None else None),
         (actor or _current_actor()), (note[:500] if note else None)))
+
+
+def _line_label(order, rel, item, sku=None):
+  """'595613-20' (release shown only when it is not 001), + ' / SKU'."""
+  r = (rel or '').strip()
+  s = f"{order}-{(item or '').strip()}" if item else f"{order}"
+  if r and r != '001':
+    s = f"{order}-{r}-{(item or '').strip()}"
+  return f"{s} / {sku}" if sku else s
 
 
 def _stamp_work_orders(cursor, plan_date):
@@ -524,23 +541,22 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     from_sql = ("FROM dbo.vw_pc_ship_candidates c "
                 "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
                 "ON fs.nx_order_numb = c.nx_order_numb "
-                "AND fs.nx_sku = c.nx_sku")
+                "AND fs.nx_rel_numb = c.nx_rel_numb "
+                "AND fs.nx_item_no = c.nx_item_no")
     # Flag system (040/041): the scores view drives eligibility + rank.
     # Gated rows sort LAST (they are the Daily conversation, not the
     # plan); ungated rank by priority_score, then oldest ship-by.
+    # 066: one row per e21 line; qty_open = ordered, qty_balance = balance.
     sql = ("SELECT TOP %d c.*, ISNULL(fs.is_gated, 0) AS is_gated, "
            "fs.gate_codes, "
            "ISNULL(fs.priority_score, 0) AS priority_score, "
-           "fs.flag_codes, "
-           # 065 / C05: e21 ordered qty (orditem.qty) beside the balance
-           "(SELECT SUM(s.nx_qty_ordered) FROM dbo.sales_orders_due s "
-           " WHERE s.nx_order_numb = c.nx_order_numb "
-           "   AND s.nx_sku = c.nx_sku) AS qty_ordered "
+           "fs.flag_codes "
            % max(1, min(int(limit), 1000))) + from_sql
     if where:
       sql += " WHERE " + " AND ".join(where)
     sql += (" ORDER BY is_gated, priority_score DESC, "
-            "c.ship_by_date, c.load_inches DESC")
+            "c.ship_by_date, c.load_inches DESC, c.nx_order_numb, "
+            "c.nx_rel_numb, c.nx_item_no")
     cursor.execute(sql, tuple(args))
     rows = [serialize_row(r) for r in cursor.fetchall()]
     # Total matching (pre-TOP) — so truncation is VISIBLE, never silent:
@@ -554,25 +570,27 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     # Per-flag detail (code + note) for row tooltips — same WHERE, so
     # the notes describe exactly the rows on screen. One more query,
     # still ONE round trip for the client.
-    flags_sql = ("SELECT f.nx_order_numb, f.nx_sku, f.flag_code, "
-                 "f.flag_name, f.note "
+    flags_sql = ("SELECT f.nx_order_numb, f.nx_rel_numb, f.nx_item_no, "
+                 "f.flag_code, f.flag_name, f.note "
                  "FROM dbo.vw_pc_order_flags f "
                  "JOIN dbo.vw_pc_ship_candidates c "
                  "ON c.nx_order_numb = f.nx_order_numb "
-                 "AND c.nx_sku = f.nx_sku "
+                 "AND c.nx_rel_numb = f.nx_rel_numb "
+                 "AND c.nx_item_no = f.nx_item_no "
                  "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
                  "ON fs.nx_order_numb = c.nx_order_numb "
-                 "AND fs.nx_sku = c.nx_sku")
+                 "AND fs.nx_rel_numb = c.nx_rel_numb "
+                 "AND fs.nx_item_no = c.nx_item_no")
     if where:
       flags_sql += " WHERE " + " AND ".join(where)
     cursor.execute(flags_sql, tuple(args))
     fmap = {}
     for fr in cursor.fetchall():
-      fmap.setdefault((fr['nx_order_numb'], fr['nx_sku']), []).append(
+      fmap.setdefault((fr['nx_order_numb'], fr['nx_rel_numb'], fr['nx_item_no']), []).append(
         {'code': fr['flag_code'], 'name': fr['flag_name'],
          'note': fr['note']})
     for r in rows:
-      r['flags'] = fmap.get((r['nx_order_numb'], r['nx_sku']), [])
+      r['flags'] = fmap.get((r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']), [])
     # Feed freshness for the always-on Orders chip — age computed
     # SERVER-side (GETDATE) so browser clocks can't skew it.
     cursor.execute("""
@@ -609,28 +627,30 @@ def ship_plan_get_plan(plan_date):
         SELECT l.*, live.live_qty, live.live_ordered, pr.description AS reason_desc
         FROM dbo.pc_ship_plan_line l
         OUTER APPLY (SELECT SUM(s.nx_qty_balance_due) AS live_qty,
-                            SUM(s.nx_qty_ordered)     AS live_ordered   -- 065: C05
+                            SUM(ISNULL(s.nx_qty_ordered, s.nx_qty_balance_due)) AS live_ordered
                      FROM dbo.sales_orders_due s
                      WHERE s.nx_order_numb = l.nx_order_numb
-                       AND s.nx_sku = l.nx_sku) live
+                       AND s.nx_rel_numb = l.nx_rel_numb
+                       AND s.nx_item_no = l.nx_item_no) live          -- 066: the e21 line
         LEFT JOIN dbo.pc_priority_reasons pr
                ON pr.reason_code = l.priority_reason
         WHERE l.plan_date = %s
         ORDER BY CASE l.line_status WHEN 'Unplaced' THEN 0 ELSE 1 END,
                  CASE l.tier WHEN 'Must' THEN 0 WHEN 'Next' THEN 1
                              ELSE 2 END,
-                 l.position, l.load_inches DESC
+                 l.position, l.load_inches DESC, l.nx_order_numb, l.nx_rel_numb, l.nx_item_no
     """, (plan_date,))
     lines = []
     for r in cursor.fetchall():
       row = serialize_row(r)
-      live = row.get('live_qty')
+      live = row.get('live_qty')                  # e21 balance due (display)
+      ordered = row.get('live_ordered')           # e21 orditem.qty (planning qty, 066)
       planned = float(row['qty_planned'])
       if row['line_status'] in _ACTIVE_STATUSES:
-        if live is None:
+        if ordered is None:
           row['drift'] = 'gone'          # nothing open — likely shipped
-        elif abs(float(live) - planned) > 0.005:
-          row['drift'] = f"{planned:g} → {float(live):g}"
+        elif abs(float(ordered) - planned) > 0.005:
+          row['drift'] = f"{planned:g} → {float(ordered):g}"
         else:
           row['drift'] = None
       else:
@@ -638,12 +658,13 @@ def ship_plan_get_plan(plan_date):
       # 065 / C05: e21 balance due vs ordered disagree -> stale balance on
       # an e21 editing path (never a partial: e21 restates the line). The
       # Qty column shows "ordered (balance)"; PC re-accepts the line.
-      ordered = row.get('live_ordered')
       if (live is not None and ordered is not None
           and abs(float(live) - float(ordered)) > 0.005):
         row['qty_warn'] = f"balance {float(live):g} vs ordered {float(ordered):g}"
       else:
         row['qty_warn'] = None
+      row['line_label'] = _line_label(row['nx_order_numb'], row.get('nx_rel_numb'),
+                                      row.get('nx_item_no'))
       lines.append(row)
 
     planned_total = sum(float(l['load_inches']) for l in lines
@@ -680,20 +701,25 @@ def ship_plan_get_plan(plan_date):
 # MUTATIONS — one transaction each, event row inside it
 # =============================================================================
 
-def _fetch_candidate_rows(cursor, order, sku):
+def _fetch_candidate_rows(cursor, order, rel, item):
+  """066: the ONE candidate row of an e21 line (order, release, item)."""
   cursor.execute("""
       SELECT * FROM dbo.vw_pc_ship_candidate_rows
-      WHERE nx_order_numb = %s AND nx_sku = %s
-  """, (order, sku))
+      WHERE nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+  """, (order, rel, item))
   return cursor.fetchall()
 
 
 def _aggregate(rows):
-  qty = sum(float(r['nx_qty_balance_due'] or 0) for r in rows)
+  """066: qty = the ORDERED quantity (e21 orditem.qty). One row per line
+  now, but the shape is kept so the load math has one home."""
+  qty = sum(float((r['nx_qty_ordered'] if r.get('nx_qty_ordered') is not None
+                   else r['nx_qty_balance_due']) or 0) for r in rows)
   dates = [r['nx_dship_by_date'] or r['nx_hship_by_date'] for r in rows]
   dates = [d.date() if isinstance(d, datetime) else d for d in dates if d]
   return {
     'qty': qty,
+    'sku': rows[0]['nx_sku'],
     'ship_by': min(dates) if dates else None,
     'shipto': rows[0]['nx_shipto_code'],
     'carrier': rows[0]['nx_carrier'],
@@ -703,19 +729,9 @@ def _aggregate(rows):
   }
 
 
-def _insert_line_and_source(cursor, plan_date, order, sku, rows, agg,
-                            role='PC', actor=None, tier='Next', reason=None):
-  cursor.execute("""
-      INSERT INTO dbo.pc_ship_plan_line
-          (plan_date, nx_order_numb, nx_sku, qty_planned, ship_by_date,
-           shipto_code, carrier, load_inches, load_minutes,
-           surcharge_minutes, line_status, added_by_role, created_by,
-           tier, priority_reason)
-      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Planned', %s, %s,
-              %s, %s)
-  """, (plan_date, order, sku, agg['qty'], agg['ship_by'], agg['shipto'],
-        agg['carrier'], agg['inches'], agg['minutes'], agg['surcharge'],
-        role, actor or _current_actor(), tier, (reason or None)))
+def _insert_source_rows(cursor, plan_date, order, rel, item, rows):
+  """The plan-time snapshot of the e21 line (066: one row; qty_balance
+  holds the ORDERED quantity the plan was built on)."""
   for r in rows:
     cursor.execute("""
         INSERT INTO dbo.pc_ship_plan_line_source
@@ -723,11 +739,37 @@ def _insert_line_and_source(cursor, plan_date, order, sku, rows, agg,
              qty_balance, nx_attrib_val, element_class_used,
              class_was_defaulted, size_inches, minutes_charged)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (plan_date, order, sku, r['nx_rel_numb'], r['nx_item_no'],
-          r['nx_qty_balance_due'], r['nx_attrib_val'],
+    """, (plan_date, order, r['nx_sku'], rel, item,
+          (r['nx_qty_ordered'] if r.get('nx_qty_ordered') is not None
+           else r['nx_qty_balance_due']),
+          r['nx_attrib_val'],
           (r['element_class'] if r['element_class'] in
            ('Standard', 'Non-Standard') else 'n/a'),
           r['class_was_defaulted'], r['size_inches'], r['minutes_charged']))
+
+
+def _delete_source_rows(cursor, plan_date, order, rel, item):
+  cursor.execute("""
+      DELETE FROM dbo.pc_ship_plan_line_source
+      WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+  """, (plan_date, order, rel, item))
+
+
+def _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
+                            role='PC', actor=None, tier='Next', reason=None):
+  cursor.execute("""
+      INSERT INTO dbo.pc_ship_plan_line
+          (plan_date, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
+           qty_planned, ship_by_date,
+           shipto_code, carrier, load_inches, load_minutes,
+           surcharge_minutes, line_status, added_by_role, created_by,
+           tier, priority_reason)
+      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Planned', %s, %s,
+              %s, %s)
+  """, (plan_date, order, rel, item, agg['sku'], agg['qty'], agg['ship_by'],
+        agg['shipto'], agg['carrier'], agg['inches'], agg['minutes'],
+        agg['surcharge'], role, actor or _current_actor(), tier, (reason or None)))
+  _insert_source_rows(cursor, plan_date, order, rel, item, rows)
 
 
 def _ensure_header(cursor, plan_date, actor):
@@ -742,10 +784,10 @@ def _ensure_header(cursor, plan_date, actor):
 
 
 @anvil.server.callable
-def ship_plan_add_line(plan_date, order, sku, tier='Next', reason=None):
-  """Add an (order, SKU) to a day. The line is ALWAYS added — over-cap is
-  reported back so the client runs the cap-hit dialog (snooze / unplaced /
-  stretch / keep). Never a silent drop, never a lost order."""
+def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None):
+  """Add one e21 line (order, release, item) to a day. The line is ALWAYS
+  added — over-cap is reported back so the client runs the cap-hit dialog
+  (snooze / unplaced / stretch / keep). Never a silent drop."""
   plan_date = _parse_date(plan_date)
   if tier not in ('Must', 'Next', 'Stretch'):
     return {'status': 'error', 'message': f'Bad tier {tier}.'}
@@ -754,61 +796,48 @@ def ship_plan_add_line(plan_date, order, sku, tier='Next', reason=None):
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT line_status FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (plan_date, order, sku))
+        SELECT line_status, nx_sku FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (plan_date, order, rel, item))
     existing = cursor.fetchone()
+    label = _line_label(order, rel, item, existing['nx_sku'] if existing else None)
     if existing and existing['line_status'] != 'Removed':
       return {'status': 'error',
-              'message': f'{order} / {sku} is already on this plan '
+              'message': f'{label} is already on this plan '
               f"({existing['line_status']})."}
 
-    rows = _fetch_candidate_rows(cursor, order, sku)
+    rows = _fetch_candidate_rows(cursor, order, rel, item)
     if not rows:
       return {'status': 'error',
-              'message': f'{order} / {sku} has no open balance in the feed '
+              'message': f'{label} has no open quantity in the feed '
               '(shipped, or already planned on another day).'}
     agg = _aggregate(rows)
+    label = _line_label(order, rel, item, agg['sku'])
     _ensure_header(cursor, plan_date, actor)
 
     if existing:  # was Removed — revive rather than violate the PK
-      cursor.execute("""
-          DELETE FROM dbo.pc_ship_plan_line_source
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-      """, (plan_date, order, sku))
+      _delete_source_rows(cursor, plan_date, order, rel, item)
       cursor.execute("""
           UPDATE dbo.pc_ship_plan_line
-          SET qty_planned = %s, ship_by_date = %s, shipto_code = %s,
+          SET nx_sku = %s, qty_planned = %s, ship_by_date = %s, shipto_code = %s,
               carrier = %s, load_inches = %s, load_minutes = %s,
               surcharge_minutes = %s, line_status = 'Planned',
               tier = %s, priority_reason = %s,
               snooze_to_date = NULL, updated_by = %s, updated_at = GETDATE()
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-      """, (agg['qty'], agg['ship_by'], agg['shipto'], agg['carrier'],
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (agg['sku'], agg['qty'], agg['ship_by'], agg['shipto'], agg['carrier'],
             agg['inches'], agg['minutes'], agg['surcharge'],
             tier, (reason or None), actor,
-            plan_date, order, sku))
-      for r in rows:
-        cursor.execute("""
-            INSERT INTO dbo.pc_ship_plan_line_source
-                (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
-                 qty_balance, nx_attrib_val, element_class_used,
-                 class_was_defaulted, size_inches, minutes_charged)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (plan_date, order, sku, r['nx_rel_numb'], r['nx_item_no'],
-              r['nx_qty_balance_due'], r['nx_attrib_val'],
-              (r['element_class'] if r['element_class'] in
-               ('Standard', 'Non-Standard') else 'n/a'),
-              r['class_was_defaulted'], r['size_inches'],
-              r['minutes_charged']))
+            plan_date, order, rel, item))
+      _insert_source_rows(cursor, plan_date, order, rel, item, rows)
     else:
-      _insert_line_and_source(cursor, plan_date, order, sku, rows, agg,
+      _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
                               actor=actor, tier=tier, reason=reason)
 
-    _log_event(cursor, plan_date, order, sku, 'Added',
+    _log_event(cursor, plan_date, order, agg['sku'], 'Added',
                new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in "
                f"({tier})",
-               actor=actor)
+               actor=actor, rel=rel, item=item)
     _bump_revision(cursor, plan_date, actor)
 
     planned = _planned_inches(cursor, plan_date)
@@ -819,7 +848,7 @@ def ship_plan_add_line(plan_date, order, sku, tier='Next', reason=None):
     return {'status': 'success', 'planned_inches': round(planned, 1),
             'capacity_inches': round(cap, 1), 'over_capacity': over,
             'line_inches': round(agg['inches'], 1),
-            'suggested_day': suggested}
+            'suggested_day': suggested, 'label': label}
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Add failed: {e}'}
@@ -849,7 +878,7 @@ def ship_plan_get_reasons():
 
 
 @anvil.server.callable
-def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None,
+def ship_plan_set_priority(plan_date, order, rel, item, tier=None, reason=None,
                            note=None):
   """Set tier / reason / note on one plan line. Pass only what changes;
   ''=clear. Each change gets its own event (TierChange / ReasonSet) and
@@ -863,13 +892,14 @@ def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None,
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT tier, priority_reason, priority_note, line_status
+        SELECT tier, priority_reason, priority_note, line_status, nx_sku
         FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (plan_date, order, sku))
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (plan_date, order, rel, item))
     row = cursor.fetchone()
     if not row:
       return {'status': 'error', 'message': 'Line not found.'}
+    sku = row['nx_sku']
     if row['line_status'] == 'Removed':
       return {'status': 'error', 'message': 'Line is removed — revive it '
               'first (re-add the order).'}
@@ -879,10 +909,11 @@ def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None,
       cursor.execute("""
           UPDATE dbo.pc_ship_plan_line
           SET tier = %s, updated_by = %s, updated_at = GETDATE()
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-      """, (tier, actor, plan_date, order, sku))
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (tier, actor, plan_date, order, rel, item))
       _log_event(cursor, plan_date, order, sku, 'TierChange',
-                 old_value=row['tier'], new_value=tier, actor=actor)
+                 old_value=row['tier'], new_value=tier, actor=actor,
+                 rel=rel, item=item)
       changed = True
     if reason is not None:
       new_reason = reason or None          # '' clears
@@ -890,11 +921,11 @@ def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None,
         cursor.execute("""
             UPDATE dbo.pc_ship_plan_line
             SET priority_reason = %s, updated_by = %s, updated_at = GETDATE()
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-        """, (new_reason, actor, plan_date, order, sku))
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+        """, (new_reason, actor, plan_date, order, rel, item))
         _log_event(cursor, plan_date, order, sku, 'ReasonSet',
                    old_value=row['priority_reason'], new_value=new_reason,
-                   actor=actor)
+                   actor=actor, rel=rel, item=item)
         changed = True
     if note is not None:
       new_note = (note or '').strip()[:200] or None
@@ -902,11 +933,11 @@ def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None,
         cursor.execute("""
             UPDATE dbo.pc_ship_plan_line
             SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-        """, (new_note, actor, plan_date, order, sku))
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+        """, (new_note, actor, plan_date, order, rel, item))
         _log_event(cursor, plan_date, order, sku, 'ReasonSet',
                    old_value=row['priority_note'], new_value=new_note,
-                   actor=actor, note='note edit')
+                   actor=actor, note='note edit', rel=rel, item=item)
         changed = True
 
     if not changed:
@@ -930,12 +961,13 @@ def ship_plan_set_priority(plan_date, order, sku, tier=None, reason=None,
 @anvil.server.callable
 def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
                         due_date=None):
-  """Add EVERY open SKU of a sales order to the day — one transaction.
+  """Add EVERY open e21 line of a sales order to the day — one transaction.
   Per-line Added events plus one OrderAdded summary; a single cap check
   at the end (the client runs one dialog for the whole order, not one
-  per line). SKUs already on the plan are skipped, not errors.
+  per line). Lines already on the plan are skipped, not errors.
   due_date (2026-09-13, whole-order rule): only the lines with that
-  DETAIL ship-by date - the publish check's "Add the rest"."""
+  DETAIL ship-by date - the publish check's "Add the rest".
+  066: iterates e21 lines (rel, item), not SKUs."""
   plan_date = _parse_date(plan_date)
   if tier not in ('Must', 'Next', 'Stretch'):
     return {'status': 'error', 'message': f'Bad tier {tier}.'}
@@ -945,63 +977,63 @@ def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
     cursor = conn.cursor()
     if due_date:
       cursor.execute("""
-          SELECT DISTINCT nx_sku FROM dbo.vw_pc_ship_candidate_rows
+          SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.vw_pc_ship_candidate_rows
           WHERE nx_order_numb = %s
             AND CAST(nx_dship_by_date AS DATE) = %s
+          ORDER BY nx_rel_numb, nx_item_no
       """, (order, _parse_date(due_date)))
     else:
       cursor.execute("""
-          SELECT DISTINCT nx_sku FROM dbo.vw_pc_ship_candidate_rows
+          SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.vw_pc_ship_candidate_rows
           WHERE nx_order_numb = %s
+          ORDER BY nx_rel_numb, nx_item_no
       """, (order,))
-    skus = [r['nx_sku'] for r in cursor.fetchall()]
-    if not skus:
+    items = [(r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']) for r in cursor.fetchall()]
+    if not items:
       return {'status': 'error',
-              'message': f'{order} has no open balance in the feed '
+              'message': f'{order} has no open quantity in the feed '
               '(shipped, or already planned on another day).'}
 
     _ensure_header(cursor, plan_date, actor)
     added, skipped, order_inches = [], [], 0.0
-    for sku in skus:
+    for rel, item, sku in items:
+      label = _line_label(order, rel, item, sku)
       cursor.execute("""
           SELECT line_status FROM dbo.pc_ship_plan_line
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-      """, (plan_date, order, sku))
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (plan_date, order, rel, item))
       existing = cursor.fetchone()
       if existing and existing['line_status'] != 'Removed':
-        skipped.append(sku)
+        skipped.append(label)
         continue
-      rows = _fetch_candidate_rows(cursor, order, sku)
+      rows = _fetch_candidate_rows(cursor, order, rel, item)
       if not rows:
-        skipped.append(sku)
+        skipped.append(label)
         continue
       agg = _aggregate(rows)
       if existing:  # Removed — revive: clear then reinsert cleanly
-        cursor.execute("""
-            DELETE FROM dbo.pc_ship_plan_line_source
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-        """, (plan_date, order, sku))
+        _delete_source_rows(cursor, plan_date, order, rel, item)
         cursor.execute("""
             DELETE FROM dbo.pc_ship_plan_line
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-        """, (plan_date, order, sku))
-      _insert_line_and_source(cursor, plan_date, order, sku, rows, agg,
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+        """, (plan_date, order, rel, item))
+      _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
                               actor=actor, tier=tier, reason=reason)
-      _log_event(cursor, plan_date, order, sku, 'Added',
+      _log_event(cursor, plan_date, order, agg['sku'], 'Added',
                  new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in "
                  f"({tier})",
-                 actor=actor, note='whole order')
-      added.append(sku)
+                 actor=actor, note='whole order', rel=rel, item=item)
+      added.append(label)
       order_inches += agg['inches']
 
     if not added:
       conn.rollback()
       return {'status': 'error',
-              'message': f'Every open item of {order} is already on this '
+              'message': f'Every open line of {order} is already on this '
               'plan — nothing to add.'}
 
     _log_event(cursor, plan_date, order, None, 'OrderAdded',
-               new_value=f'{len(added)} items / {order_inches:.1f} in '
+               new_value=f'{len(added)} lines / {order_inches:.1f} in '
                f'({tier})',
                actor=actor)
     _bump_revision(cursor, plan_date, actor)
@@ -1032,7 +1064,8 @@ def ship_plan_partial_orders(plan_date):
   on it. Returns the missing lines per (order, due date) so the client
   can offer 'Add the rest'. Lines already planned on another day or
   snoozed are reported with where they went (PC decided; not auto-added).
-  Hidden lines (charges, services - pc_plan_exclusions) are not lines."""
+  Hidden lines (charges, services - pc_plan_exclusions) are not lines.
+  066: at e21-line grain (order, release, item)."""
   plan_date = _parse_date(plan_date)
   conn = get_connection()
   try:
@@ -1042,8 +1075,8 @@ def ship_plan_partial_orders(plan_date):
     # it before and after).
     cursor.execute("IF OBJECT_ID('tempdb..#cr') IS NOT NULL DROP TABLE #cr")
     cursor.execute("""
-        SELECT nx_order_numb, nx_sku, nx_sku_desc, bucket,
-               nx_qty_balance_due, work_inches,
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, nx_sku_desc, bucket,
+               nx_qty_ordered, work_inches,
                CAST(nx_dship_by_date AS DATE) AS due_date
         INTO #cr
         FROM dbo.vw_pc_ship_candidate_rows
@@ -1052,13 +1085,14 @@ def ship_plan_partial_orders(plan_date):
                                   AND line_status IN ('Planned', 'Proposed', 'Confirmed'))
     """, (plan_date,))
     cursor.execute("""
-        SELECT r.nx_order_numb, r.due_date, r.nx_sku,
-               MAX(r.nx_sku_desc) AS sku_desc, MAX(r.bucket) AS bucket,
-               SUM(r.nx_qty_balance_due) AS qty, SUM(r.work_inches) AS inches,
+        SELECT r.nx_order_numb, r.due_date, r.nx_rel_numb, r.nx_item_no, r.nx_sku,
+               r.nx_sku_desc AS sku_desc, r.bucket,
+               r.nx_qty_ordered AS qty, r.work_inches AS inches,
                (SELECT TOP 1 CONVERT(VARCHAR(10), ISNULL(x.snooze_to_date, x.plan_date), 120)
                              + ' ' + x.line_status
                 FROM dbo.pc_ship_plan_line x
-                WHERE x.nx_order_numb = r.nx_order_numb AND x.nx_sku = r.nx_sku
+                WHERE x.nx_order_numb = r.nx_order_numb AND x.nx_rel_numb = r.nx_rel_numb
+                  AND x.nx_item_no = r.nx_item_no
                   AND x.plan_date <> %s
                   AND ((x.plan_date >= CAST(GETDATE() AS DATE)
                         AND x.line_status IN ('Planned', 'Proposed', 'Confirmed'))
@@ -1067,23 +1101,24 @@ def ship_plan_partial_orders(plan_date):
                 ORDER BY x.plan_date DESC) AS elsewhere,
                (SELECT MIN(CASE p.tier WHEN 'Must' THEN 0 WHEN 'Next' THEN 1 ELSE 2 END)
                 FROM dbo.pc_ship_plan_line p
-                JOIN #cr pr ON pr.nx_order_numb = p.nx_order_numb AND pr.nx_sku = p.nx_sku
+                JOIN #cr pr ON pr.nx_order_numb = p.nx_order_numb
+                           AND pr.nx_rel_numb = p.nx_rel_numb AND pr.nx_item_no = p.nx_item_no
                 WHERE p.plan_date = %s AND p.nx_order_numb = r.nx_order_numb
                   AND p.line_status IN ('Planned', 'Proposed', 'Confirmed')
                   AND pr.due_date = r.due_date) AS tier_rank
         FROM #cr r
         WHERE EXISTS (SELECT 1
                       FROM dbo.pc_ship_plan_line p
-                      JOIN #cr pr ON pr.nx_order_numb = p.nx_order_numb AND pr.nx_sku = p.nx_sku
+                      JOIN #cr pr ON pr.nx_order_numb = p.nx_order_numb
+                                 AND pr.nx_rel_numb = p.nx_rel_numb AND pr.nx_item_no = p.nx_item_no
                       WHERE p.plan_date = %s AND p.nx_order_numb = r.nx_order_numb
                         AND p.line_status IN ('Planned', 'Proposed', 'Confirmed')
                         AND pr.due_date = r.due_date)
           AND NOT EXISTS (SELECT 1 FROM dbo.pc_ship_plan_line p2
                           WHERE p2.plan_date = %s AND p2.nx_order_numb = r.nx_order_numb
-                            AND p2.nx_sku = r.nx_sku
+                            AND p2.nx_rel_numb = r.nx_rel_numb AND p2.nx_item_no = r.nx_item_no
                             AND p2.line_status IN ('Planned', 'Proposed', 'Confirmed'))
-        GROUP BY r.nx_order_numb, r.due_date, r.nx_sku
-        ORDER BY r.nx_order_numb, r.due_date, r.nx_sku
+        ORDER BY r.nx_order_numb, r.due_date, r.nx_rel_numb, r.nx_item_no
     """, (plan_date, plan_date, plan_date, plan_date))
     rows = cursor.fetchall()
     cursor.execute("IF OBJECT_ID('tempdb..#cr') IS NOT NULL DROP TABLE #cr")
@@ -1092,7 +1127,9 @@ def ship_plan_partial_orders(plan_date):
       k = (r['nx_order_numb'], str(r['due_date'])[:10])
       g = by_group.setdefault(k, {'order': k[0], 'due_date': k[1], 'lines': [],
                                   'missing_inches': 0.0, 'tier': 'Next'})
-      g['lines'].append({'sku': r['nx_sku'], 'desc': r['sku_desc'], 'bucket': r['bucket'],
+      g['lines'].append({'rel': r['nx_rel_numb'], 'item': r['nx_item_no'],
+                         'label': _line_label(k[0], r['nx_rel_numb'], r['nx_item_no']),
+                         'sku': r['nx_sku'], 'desc': r['sku_desc'], 'bucket': r['bucket'],
                          'qty': float(r['qty'] or 0), 'inches': float(r['inches'] or 0),
                          'elsewhere': r['elsewhere']})
       g['missing_inches'] += float(r['inches'] or 0)
@@ -1125,12 +1162,12 @@ def ship_plan_remove_order(plan_date, order, note=None):
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT nx_sku FROM dbo.pc_ship_plan_line
+        SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND nx_order_numb = %s
           AND line_status <> 'Removed'
     """, (plan_date, order))
-    skus = [r['nx_sku'] for r in cursor.fetchall()]
-    if not skus:
+    items = [(r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']) for r in cursor.fetchall()]
+    if not items:
       return {'status': 'error',
               'message': f'{order} has no active lines on this plan.'}
     cursor.execute("""
@@ -1139,14 +1176,15 @@ def ship_plan_remove_order(plan_date, order, note=None):
         WHERE plan_date = %s AND nx_order_numb = %s
           AND line_status <> 'Removed'
     """, (actor, plan_date, order))
-    for sku in skus:
+    for rel, item, sku in items:
       _log_event(cursor, plan_date, order, sku, 'Removed',
-                 actor=actor, note=note or 'whole order')
+                 actor=actor, note=note or 'whole order', rel=rel, item=item)
     _log_event(cursor, plan_date, order, None, 'OrderRemoved',
-               new_value=f'{len(skus)} items', actor=actor, note=note)
+               new_value=f'{len(items)} lines', actor=actor, note=note)
     _bump_revision(cursor, plan_date, actor)
     conn.commit()
-    return {'status': 'success', 'removed': skus}
+    return {'status': 'success',
+            'removed': [_line_label(order, rel, item, sku) for rel, item, sku in items]}
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Remove order failed: {e}'}
@@ -1155,20 +1193,27 @@ def ship_plan_remove_order(plan_date, order, note=None):
 
 
 @anvil.server.callable
-def ship_plan_remove_line(plan_date, order, sku, note=None):
+def ship_plan_remove_line(plan_date, order, rel, item, note=None):
   plan_date = _parse_date(plan_date)
   conn = get_connection()
   try:
     cursor = conn.cursor()
     cursor.execute("""
+        SELECT nx_sku FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+          AND line_status <> 'Removed'
+    """, (plan_date, order, rel, item))
+    hit = cursor.fetchone()
+    if not hit:
+      return {'status': 'error', 'message': 'Line not found (or already removed).'}
+    cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
         SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
           AND line_status <> 'Removed'
-    """, (_current_actor(), plan_date, order, sku))
-    if cursor.rowcount == 0:
-      return {'status': 'error', 'message': 'Line not found (or already removed).'}
-    _log_event(cursor, plan_date, order, sku, 'Removed', note=note)
+    """, (_current_actor(), plan_date, order, rel, item))
+    _log_event(cursor, plan_date, order, hit['nx_sku'], 'Removed', note=note,
+               rel=rel, item=item)
     _bump_revision(cursor, plan_date, None)
     conn.commit()
     return {'status': 'success'}
@@ -1180,20 +1225,26 @@ def ship_plan_remove_line(plan_date, order, sku, note=None):
 
 
 @anvil.server.callable
-def ship_plan_mark_unplaced(plan_date, order, sku, note=None):
+def ship_plan_mark_unplaced(plan_date, order, rel, item, note=None):
   """The explicit queue (DECISION §4) — visible on the day PC tried."""
   plan_date = _parse_date(plan_date)
   conn = get_connection()
   try:
     cursor = conn.cursor()
     cursor.execute("""
+        SELECT nx_sku FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (plan_date, order, rel, item))
+    hit = cursor.fetchone()
+    if not hit:
+      return {'status': 'error', 'message': 'Line not found.'}
+    cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
         SET line_status = 'Unplaced', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (_current_actor(), plan_date, order, sku))
-    if cursor.rowcount == 0:
-      return {'status': 'error', 'message': 'Line not found.'}
-    _log_event(cursor, plan_date, order, sku, 'Unplaced', note=note)
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (_current_actor(), plan_date, order, rel, item))
+    _log_event(cursor, plan_date, order, hit['nx_sku'], 'Unplaced', note=note,
+               rel=rel, item=item)
     _bump_revision(cursor, plan_date, None)
     conn.commit()
     return {'status': 'success'}
@@ -1205,7 +1256,7 @@ def ship_plan_mark_unplaced(plan_date, order, sku, note=None):
 
 
 @anvil.server.callable
-def ship_plan_snooze_line(plan_date, order, sku, to_date):
+def ship_plan_snooze_line(plan_date, order, rel, item, to_date):
   """Mark this day's line Snoozed and create the future day's line —
   ONE transaction across both days. Source rows re-captured fresh for the
   new day (its own plan-time snapshot)."""
@@ -1219,43 +1270,43 @@ def ship_plan_snooze_line(plan_date, order, sku, to_date):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT line_status FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (to_date, order, sku))
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (to_date, order, rel, item))
     if cursor.fetchone():
       return {'status': 'error',
-              'message': f'{order} / {sku} is already on {to_date}.'}
+              'message': f'{_line_label(order, rel, item)} is already on {to_date}.'}
     cursor.execute("""
-        SELECT tier, priority_reason FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (plan_date, order, sku))
+        SELECT tier, priority_reason, nx_sku FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (plan_date, order, rel, item))
     src = cursor.fetchone() or {}
 
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
         SET line_status = 'Snoozed', snooze_to_date = %s,
             updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
           AND line_status IN %s
-    """, (to_date, actor, plan_date, order, sku, _ACTIVE_STATUSES))
+    """, (to_date, actor, plan_date, order, rel, item, _ACTIVE_STATUSES))
     if cursor.rowcount == 0:
       return {'status': 'error', 'message': 'Line not found or not active.'}
-    _log_event(cursor, plan_date, order, sku, 'Snoozed',
-               new_value=to_date.isoformat(), actor=actor)
+    _log_event(cursor, plan_date, order, src.get('nx_sku'), 'Snoozed',
+               new_value=to_date.isoformat(), actor=actor, rel=rel, item=item)
 
-    rows = _fetch_candidate_rows(cursor, order, sku)
+    rows = _fetch_candidate_rows(cursor, order, rel, item)
     if not rows:
       conn.rollback()
       return {'status': 'error',
-              'message': 'No open balance left in the feed — nothing to '
+              'message': 'No open quantity left in the feed — nothing to '
               'snooze forward. Refresh the plan.'}
     agg = _aggregate(rows)
     _ensure_header(cursor, to_date, actor)
-    _insert_line_and_source(cursor, to_date, order, sku, rows, agg,
+    _insert_line_and_source(cursor, to_date, order, rel, item, rows, agg,
                             actor=actor, tier=src.get('tier') or 'Next',
                             reason=src.get('priority_reason'))
-    _log_event(cursor, to_date, order, sku, 'Added',
+    _log_event(cursor, to_date, order, agg['sku'], 'Added',
                new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in",
-               actor=actor, note=f'snoozed from {plan_date}')
+               actor=actor, note=f'snoozed from {plan_date}', rel=rel, item=item)
     _bump_revision(cursor, plan_date, actor)
     _bump_revision(cursor, to_date, actor)
     conn.commit()
@@ -1268,7 +1319,7 @@ def ship_plan_snooze_line(plan_date, order, sku, to_date):
 
 
 @anvil.server.callable
-def ship_plan_recalc_line(plan_date, order, sku):
+def ship_plan_recalc_line(plan_date, order, rel, item):
   """THE drift-rule writer — the only path that re-totals a plan line.
   Replaces the source snapshot and logs Recalc with old/new."""
   plan_date = _parse_date(plan_date)
@@ -1278,49 +1329,35 @@ def ship_plan_recalc_line(plan_date, order, sku):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT qty_planned, load_inches FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
           AND line_status IN %s
-    """, (plan_date, order, sku, _ACTIVE_STATUSES))
+    """, (plan_date, order, rel, item, _ACTIVE_STATUSES))
     old = cursor.fetchone()
     if not old:
       return {'status': 'error', 'message': 'Line not found or not active.'}
 
-    rows = _fetch_candidate_rows(cursor, order, sku)
+    rows = _fetch_candidate_rows(cursor, order, rel, item)
     if not rows:
       return {'status': 'error',
-              'message': 'No open balance in the feed — this line likely '
+              'message': 'No open quantity in the feed — this line likely '
               'shipped. Remove it rather than refreshing.'}
     agg = _aggregate(rows)
 
-    cursor.execute("""
-        DELETE FROM dbo.pc_ship_plan_line_source
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (plan_date, order, sku))
-    for r in rows:
-      cursor.execute("""
-          INSERT INTO dbo.pc_ship_plan_line_source
-              (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
-               qty_balance, nx_attrib_val, element_class_used,
-               class_was_defaulted, size_inches, minutes_charged)
-          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-      """, (plan_date, order, sku, r['nx_rel_numb'], r['nx_item_no'],
-            r['nx_qty_balance_due'], r['nx_attrib_val'],
-            (r['element_class'] if r['element_class'] in
-             ('Standard', 'Non-Standard') else 'n/a'),
-            r['class_was_defaulted'], r['size_inches'], r['minutes_charged']))
+    _delete_source_rows(cursor, plan_date, order, rel, item)
+    _insert_source_rows(cursor, plan_date, order, rel, item, rows)
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
-        SET qty_planned = %s, ship_by_date = %s, load_inches = %s,
+        SET nx_sku = %s, qty_planned = %s, ship_by_date = %s, load_inches = %s,
             load_minutes = %s, surcharge_minutes = %s,
             updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (agg['qty'], agg['ship_by'], agg['inches'], agg['minutes'],
-          agg['surcharge'], actor, plan_date, order, sku))
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (agg['sku'], agg['qty'], agg['ship_by'], agg['inches'], agg['minutes'],
+          agg['surcharge'], actor, plan_date, order, rel, item))
 
     old_txt = f"{float(old['qty_planned']):g} pcs / {float(old['load_inches']):.1f} in"
     new_txt = f"{agg['qty']:g} pcs / {agg['inches']:.1f} in"
-    _log_event(cursor, plan_date, order, sku, 'Recalc',
-               old_value=old_txt, new_value=new_txt, actor=actor)
+    _log_event(cursor, plan_date, order, agg['sku'], 'Recalc',
+               old_value=old_txt, new_value=new_txt, actor=actor, rel=rel, item=item)
     _bump_revision(cursor, plan_date, actor)
     conn.commit()
     return {'status': 'success', 'old': old_txt, 'new': new_txt}
@@ -1340,36 +1377,41 @@ def _snapshot_flags(cursor, plan_date, revision_no, weight_set_id):
   step-12 backtests replay from it. Idempotent per (plan_date, revision)."""
   cursor.execute("""
       INSERT INTO dbo.pc_plan_flag_snapshot
-          (plan_date, revision_no, nx_order_numb, nx_sku, was_planned, tier,
-           is_gated, gate_codes, priority_score, flag_codes,
+          (plan_date, revision_no, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
+           was_planned, tier, is_gated, gate_codes, priority_score, flag_codes,
            ship_by_date, qty_open, load_inches, capacity_weight_set_id)
-      SELECT %s, %s, p.nx_order_numb, p.nx_sku, p.was_planned, p.tier,
+      SELECT %s, %s, p.nx_order_numb, p.nx_rel_numb, p.nx_item_no, p.nx_sku,
+             p.was_planned, p.tier,
              ISNULL(fs.is_gated, 0), fs.gate_codes,
              ISNULL(fs.priority_score, 0), fs.flag_codes,
              p.ship_by_date, p.qty_open, p.load_inches, %s
       FROM (
-          SELECT l.nx_order_numb, l.nx_sku, 1 AS was_planned, l.tier,
+          SELECT l.nx_order_numb, l.nx_rel_numb, l.nx_item_no, l.nx_sku,
+                 1 AS was_planned, l.tier,
                  l.ship_by_date, l.qty_planned AS qty_open, l.load_inches
           FROM dbo.pc_ship_plan_line l
           WHERE l.plan_date = %s
             AND l.line_status IN ('Planned','Proposed','Confirmed')
           UNION ALL
-          SELECT c.nx_order_numb, c.nx_sku, 0, NULL,
+          SELECT c.nx_order_numb, c.nx_rel_numb, c.nx_item_no, c.nx_sku, 0, NULL,
                  c.ship_by_date, c.qty_open, c.load_inches
           FROM dbo.vw_pc_ship_candidates c
           WHERE NOT EXISTS (
               SELECT 1 FROM dbo.pc_ship_plan_line l2
               WHERE l2.plan_date = %s
                 AND l2.nx_order_numb = c.nx_order_numb
-                AND l2.nx_sku = c.nx_sku
+                AND l2.nx_rel_numb = c.nx_rel_numb
+                AND l2.nx_item_no = c.nx_item_no
                 AND l2.line_status IN ('Planned','Proposed','Confirmed'))
       ) p
       LEFT JOIN dbo.vw_pc_order_flag_scores fs
-             ON fs.nx_order_numb = p.nx_order_numb AND fs.nx_sku = p.nx_sku
+             ON fs.nx_order_numb = p.nx_order_numb AND fs.nx_rel_numb = p.nx_rel_numb
+            AND fs.nx_item_no = p.nx_item_no
       WHERE NOT EXISTS (
           SELECT 1 FROM dbo.pc_plan_flag_snapshot s
           WHERE s.plan_date = %s AND s.revision_no = %s
-            AND s.nx_order_numb = p.nx_order_numb AND s.nx_sku = p.nx_sku)
+            AND s.nx_order_numb = p.nx_order_numb AND s.nx_rel_numb = p.nx_rel_numb
+            AND s.nx_item_no = p.nx_item_no)
   """, (plan_date, revision_no, weight_set_id, plan_date, plan_date,
         plan_date, revision_no))
   n_rows = cursor.rowcount
@@ -1379,7 +1421,8 @@ def _snapshot_flags(cursor, plan_date, revision_no, weight_set_id):
       SELECT s.snapshot_id, f.flag_code, f.weight, LEFT(f.note, 500)
       FROM dbo.pc_plan_flag_snapshot s
       JOIN dbo.vw_pc_order_flags f
-        ON f.nx_order_numb = s.nx_order_numb AND f.nx_sku = s.nx_sku
+        ON f.nx_order_numb = s.nx_order_numb AND f.nx_rel_numb = s.nx_rel_numb
+       AND f.nx_item_no = s.nx_item_no
       WHERE s.plan_date = %s AND s.revision_no = %s
         AND NOT EXISTS (
             SELECT 1 FROM dbo.pc_plan_flag_snapshot_detail d
@@ -1411,7 +1454,8 @@ def ship_plan_publish(plan_date, partial_ack=None):
                    f"{float(g.get('missing_inches') or 0):,.0f} in",
                    actor=actor,
                    note='published anyway; due ' + str(g.get('due_date') or '') + ': '
-                   + ', '.join(l.get('sku', '') for l in (g.get('lines') or []))[:400])
+                   + ', '.join((l.get('label') or l.get('sku') or '')
+                               for l in (g.get('lines') or []))[:400])
       except Exception:
         pass                      # the acknowledgement must never block a publish
     cursor.execute("""
@@ -1738,8 +1782,8 @@ def ship_plan_get_events(plan_date, limit=100):
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT TOP %d event_id, plan_date, nx_order_numb, nx_sku, event_type,
-               old_value, new_value, actor, event_time, note
+        SELECT TOP %d event_id, plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
+               event_type, old_value, new_value, actor, event_time, note
         FROM dbo.pc_plan_line_events
         WHERE plan_date = %%s
         ORDER BY event_time DESC, event_id DESC
@@ -1765,7 +1809,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.0'
+_AGENT_VERSION = 'v1.1'   # 066: item-level lines, ordered qty
 
 
 def _agent_params(cursor):
@@ -1829,56 +1873,41 @@ def _agent_reason(c, tier, notes):
   return txt[:500]
 
 
-def _upsert_proposed_line(cursor, plan_date, order, sku, rows, agg, tier,
+def _upsert_proposed_line(cursor, plan_date, order, rel, item, rows, agg, tier,
                           reason, actor):
   """Insert (or revive a Removed) line as Proposed by the agent. Returns
   False if PC already has the line active — the proposal records it, the
   plan is left alone."""
   cursor.execute("""
       SELECT line_status FROM dbo.pc_ship_plan_line
-      WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-  """, (plan_date, order, sku))
+      WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+  """, (plan_date, order, rel, item))
   ex = cursor.fetchone()
   if ex and ex['line_status'] in _ACTIVE_STATUSES:
     return False
   if ex:   # Removed earlier today — revive under the PK
-    cursor.execute("""
-        DELETE FROM dbo.pc_ship_plan_line_source
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (plan_date, order, sku))
+    _delete_source_rows(cursor, plan_date, order, rel, item)
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
-        SET qty_planned = %s, ship_by_date = %s, shipto_code = %s,
+        SET nx_sku = %s, qty_planned = %s, ship_by_date = %s, shipto_code = %s,
             carrier = %s, load_inches = %s, load_minutes = %s,
             surcharge_minutes = %s, line_status = 'Proposed',
             added_by_role = 'Agent', tier = %s, priority_reason = NULL,
             priority_note = %s, proposed_by = %s, snooze_to_date = NULL,
             updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (agg['qty'], agg['ship_by'], agg['shipto'], agg['carrier'],
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (agg['sku'], agg['qty'], agg['ship_by'], agg['shipto'], agg['carrier'],
           agg['inches'], agg['minutes'], agg['surcharge'],
-          tier, reason, actor, actor, plan_date, order, sku))
-    for r in rows:
-      cursor.execute("""
-          INSERT INTO dbo.pc_ship_plan_line_source
-              (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
-               qty_balance, nx_attrib_val, element_class_used,
-               class_was_defaulted, size_inches, minutes_charged)
-          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-      """, (plan_date, order, sku, r['nx_rel_numb'], r['nx_item_no'],
-            r['nx_qty_balance_due'], r['nx_attrib_val'],
-            (r['element_class'] if r['element_class'] in
-             ('Standard', 'Non-Standard') else 'n/a'),
-            r['class_was_defaulted'], r['size_inches'],
-            r['minutes_charged']))
+          tier, reason, actor, actor, plan_date, order, rel, item))
+    _insert_source_rows(cursor, plan_date, order, rel, item, rows)
   else:
-    _insert_line_and_source(cursor, plan_date, order, sku, rows, agg,
+    _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
                             role='Agent', actor=actor, tier=tier, reason=None)
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
         SET line_status = 'Proposed', proposed_by = %s, priority_note = %s
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (actor, reason, plan_date, order, sku))
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (actor, reason, plan_date, order, rel, item))
   return True
 
 
@@ -1973,32 +2002,34 @@ def _agent_propose_impl(plan_date=None, force=False):
                ISNULL(fs.priority_score, 0) AS priority_score, fs.flag_codes
         FROM dbo.vw_pc_ship_candidates c
         LEFT JOIN dbo.vw_pc_order_flag_scores fs
-               ON fs.nx_order_numb = c.nx_order_numb AND fs.nx_sku = c.nx_sku
+               ON fs.nx_order_numb = c.nx_order_numb AND fs.nx_rel_numb = c.nx_rel_numb
+              AND fs.nx_item_no = c.nx_item_no
         WHERE c.ship_by_date <= %s
         ORDER BY ISNULL(fs.is_gated, 0), ISNULL(fs.priority_score, 0) DESC,
-                 c.ship_by_date, c.load_inches DESC
+                 c.ship_by_date, c.load_inches DESC, c.nx_order_numb, c.nx_rel_numb, c.nx_item_no
     """, (end,))
     cands = [serialize_row(r) for r in cursor.fetchall()]
     cursor.execute("""
-        SELECT f.nx_order_numb, f.nx_sku, f.flag_code, f.note
+        SELECT f.nx_order_numb, f.nx_rel_numb, f.nx_item_no, f.flag_code, f.note
         FROM dbo.vw_pc_order_flags f
         JOIN dbo.vw_pc_ship_candidates c
-          ON c.nx_order_numb = f.nx_order_numb AND c.nx_sku = f.nx_sku
+          ON c.nx_order_numb = f.nx_order_numb AND c.nx_rel_numb = f.nx_rel_numb
+         AND c.nx_item_no = f.nx_item_no
         WHERE c.ship_by_date <= %s
         ORDER BY f.flag_code
     """, (end,))
     notes = {}
     for r in cursor.fetchall():
-      notes.setdefault((r['nx_order_numb'], r['nx_sku']), []).append(r)
+      notes.setdefault((r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']), []).append(r)
     # All source rows for the horizon in ONE query (per-line view queries
-    # were the 30 s timeout on the first run).
+    # were the 30 s timeout on the first run). 066: one row per e21 line.
     cursor.execute("""
         SELECT * FROM dbo.vw_pc_ship_candidate_rows
         WHERE CAST(COALESCE(nx_dship_by_date, nx_hship_by_date) AS DATE) <= %s
     """, (end,))
     rows_by_key = {}
     for r in cursor.fetchall():
-      rows_by_key.setdefault((r['nx_order_numb'], r['nx_sku']), []).append(r)
+      rows_by_key.setdefault((r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']), []).append(r)
 
     # --- the fill: WHOLE-ORDER GROUPS (rule, Dave 2026-09-13) ---------
     # If one line of a sales order is proposed, every other open line
@@ -2021,15 +2052,16 @@ def _agent_propose_impl(plan_date=None, force=False):
     #     AFTER the fill against the final slack - whole groups only.
     max_line = target * ap['max_line_pct']
     cursor.execute("""
-        SELECT pl.nx_order_numb, pl.nx_sku, pl.plan_date, pl.line_status,
-               pl.snooze_to_date
+        SELECT pl.nx_order_numb, pl.nx_rel_numb, pl.nx_item_no, pl.nx_sku, pl.plan_date,
+               pl.line_status, pl.snooze_to_date
         FROM dbo.pc_ship_plan_line pl
         WHERE (pl.plan_date <> %s AND pl.plan_date >= CAST(GETDATE() AS DATE)
                AND pl.line_status IN ('Planned', 'Proposed', 'Confirmed'))
            OR (pl.line_status = 'Snoozed'
                AND ISNULL(pl.snooze_to_date, pl.plan_date) >= CAST(GETDATE() AS DATE))
     """, (plan_date,))
-    elsewhere = {(r['nx_order_numb'], r['nx_sku']): r for r in cursor.fetchall()}
+    elsewhere = {(r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']): r
+                 for r in cursor.fetchall()}
     cursor.execute("""
         SELECT DISTINCT nx_order_numb FROM dbo.sales_orders_due
         WHERE RTRIM(nx_order_type) = 'S'
@@ -2065,11 +2097,12 @@ def _agent_propose_impl(plan_date=None, force=False):
         m['group_inches'] = load
         m['group_n'] = len(members)
         m['rides_along'] = not any(m is d for d in drivers)
-      blk = [m for m in members if (order, m['nx_sku']) in elsewhere]
+      blk = [m for m in members
+             if (order, m['nx_rel_numb'], m['nx_item_no']) in elsewhere]
       if blk:
-        e = elsewhere[(order, blk[0]['nx_sku'])]
+        e = elsewhere[(order, blk[0]['nx_rel_numb'], blk[0]['nx_item_no'])]
         when = str(e.get('snooze_to_date') or e.get('plan_date') or '')[:10]
-        why = (f"sibling {blk[0]['nx_sku']} already "
+        why = (f"sibling {_line_label(order, blk[0]['nx_rel_numb'], blk[0]['nx_item_no'], blk[0]['nx_sku'])} already "
                f"{'snoozed to' if e['line_status'] == 'Snoozed' else 'planned on'} {when}")
         for m in members:
           m['block_reason'] = why
@@ -2077,7 +2110,8 @@ def _agent_propose_impl(plan_date=None, force=False):
         continue
       gm = [m for m in members if m.get('is_gated')]
       if gm and order in ship_complete:
-        why = f"ship-complete order; {gm[0]['nx_sku']} gated {gm[0].get('gate_codes') or ''}".strip()
+        why = (f"ship-complete order; {_line_label(order, gm[0]['nx_rel_numb'], gm[0]['nx_item_no'], gm[0]['nx_sku'])} "
+               f"gated {gm[0].get('gate_codes') or ''}").strip()
         for m in members:
           m['block_reason'] = why
         blocked.extend(members)
@@ -2121,6 +2155,8 @@ def _agent_propose_impl(plan_date=None, force=False):
     for c, tier in picks + stretch:
       rank += 1
       order, sku = c['nx_order_numb'], c['nx_sku']
+      rel, item = c['nx_rel_numb'], c['nx_item_no']
+      key = (order, rel, item)
       due = str(c.get('ship_by_date') or '')[:10]
       if c.get('rides_along'):
         how = (f"gated {c.get('gate_codes') or ''}".strip() if c.get('is_gated')
@@ -2128,25 +2164,26 @@ def _agent_propose_impl(plan_date=None, force=False):
         reason = (f"{tier}: rides with order {order} — whole-order rule, due {due} "
                   f"({how}) — {float(c.get('load_inches') or 0):,.1f} in")[:500]
       else:
-        reason = _agent_reason(c, tier, notes.get((order, sku), []))
+        reason = _agent_reason(c, tier, notes.get(key, []))
         if int(c.get('group_n') or 1) > 1:
           reason = (reason + f" · order {int(c['group_n'])} lines, "
                     f"{float(c.get('group_inches') or 0):,.0f} in together")[:500]
       cursor.execute("""
           INSERT INTO dbo.pc_agent_proposal_line
-              (proposal_id, nx_order_numb, nx_sku, rank_no, proposed_tier,
-               load_inches, priority_score, gate_codes, flag_codes, reason)
-          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-      """, (proposal_id, order, sku, rank, tier,
+              (proposal_id, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no,
+               proposed_tier, load_inches, priority_score, gate_codes, flag_codes, reason)
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+      """, (proposal_id, order, rel, item, sku, rank, tier,
             float(c.get('load_inches') or 0), int(c.get('priority_score') or 0),
             c.get('gate_codes'), c.get('flag_codes'), reason))
-      rows = rows_by_key.get((order, sku)) or []
-      if rows and _upsert_proposed_line(cursor, plan_date, order, sku, rows,
+      rows = rows_by_key.get(key) or []
+      if rows and _upsert_proposed_line(cursor, plan_date, order, rel, item, rows,
                                         _aggregate(rows), tier, reason, actor):
         n_added += 1
         _log_event(cursor, plan_date, order, sku, 'Proposed',
-                   new_value=tier, actor=actor, note=reason)
+                   new_value=tier, actor=actor, note=reason, rel=rel, item=item)
       out_lines.append({'rank': rank, 'order': order, 'sku': sku,
+                        'rel': rel, 'item': item, 'line': _line_label(order, rel, item),
                         'desc': c.get('sku_desc'), 'shipto': c.get('shipto_code'),
                         'tier': tier, 'load_inches': float(c.get('load_inches') or 0),
                         'ship_by': c.get('ship_by_date'),
@@ -2154,13 +2191,15 @@ def _agent_propose_impl(plan_date=None, force=False):
                         'flags': c.get('flag_codes'), 'reason': reason})
 
     gated_out = [{'order': g['nx_order_numb'], 'sku': g['nx_sku'],
+                  'item': g['nx_item_no'], 'line': _line_label(g['nx_order_numb'], g['nx_rel_numb'], g['nx_item_no']),
                   'gates': g.get('gate_codes'), 'score': int(g.get('priority_score') or 0),
                   'ship_by': g.get('ship_by_date'),
-                  'notes': [n['note'] for n in notes.get((g['nx_order_numb'], g['nx_sku']), [])
+                  'notes': [n['note'] for n in notes.get((g['nx_order_numb'], g['nx_rel_numb'], g['nx_item_no']), [])
                             if (n['flag_code'] or '')[:1] == 'X']}
                  for g in gated[:25]]
 
     oversize_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
+                     'item': o['nx_item_no'], 'line': _line_label(o['nx_order_numb'], o['nx_rel_numb'], o['nx_item_no']),
                      'load_inches': float(o.get('load_inches') or 0),
                      'group_inches': float(o.get('group_inches') or 0),
                      'qty_open': float(o.get('qty_open') or 0),
@@ -2169,6 +2208,7 @@ def _agent_propose_impl(plan_date=None, force=False):
                      'why': o.get('split_reason')}
                     for o in oversize[:15]]
     blocked_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
+                    'item': o['nx_item_no'], 'line': _line_label(o['nx_order_numb'], o['nx_rel_numb'], o['nx_item_no']),
                     'load_inches': float(o.get('load_inches') or 0),
                     'group_inches': float(o.get('group_inches') or 0),
                     'score': int(o.get('priority_score') or 0),
@@ -2244,7 +2284,7 @@ def agent_status_endpoint(task_id=None, **kwargs):
 
 
 @anvil.server.callable
-def ship_plan_confirm_line(plan_date, order, sku):
+def ship_plan_confirm_line(plan_date, order, rel, item):
   """PC accepts one Proposed line: it becomes Planned, tier unchanged."""
   plan_date = _parse_date(plan_date)
   actor = _current_actor()
@@ -2252,14 +2292,21 @@ def ship_plan_confirm_line(plan_date, order, sku):
   try:
     cursor = conn.cursor()
     cursor.execute("""
+        SELECT nx_sku FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+          AND line_status = 'Proposed'
+    """, (plan_date, order, rel, item))
+    hit = cursor.fetchone()
+    if not hit:
+      return {'status': 'error', 'message': 'Line is not Proposed.'}
+    cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
         SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
           AND line_status = 'Proposed'
-    """, (actor, plan_date, order, sku))
-    if cursor.rowcount == 0:
-      return {'status': 'error', 'message': 'Line is not Proposed.'}
-    _log_event(cursor, plan_date, order, sku, 'Confirmed', actor=actor)
+    """, (actor, plan_date, order, rel, item))
+    _log_event(cursor, plan_date, order, hit['nx_sku'], 'Confirmed', actor=actor,
+               rel=rel, item=item)
     _bump_revision(cursor, plan_date, actor)
     conn.commit()
     return {'status': 'success'}
@@ -2279,7 +2326,7 @@ def ship_plan_confirm_all_proposed(plan_date):
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT nx_order_numb, nx_sku FROM dbo.pc_ship_plan_line
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND line_status = 'Proposed'
     """, (plan_date,))
     todo = cursor.fetchall()
@@ -2287,11 +2334,12 @@ def ship_plan_confirm_all_proposed(plan_date):
       cursor.execute("""
           UPDATE dbo.pc_ship_plan_line
           SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
             AND line_status = 'Proposed'
-      """, (actor, plan_date, r['nx_order_numb'], r['nx_sku']))
+      """, (actor, plan_date, r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']))
       _log_event(cursor, plan_date, r['nx_order_numb'], r['nx_sku'],
-                 'Confirmed', actor=actor, note='accept all')
+                 'Confirmed', actor=actor, note='accept all',
+                 rel=r['nx_rel_numb'], item=r['nx_item_no'])
     if todo:
       _bump_revision(cursor, plan_date, actor)
     conn.commit()
@@ -2310,17 +2358,18 @@ def _settle_proposal_outcomes(cursor, plan_date, actor):
   did not propose. Proposal status: ACCEPTED (all kept, nothing added),
   MODIFIED, or REJECTED (nothing kept). This is the hit-rate record."""
   cursor.execute("""
-      SELECT nx_order_numb, nx_sku FROM dbo.pc_ship_plan_line
+      SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku FROM dbo.pc_ship_plan_line
       WHERE plan_date = %s AND line_status = 'Proposed'
   """, (plan_date,))
   for r in cursor.fetchall():
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
         SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (actor, plan_date, r['nx_order_numb'], r['nx_sku']))
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (actor, plan_date, r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']))
     _log_event(cursor, plan_date, r['nx_order_numb'], r['nx_sku'],
-               'Confirmed', actor=actor, note='auto-confirmed at publish')
+               'Confirmed', actor=actor, note='auto-confirmed at publish',
+               rel=r['nx_rel_numb'], item=r['nx_item_no'])
   cursor.execute("""
       SELECT TOP 1 proposal_id FROM dbo.pc_agent_proposal
       WHERE plan_date = %s AND status = 'PROPOSED'
@@ -2331,18 +2380,18 @@ def _settle_proposal_outcomes(cursor, plan_date, actor):
     return None
   pid = prop['proposal_id']
   cursor.execute("""
-      SELECT nx_order_numb, nx_sku, tier, line_status
+      SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, tier, line_status
       FROM dbo.pc_ship_plan_line WHERE plan_date = %s
   """, (plan_date,))
-  plan = {(r['nx_order_numb'], r['nx_sku']): r for r in cursor.fetchall()}
+  plan = {(r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']): r for r in cursor.fetchall()}
   cursor.execute("""
-      SELECT nx_order_numb, nx_sku, proposed_tier
+      SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, proposed_tier
       FROM dbo.pc_agent_proposal_line WHERE proposal_id = %s
   """, (pid,))
   kept = retiered = dropped = 0
   proposed_keys = set()
   for r in cursor.fetchall():
-    key = (r['nx_order_numb'], r['nx_sku'])
+    key = (r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no'])
     proposed_keys.add(key)
     pl = plan.get(key)
     if pl and pl['line_status'] in _COUNTS_AGAINST_CAP:
@@ -2353,8 +2402,8 @@ def _settle_proposal_outcomes(cursor, plan_date, actor):
       outcome, dropped = 'DROPPED', dropped + 1
     cursor.execute("""
         UPDATE dbo.pc_agent_proposal_line SET outcome = %s
-        WHERE proposal_id = %s AND nx_order_numb = %s AND nx_sku = %s
-    """, (outcome, pid, key[0], key[1]))
+        WHERE proposal_id = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (outcome, pid, key[0], key[1], key[2]))
   added = 0
   for key, pl in plan.items():
     if key in proposed_keys or pl['line_status'] not in _COUNTS_AGAINST_CAP:
@@ -2362,10 +2411,10 @@ def _settle_proposal_outcomes(cursor, plan_date, actor):
     added += 1
     cursor.execute("""
         INSERT INTO dbo.pc_agent_proposal_line
-            (proposal_id, nx_order_numb, nx_sku, rank_no, proposed_tier,
-             reason, outcome)
-        VALUES (%s, %s, %s, 0, %s, 'not proposed by the agent', 'ADDED_BY_PC')
-    """, (pid, key[0], key[1], pl['tier'] or 'Next'))
+            (proposal_id, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no,
+             proposed_tier, reason, outcome)
+        VALUES (%s, %s, %s, %s, %s, 0, %s, 'not proposed by the agent', 'ADDED_BY_PC')
+    """, (pid, key[0], key[1], key[2], pl['nx_sku'], pl['tier'] or 'Next'))
   if kept + retiered == 0:
     status = 'REJECTED'
   elif dropped == 0 and retiered == 0 and added == 0:

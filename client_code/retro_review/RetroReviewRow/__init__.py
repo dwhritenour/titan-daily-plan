@@ -28,7 +28,7 @@ class RetroReviewRow(RetroReviewRowTemplate):
   def _paint(self):
     q = self.item or {}
     side = 'Sales' if q.get('routed_to') == 'SALES' else 'Production Control'
-    self.lbl_head.text = (f"{q.get('plan_date')}  ·  {q.get('nx_order_numb')} / {q.get('nx_sku')}"
+    self.lbl_head.text = (f"{q.get('plan_date')}  ·  {q.get('nx_order_numb')}{('-' + q['nx_item_no']) if q.get('nx_item_no') else ''} / {q.get('nx_sku')}"
                           f"  ·  {q.get('case_text', '')}  ·  {side}")
     self.lbl_question.text = q.get('question_text') or ''
     self.lbl_answer.text = (f"Answer ({q.get('answered_by') or '—'}, "

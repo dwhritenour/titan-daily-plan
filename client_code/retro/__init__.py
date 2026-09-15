@@ -113,7 +113,7 @@ class retro(retroTemplate):
     if hasattr(self, 'ta_closed'):
       closed = [v for v in (r.get('variances') or []) if not v.get('question_text')]
       self.ta_closed.text = '\n'.join(
-        f"{v['nx_order_numb']} / {v['nx_sku']} — "
+        f"{v['nx_order_numb']}{('-' + v['nx_item_no']) if v.get('nx_item_no') else ''} / {v['nx_sku']} — "
         f"{self._CASE_TXT.get(v.get('variance_case'), v.get('variance_case'))}: "
         f"{v.get('system_explanation') or ''}" for v in closed)
       self.ta_closed.visible = False

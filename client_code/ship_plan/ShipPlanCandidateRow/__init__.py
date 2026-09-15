@@ -32,22 +32,26 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     self.init_components(**properties)
     item = self.item
 
-    self.lbl_order.text = item['nx_order_numb']
+    # 066: one row per e21 line - '595613-20' (release only when not 001)
+    rel = (item.get('nx_rel_numb') or '').strip()
+    itm = (item.get('nx_item_no') or '').strip()
+    self.lbl_order.text = (f"{item['nx_order_numb']}-{rel}-{itm}" if rel and rel != '001'
+                           else f"{item['nx_order_numb']}-{itm}" if itm
+                           else item['nx_order_numb'])
+    self.lbl_order.tooltip = f"order {item['nx_order_numb']}, release {rel or '?'}, item {itm or '?'}"
     self.lbl_what.text = f"{item.get('sku_desc') or item['nx_sku']}"
     self.lbl_sub.text = f"{item.get('shipto_code') or ''} · {item.get('part_line') or item.get('bucket', '')}"
-    # Qty = e21 ORDERED (orditem.qty); "(balance)" only when e21's balance
-    # due disagrees (065 / C05).
-    ordered = item.get('qty_ordered')
-    balance = float(item['qty_open'])
-    if ordered is None:
-      self.lbl_qty.text = f"{balance:g}"
-    elif abs(float(ordered) - balance) > 0.005:
-      self.lbl_qty.text = f"{float(ordered):g} ({balance:g})"
+    # Qty = e21 ORDERED (orditem.qty) = qty_open since 066; "(balance)" only
+    # when e21's balance due disagrees (065 / C05).
+    ordered = float(item['qty_open'])
+    balance = item.get('qty_balance')
+    if balance is not None and abs(float(balance) - ordered) > 0.005:
+      self.lbl_qty.text = f"{ordered:g} ({float(balance):g})"
       self.lbl_qty.foreground = '#C62828'
       self.lbl_qty.bold = True
       self.lbl_qty.tooltip = QTY_TIP
     else:
-      self.lbl_qty.text = f"{float(ordered):g}"
+      self.lbl_qty.text = f"{ordered:g}"
     self.lbl_load.text = f"{item['load_inches']:,.1f} in"
     self.lbl_load.tooltip = (f"{item['load_minutes']:,.0f} min total, "
                              f"{item['surcharge_minutes']:,.0f} min surcharge, "
