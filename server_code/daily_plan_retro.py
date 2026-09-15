@@ -64,7 +64,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.4.0'   # 1.4 (066): e21-line grain, ordered qty; 1.3: PARTIAL_ORDER
+_RETRO_VERSION = 'retro-1.5.0'   # 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain; 1.3: PARTIAL_ORDER
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -625,11 +625,50 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
           counts['DATE_MOVED'], n_unplanned_all, len(chosen),
           round(planned_in, 2), round(moved_in, 2), round(unplanned_in, 2),
           reserve_in, reserve_used, actor))
+    # --- 067: the day's ACTUAL crew and capacity (pro-rated attendance) ---
+    # Same formula as vw_pc_capacity_day, on the plan date's credited
+    # attendance (vw_em_assembler_credit): day override > standing factor x
+    # credit > credit. Stored beside the stamped (morning) capacity so the
+    # calibration can compare shipped inches with hours actually worked.
+    crew_actual = cap_actual = None
+    try:
+      cursor.execute("""
+          SELECT SUM(COALESCE(o.capacity_factor,
+                              r.default_capacity_factor * ISNULL(c.credit, 0),
+                              ISNULL(c.credit, 0))) AS crew
+          FROM dbo.em_assembler_roster r
+          LEFT JOIN dbo.vw_em_assembler_credit c
+                 ON c.employee_id = r.employee_id AND c.status_date = %s
+          LEFT JOIN dbo.pc_assembler_day_override o
+                 ON o.employee_id = r.employee_id AND o.override_date = %s
+          WHERE r.end_date IS NULL
+            AND (r.start_date IS NULL OR r.start_date <= %s)
+      """, (plan_date, plan_date, plan_date))
+      crew_actual = float((cursor.fetchone() or {}).get('crew') or 0)
+      cursor.execute("""
+          SELECT MAX(CASE WHEN pw.factor_code = 'ST_STD' THEN pw.factor_value END) AS st_std,
+                 MAX(CASE WHEN pw.factor_code = 'BASE_OVERHEAD' THEN pw.factor_value END) AS base_hrs
+          FROM dbo.pc_weight_set ws JOIN dbo.pc_weight pw ON pw.weight_set_id = ws.weight_set_id
+          WHERE ws.retired_date IS NULL
+      """)
+      w = cursor.fetchone() or {}
+      p = _get_params(cursor)
+      hours = float(p.get('HOURS_PER_DAY', 8.0)); eff = float(p.get('EFFICIENCY_FACTOR', 1.2)) or 1.0
+      st_std = float(w.get('st_std') or 0); base = float(w.get('base_hrs') or 0)
+      if st_std:
+        cap_actual = round(crew_actual * (hours * 60.0 - base * 60.0 / 5.0) / eff / st_std, 1)
+      cursor.execute("""
+          UPDATE dbo.pc_plan_retro SET crew_actual = %s, capacity_actual_inches = %s
+          WHERE plan_date = %s
+      """, (round(crew_actual, 2), cap_actual, plan_date))
+    except Exception:
+      pass                          # 067 not applied yet, or no attendance: the retro still stands
     conn.commit()
 
     return _jsonable({
       'status': 'success', 'plan_date': plan_date.isoformat(), 'revision_no': rev,
       'version': _RETRO_VERSION, 'capacity_inches': cap_in,
+      'crew_actual': crew_actual, 'capacity_actual_inches': cap_actual,
       'n_planned': n_planned, 'n_stretch': n_stretch, 'counts': counts,
       'n_unplanned_all': n_unplanned_all,
       'planned_inches': round(planned_in, 1), 'moved_inches': round(moved_in, 1),
