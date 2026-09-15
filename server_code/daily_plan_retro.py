@@ -1,2326 +1,125 @@
-import anvil.secrets
 """
-Anvil Server Module - Daily Ship Plan
-======================================
-Server-side code for the Ship Plan form (Week-2 release of the Daily
-Ship Plan ladder — DECISION, exchange topic 2026-08-13_daily-ship-plan).
+Anvil Server Module - Daily Plan Retro-Review (v1, 2026-09-07)
+===============================================================
+The back half of the AI Agent Operating Cycle: read the previous business
+day's PUBLISHED plan, decide what happened to every planned line from the
+records Nexus already holds, write the variance ledger, and ask at most
+RETRO_MAX_QUESTIONS bounded, factual questions (2 PC + 1 Sales floor).
 
-Spec: documents/Ship_Plan_Form_Specification.docx v1.0.0
-Schema: migrations 027 (reference/config) + 028 (plan core), applied
-2026-08-19. The client computes NOTHING — all load math lives in
-vw_pc_ship_candidate_rows / vw_pc_ship_candidates, all capacity math in
-vw_pc_capacity_day (today) or _capacity_for() (future-date estimate).
+Spec: documents/Retro_v1_Spec_2026-09-07.md. Schema: migrations 051 + 053.
 
-Governing rules enforced HERE, not in the client:
-    - Every mutation writes its pc_plan_line_events row INSIDE the same
-      transaction. A change without its event is impossible.
-    - DRIFT RULE (Dave, 2026-08-19): plan lines never silently re-total.
-      get_plan() only REPORTS drift; recalc_line() is the only re-total
-      path and it logs Recalc with old/new.
-    - Cap hit is the CLIENT's dialog, but the suggested day comes from
-      _suggest_day() here. Nothing is ever dropped silently.
-    - Nothing is deleted: remove_line() sets status 'Removed'.
-    - Wk-3 verbs (Proposed/Confirmed) exist in the schema CHECKs and in
-      _ACTIVE_STATUSES but have no callables yet — propose_line() and
-      confirm_line() arrive with the Wk-3 release, nothing else changes.
+What the records can prove (no Assembly App yet, kiosk Start/Complete
+events unused since 08-21):
+    SHIPPED   line gone from the open book, or balance below the
+              published qty (sales_orders_due, hourly). Item status 15
+              ('Material Received/Shipped') is deliberately NOT used: the
+              status at publish is not snapshotted yet, and 86 lines sat
+              at 15 before the first plan existed (2026-09-07 test).
+    WORKED    a work order for the line completed since the plan day, or
+              a WO Assign/Start/Complete event on the plan day
+    REMOVED   plan event Removed / TierChange after publish - with a reason
+              it is a variance with the cause attached (counts toward the
+              N=3 recurrence); without one it earns a question
+    UNTOUCHED none of the above (Must/Next earn a PC question; Stretch is
+              optional by definition and closes silently)
+    DATE_MOVED    ship-by on the open line != ship-by at publish, or a
+              due_date change in work_order_changes (old -> new, when)
+              -> Sales. Suppresses the PC question on the same line.
+    CANCELLED     SO_Canceled / SO_Removed in work_order_changes since
+              publish: the line left the open book but did NOT ship
+              (v1.2, 2026-09-08 - before this it counted as SHIPPED)
+    QTY_CHANGED   quantity FIELD_CHANGE since publish, no SO_Shipped: the
+              balance dropped because Order Entry changed it, not a ship
+    Evidence (v1.2): dbo.work_order_changes - the EM job diffs every work
+    order against its sales-order line every 15 min (SO_Shipped with the
+    time, SO_Canceled, SO_Removed, FIELD_CHANGE due_date / quantity).
+    UNPLANNED_SHIP shipped on the day, not planned, load >= threshold -> Sales
+Every inferred outcome enters the ledger as evidence 'Probable' at best;
+'Verified' needs a person (Dave confirms the reading - always Dave).
 
-NOTE on Change Log: PD's ask was one cl_change_log entry per LADDER
-RELEASE (a deploy), not per morning publish — so publish_plan() does not
-write to the Change Log app's tables. The Wk-2 release itself gets its
-entry at deploy time, in that app.
+Callables (the #retro and #retrev forms):
+    retro_get_day(plan_date)                 header + all variances + day list
+    retro_get_review()                       Dave's queue across days + recent + causes
+    retro_answer(variance_id, answer, who)   free text, verbatim
+    retro_confirm(variance_id, reading, evidence_class, cause_key,
+                  resolution, pin)           Dave only (RETRO_ARBITER_PIN secret)
+    retro_ask_anyway(variance_id)            promote a 'not asked today' row
+    retro_run(plan_date=None, force=False)   manual run from the app
+HTTP (titan-ai-service, X-Agent-Key): POST /agent/retro {plan_date, force}
 
-Tables read : vw_pc_ship_candidates, vw_pc_ship_candidate_rows,
-              vw_pc_capacity_day, pc_plan_parameters, pc_weight_set,
-              pc_weight, pc_special_customers, em_assembler_roster,
-              em_assembler_status_daily, pc_assembler_day_override,
-              sales_orders_due (drift compare only)
-Tables written: pc_ship_plan, pc_ship_plan_line, pc_ship_plan_line_source,
-              pc_plan_line_events, pc_plan_parameters,
-              pc_assembler_day_override, pc_special_customers
-
-066 (2026-09-15, Dave): the plan line IS the e21 line - identity =
-    (plan_date, nx_order_numb, nx_rel_numb, nx_item_no); nx_sku is an
-    attribute. Line callables take (plan_date, order, rel, item, ...).
-    Planning quantity = nx_qty_ordered (e21 orditem.qty); balance due is
-    display + the C05 warning only. One candidate row per e21 line.
-
-Database: SQL Server (nexus) via pymssql
-Uses centralized db_config for credentials (Anvil Secrets)
+Identity note (v1): the app has no user login (events show actor
+'Production'), so the form asks WHO is answering from the RETRO_*_OWNERS
+lists and the confirm step takes Dave's PIN. Real identity comes with the
+app-wide role work.
 
 Author: Dave Whritenour / Claude AI Assistant
 Project: Titan Flow Control - Year of Automation
-Created: August 2026
 """
 
 import anvil.server
-import threading
-import os
-import time
+import anvil.secrets
 from datetime import datetime, date, timedelta
-from decimal import Decimal
 
-from . import db_config
+from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
+_get_params, _agent_key_ok, serialize_row,
+make_serializable)
 
-
-# =============================================================================
-# HELPERS (house pattern — see part_master.py)
-# =============================================================================
-
-_ACTIVE_STATUSES = ('Planned', 'Snoozed', 'Proposed', 'Confirmed')
-_COUNTS_AGAINST_CAP = ('Planned', 'Proposed', 'Confirmed')   # Snoozed moved away
-
-
-def make_serializable(value):
-  if value is None:
-    return None
-  elif isinstance(value, (datetime, date)):
-    return value.isoformat()
-  elif isinstance(value, Decimal):
-    return float(value)
-  elif isinstance(value, bytes):
-    return value.decode('utf-8', errors='replace')
-  else:
-    return value
-
-
-def serialize_row(row):
-  return {key: make_serializable(val) for key, val in row.items()}
-
-
-# ---------------------------------------------------------------------
-# Connection pool + cached secrets (perf, 2026-08-26)
-#
-# MEASURED from the running app: WS transport is ~100ms, but every call
-# cost ~900ms — the rest was 4 anvil.secrets fetches + a fresh WAN login
-# to SQL Server, paid per call because connections were opened/closed
-# per call. A thread-LOCAL cache didn't help (each call runs on a fresh
-# thread), so this is a real pool: module-level, lock-guarded, any
-# thread can reuse a parked connection. Module state only survives if
-# the process does — ship_plan_debug_stats() proves whether it does.
-# ---------------------------------------------------------------------
-_process_t0 = time.time()
-_stats = {'gets': 0, 'pool_hits': 0, 'pool_misses': 0, 'connects': 0}
-_secret_cache = {}
-_pool = []                       # parked, clean connections
-_pool_lock = threading.Lock()
-_POOL_MAX = 4
-
-
-def _secret(name):
-  """anvil.secrets.get_secret is a platform RPC — fetch each secret once
-  per process, not four times per call."""
-  if name not in _secret_cache:
-    _secret_cache[name] = anvil.secrets.get_secret(name)
-  return _secret_cache[name]
-
-
-def _connect():
-  import pymssql
-  _stats['connects'] += 1
-  _t = time.time()
-  conn = pymssql.connect(
-    server=_secret('NEXUS_SERVER'),
-    user=_secret('NEXUS_USERNAME'),
-    password=_secret('NEXUS_PASSWORD'),
-    database=_secret('NEXUS_DATABASE'),
-    port='1433',
-    as_dict=True)
-  _stats['last_connect_ms'] = int((time.time() - _t) * 1000)
-  return conn
-
-
-class _PooledConnection:
-  """Wraps a pooled pymssql connection so existing call sites work
-  UNCHANGED: close() parks the connection back in the pool instead of
-  closing the socket. Every call path already ends in commit-or-rollback
-  before close, so parked connections are clean."""
-  __slots__ = ('_real',)
-
-  def __init__(self, real):
-    self._real = real
-
-  def cursor(self):
-    return self._real.cursor()
-
-  def commit(self):
-    self._real.commit()
-
-  def rollback(self):
-    self._real.rollback()
-
-  def close(self):
-    real, self._real = self._real, None
-    if real is None:
-      return
-    with _pool_lock:
-      if len(_pool) < _POOL_MAX:
-        _pool.append(real)
-        return
-    try:
-      real.close()
-    except Exception:
-      pass
-
-
-def get_connection():
-  _stats['gets'] += 1
-  while True:
-    with _pool_lock:
-      real = _pool.pop() if _pool else None
-    if real is None:
-      break
-    try:                          # cheap ping; discard dead connections
-      cur = real.cursor()
-      # AS ok is load-bearing: as_dict=True raises ColumnsWithoutNames-
-      # Error on a nameless column, which silently killed every pooled
-      # connection until 2026-08-26's probe caught it.
-      cur.execute("SELECT 1 AS ok")
-      cur.fetchall()
-      real.rollback()             # clear the ping's implicit transaction
-      _stats['pool_hits'] += 1
-      return _PooledConnection(real)
-    except Exception as e:
-      _stats['last_ping_err'] = repr(e)[:160]
-      try:
-        real.close()
-      except Exception:
-        pass
-  _stats['pool_misses'] += 1
-  return _PooledConnection(_connect())
-
-
-@anvil.server.callable
-def ship_plan_debug_probe():
-  """Times each stage of the DB leg inside ONE call: WAN login, three
-  query round trips on the same socket. With last_ping_err from
-  cross-call pool attempts, this pins where the ~1s/call actually goes
-  and whether parked sockets are killed at call boundaries."""
-  out = {'status': 'success', 'pid': os.getpid()}
-  t0 = time.time()
-  conn = _connect()
-  out['connect_ms'] = int((time.time() - t0) * 1000)
-  cur = conn.cursor()
-  t1 = time.time()
-  cur.execute("SELECT 1 AS x")
-  cur.fetchall()
-  out['query1_ms'] = int((time.time() - t1) * 1000)
-  t2 = time.time()
-  cur.execute("SELECT COUNT(*) AS n FROM dbo.pc_priority_reasons")
-  cur.fetchall()
-  out['query2_ms'] = int((time.time() - t2) * 1000)
-  t3 = time.time()
-  cur.execute("SELECT 1 AS x")
-  cur.fetchall()
-  out['query3_ms'] = int((time.time() - t3) * 1000)
-  try:
-    conn.close()
-  except Exception:
-    pass
-  out['stats'] = dict(_stats)
-  return out
-
-
-@anvil.server.callable
-def ship_plan_debug_stats():
-  """Perf forensics: if pid is stable and process_age_s grows across
-  calls, the persistent server is real and the pool can work. If pid
-  changes every call, the process is being respawned and no in-process
-  cache can help. Harmless to leave in; PC-only info."""
-  return {'status': 'success',
-          'pid': os.getpid(),
-          'process_age_s': round(time.time() - _process_t0, 1),
-          'pool_size': len(_pool),
-          'secrets_cached': len(_secret_cache),
-          'stats': dict(_stats)}
-
-
-def _current_actor():
-  try:
-    import anvil.users
-    u = anvil.users.get_user()
-    if u:
-      try:
-        return (u['name'] or u['email'] or 'Unknown')[:50]
-      except Exception:
-        return str(u)[:50]
-  except Exception:
-    pass
-  return 'Production'
-
-
-def _is_pc_user():
-  """Role gate hook. TODO(Dave/Chuck): wire to the app's real role source
-  (same pattern the other PC forms use). Until then every logged-in user
-  is PC — the CLIENT hides mutating controls for Sales, but the server
-  must not rely on that once roles are real."""
-  return True
-
-
-def _parse_date(d):
-  """Accept date, datetime, or 'YYYY-MM-DD' string from the client."""
-  if isinstance(d, datetime):
-    return d.date()
-  if isinstance(d, date):
-    return d
-  return datetime.strptime(str(d)[:10], '%Y-%m-%d').date()
-
-
-def _log_event(cursor, plan_date, order, sku, event_type,
-               old_value=None, new_value=None, actor=None, note=None,
-               rel=None, item=None):
-  """Append one pc_plan_line_events row. ALWAYS called inside the same
-  transaction as the mutation it records. 066: rel/item identify the
-  e21 line; order-level events leave them None."""
-  cursor.execute("""
-      INSERT INTO dbo.pc_plan_line_events
-          (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no, event_type,
-           old_value, new_value, actor, note)
-      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-  """, (plan_date, order, sku, rel, item, event_type,
-        (str(old_value)[:200] if old_value is not None else None),
-        (str(new_value)[:200] if new_value is not None else None),
-        (actor or _current_actor()), (note[:500] if note else None)))
-
-
-def _customer_label(name, city, state, fallback=None):
-  """2026-09-15: 'FERGUSON ENTERPRISES #61 - EULESS, TX' for the Item
-  column sub-line on both grids (sales asked for customer, not ship-to).
-  Falls back to the ship-to code when e21 no longer has the line."""
-  name = (name or '').strip()
-  if not name:
-    return fallback or ''
-  place = ', '.join(p for p in ((city or '').strip(), (state or '').strip()) if p)
-  return f"{name} - {place}" if place else name
-
-
-def _line_label(order, rel, item, sku=None):
-  """'595613-001-20' - order, RELEASE, item, always all three (Dave
-  2026-09-15: a release shown only sometimes reads as an error), + ' / SKU'."""
-  r, i = (rel or '').strip(), (item or '').strip()
-  s = f"{order}-{r}-{i}" if (r or i) else f"{order}"
-  return f"{s} / {sku}" if sku else s
-
-
-def _stamp_work_orders(cursor, plan_date):
-  """Migration 056 (2026-09-08): carry the published plan onto the work
-  orders — plan_date / plan_tier / plan_position — so the Production App
-  releases top-to-bottom and the Assembly App sees Must/Next/Stretch
-  through vw_pc_department_queue. The logic lives in ONE place,
-  dbo.sp_stamp_plan_work_orders (clears stale stamps for the day, then
-  stamps every live work order behind a planned line). Silent no-op
-  until 056 is applied. Returns {'cleared', 'stamped'} or None."""
-  cursor.execute("SELECT OBJECT_ID('dbo.sp_stamp_plan_work_orders') AS o")
-  if (cursor.fetchone() or {}).get('o') is None:
-    return None
-  cursor.execute("EXEC dbo.sp_stamp_plan_work_orders @plan_date = %s", (plan_date,))
-  row = cursor.fetchone() or {}
-  return {'cleared': int(row.get('cleared') or 0), 'stamped': int(row.get('stamped') or 0)}
-
-
-def _bump_revision(cursor, plan_date, actor):
-  """If the day's plan is already PUBLISHED, count this change as a
-  revision — displayed as 'PUBLISHED 8:52 · rev 3'. Draft edits are not
-  revisions; the agreement only exists once it's published.
-  056: a revision re-stamps the day's work orders (added / removed lines
-  reach the Production App at once)."""
-  cursor.execute("""
-      UPDATE dbo.pc_ship_plan
-      SET revision_no = revision_no + 1,
-          last_revised_at = GETDATE(), last_revised_by = %s
-      WHERE plan_date = %s AND plan_status = 'Published'
-  """, (actor or _current_actor(), plan_date))
-  if cursor.rowcount:
-    _stamp_work_orders(cursor, plan_date)
-
-
-def _get_params(cursor):
-  cursor.execute("SELECT param_code, param_value FROM dbo.pc_plan_parameters")
-  return {r['param_code']: r['param_value'] for r in cursor.fetchall()}
-
-
-def _get_active_weights(cursor):
-  cursor.execute("""
-      SELECT ws.weight_set_id, pw.factor_code, pw.factor_value
-      FROM dbo.pc_weight_set ws
-      JOIN dbo.pc_weight pw ON pw.weight_set_id = ws.weight_set_id
-      WHERE ws.retired_date IS NULL
-  """)
-  rows = cursor.fetchall()
-  if not rows:
-    raise Exception('No active weight set (pc_weight_set.retired_date IS NULL)')
-  weights = {r['factor_code']: float(r['factor_value']) for r in rows}
-  weights['weight_set_id'] = rows[0]['weight_set_id']
-  return weights
+_RETRO_VERSION = 'retro-1.5.0'   # 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain; 1.3: PARTIAL_ORDER
+_WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
 # =============================================================================
-# CAPACITY
+# HELPERS
 # =============================================================================
 
-def _capacity_for(cursor, plan_date, prefer_estimate=False):
-  """Capacity dict for a date. Today = vw_pc_capacity_day (the 08:45
-  snapshot + overrides). Future = same formula with crew estimated as the
-  full active roster, adjusted by that date's overrides — is_estimate=True
-  so the bar renders hollow.
-  prefer_estimate (agent, 06:30 — before the attendance snapshot loads):
-  use the view only when its snapshot IS the plan date; otherwise the
-  roster estimate with that date's overrides, never yesterday's crew."""
-  today = date.today()
-  if plan_date <= today:
-    cursor.execute("SELECT * FROM dbo.vw_pc_capacity_day")
-    row = cursor.fetchone()
-    if row and prefer_estimate and row['snapshot_date'] != plan_date:
-      row = None            # stale for the agent's purpose — fall through
-    if row:
-      out = serialize_row(row)
-      out['is_estimate'] = False
-      out['snapshot_stale'] = (row['snapshot_date'] is not None
-                               and row['snapshot_date'] < today)
-      out['capacity_detail'] = (
-        f"crew {float(row['effective_crew'] or 0):g} eff "
-        f"x {float(row['hours_per_day'] or 0):g}h / "
-        f"{float(row['efficiency'] or 0):g} - base "
-        f"(snapshot {make_serializable(row['snapshot_date'])})")
-      return out
-    # view empty (no snapshot ever loaded) — fall through to estimate
+def _lk(s):
+  """Line key of a snapshot / plan / variance row: (order, rel, item).
+  Pre-066 rows carry rel/item = '' - see _look()."""
+  return (s['nx_order_numb'], (s.get('nx_rel_numb') or ''), (s.get('nx_item_no') or ''))
 
-  params = _get_params(cursor)
-  weights = _get_active_weights(cursor)
-  hours = float(params.get('HOURS_PER_DAY', 8.0))
-  eff = float(params.get('EFFICIENCY_FACTOR', 1.20)) or 1.0
-  cap_override = params.get('DAILY_CAP_OVERRIDE_IN', '') or None
 
-  cursor.execute("""
-      SELECT r.employee_id, r.default_capacity_factor, o.capacity_factor
-      FROM dbo.em_assembler_roster r
-      LEFT JOIN dbo.pc_assembler_day_override o
-             ON o.employee_id = r.employee_id AND o.override_date = %s
-      WHERE r.end_date IS NULL
-  """, (plan_date,))
-  rows = cursor.fetchall()
-  roster_count = len(rows)
-  overrides = sum(1 for r in rows if r['capacity_factor'] is not None)
+def _look(by_item, by_sku, s):
+  """Item-grain lookup with a (order, sku) fallback for pre-066 rows."""
+  k = _lk(s)
+  if k[2]:
+    return by_item.get(k)
+  return by_sku.get((s['nx_order_numb'], s['nx_sku']))
 
-  def _credit(r):
-    # day override > standing factor (trainee, 034) > full assembler
-    if r['capacity_factor'] is not None:
-      return float(r['capacity_factor'])
-    if r.get('default_capacity_factor') is not None:
-      return float(r['default_capacity_factor'])
-    return 1.0
-  effective_crew = sum(_credit(r) for r in rows)
-  trainees = sum(1 for r in rows
-                 if r['capacity_factor'] is None
-                 and r.get('default_capacity_factor') is not None)
 
-  variable_minutes = (effective_crew
-                      * (hours * 60.0 - weights['BASE_OVERHEAD'] * 60.0 / 5.0)
-                      / eff)
-  computed = variable_minutes / weights['ST_STD'] if weights['ST_STD'] else 0
-  effective_cap = float(cap_override) if cap_override else computed
-  return {
-    'capacity_date': plan_date.isoformat(),
-    'snapshot_date': None, 'snapshot_stale': False,
-    'roster_count': roster_count, 'present_count': None,
-    'overrides_applied': overrides,
-    'effective_crew': round(effective_crew, 2),
-    'hours_per_day': hours, 'efficiency': eff,
-    'variable_minutes': round(variable_minutes, 1),
-    'capacity_inches_computed': round(computed, 1),
-    'capacity_inches_override': float(cap_override) if cap_override else None,
-    'capacity_inches_effective': round(effective_cap, 1),
-    'is_estimate': True,
-    'capacity_detail': (f"ESTIMATE: {effective_crew:g} crew (roster, "
-                        f"{overrides} override, {trainees} trainee) "
-                        f"x {hours:g}h / {eff:g} - base"),
-  }
+def _line_txt(s):
+  """'595613-001-20 / YS61S0600' - order, release, item, always all three."""
+  o, r, i = _lk(s)
+  base = f"{o}-{r}-{i}" if (r or i) else f"{o}"
+  return f"{base} / {s['nx_sku']}"
 
 
-def _planned_inches(cursor, plan_date):
-  """Load counting AGAINST the cap: Must + Next only. Stretch is
-  'if capacity permits' by definition — it never trips the over-cap
-  check (Dave's tier semantics, 2026-08-26)."""
-  cursor.execute("""
-      SELECT COALESCE(SUM(load_inches), 0) AS planned
-      FROM dbo.pc_ship_plan_line
-      WHERE plan_date = %s AND line_status IN %s AND tier <> 'Stretch'
-  """, (plan_date, _COUNTS_AGAINST_CAP))
-  return float(cursor.fetchone()['planned'])
-
-
-def _suggest_day(cursor, load_inches, after_date, max_days=10):
-  """Smallest future business day whose planned total + this line fits
-  its capacity estimate. None if nothing fits inside the window."""
-  d = after_date
-  for _ in range(max_days):
-    d = d + timedelta(days=1)
-    while d.weekday() >= 5:                      # skip Sat/Sun
-      d = d + timedelta(days=1)
-    cap = _capacity_for(cursor, d)['capacity_inches_effective']
-    if _planned_inches(cursor, d) + load_inches <= cap:
-      return d.isoformat()
-  return None
-
-
-@anvil.server.callable
-def ship_plan_get_capacity(plan_date):
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    return {'status': 'success',
-            'capacity': _capacity_for(cursor, _parse_date(plan_date))}
-  except Exception as e:
-    return {'status': 'error', 'message': f'Capacity error: {e}'}
-  finally:
-    conn.close()
-
-
-# =============================================================================
-# CANDIDATES
-# =============================================================================
-
-@anvil.server.callable
-def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
-                             special_only=False, defaulted_only=False,
-                             limit=1000, flag_filter=None):
-  """Left pane. The already-planned guard lives in the VIEW.
-  due_within_days='auto' means: read PLAN_HORIZON_DAYS here, server-side
-  — the client computes NOTHING, so the parameter takes effect the
-  moment it is saved (2026-08-27 bug: the client cached 10 forever).
-  2026-08-31 flag system (040/041): joined to vw_pc_order_flag_scores —
-  each row carries is_gated / gate_codes / priority_score / flag_codes
-  plus 'flags' = [{code, name, note}] for tooltips; sort = gated last,
-  then priority_score DESC, then oldest ship-by.
-  flag_filter (2026-09-01, the single Flag dropdown): None/'ALL' = all;
-  'PLANNABLE' / 'GATED' = by is_gated; 'ANY_A' / 'ANY_B' = carries any
-  flag of that category; or one code ('X03', 'B02') = carries it.
-  Applied server-side so the header count stays honest."""
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    horizon_days = None
-    if due_within_days == 'auto':
-      cursor.execute("""
-          SELECT param_value FROM dbo.pc_plan_parameters
-          WHERE param_code = 'PLAN_HORIZON_DAYS'
-      """)
-      prow = cursor.fetchone()
-      try:
-        due_within_days = int(float(prow['param_value'])) if prow else 10
-      except (TypeError, ValueError):
-        due_within_days = 10
-    if due_within_days:
-      horizon_days = int(due_within_days)
-    where, args = [], []
-    if search:
-      like = f'%{search.strip()}%'
-      where.append("(c.nx_order_numb LIKE %s OR c.nx_sku LIKE %s "
-                   "OR c.sku_desc LIKE %s OR c.shipto_code LIKE %s "
-                   "OR so.nx_cust_name LIKE %s)")          # 2026-09-15: customer
-      args += [like, like, like, like, like]
-    if bucket in ('ST', 'ZERO', 'OTHER'):
-      where.append("c.bucket = %s")
-      args.append(bucket)
-    if due_within_days:
-      # BUSINESS days, as the label promises (Dave 2026-08-27: 4 days
-      # reached Monday — calendar counting was crossing the weekend).
-      end, added = date.today(), 0
-      while added < int(due_within_days):
-        end += timedelta(days=1)
-        if end.weekday() < 5:
-          added += 1
-      where.append("c.ship_by_date <= %s")
-      args.append(end)
-    if special_only:
-      where.append("c.n_non_standard > 0")
-    if defaulted_only:
-      where.append("c.n_class_defaulted > 0")
-    ff = (flag_filter or 'ALL').strip().upper()
-    if ff == 'PLANNABLE':
-      where.append("ISNULL(fs.is_gated, 0) = 0")
-    elif ff == 'GATED':
-      where.append("ISNULL(fs.is_gated, 0) = 1")
-    elif ff in ('ANY_A', 'ANY_B'):
-      # flag_codes is a CSV ('A01,A05,B02'); wrap in commas, LIKE ',A__,'
-      where.append("',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s")
-      args.append('%,' + ff[-1] + '__,%')
-    elif (len(ff) == 3 and ff[0] in 'XABC' and ff[1:].isdigit()):
-      where.append("',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s")
-      args.append('%,' + ff + ',%')
-    # One FROM for all three queries below: the scores join is needed by
-    # the filter, the count and the sort alike.
-    # 2026-09-15: the customer (name / city / state) rides along from the
-    # feed row itself - one row per e21 line, so the join never fans out.
-    cust_join = ("LEFT JOIN dbo.sales_orders_due so "
-                 "ON so.nx_order_numb = c.nx_order_numb "
-                 "AND so.nx_rel_numb = c.nx_rel_numb "
-                 "AND so.nx_item_no = c.nx_item_no ")
-    from_sql = ("FROM dbo.vw_pc_ship_candidates c "
-                + cust_join +
-                "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
-                "ON fs.nx_order_numb = c.nx_order_numb "
-                "AND fs.nx_rel_numb = c.nx_rel_numb "
-                "AND fs.nx_item_no = c.nx_item_no")
-    # Flag system (040/041): the scores view drives eligibility + rank.
-    # Gated rows sort LAST (they are the Daily conversation, not the
-    # plan); ungated rank by priority_score, then oldest ship-by.
-    # 066: one row per e21 line; qty_open = ordered, qty_balance = balance.
-    sql = ("SELECT TOP %d c.*, ISNULL(fs.is_gated, 0) AS is_gated, "
-           "fs.gate_codes, "
-           "ISNULL(fs.priority_score, 0) AS priority_score, "
-           "fs.flag_codes, "
-           "so.nx_cust_name, so.nx_cust_city, so.nx_cust_state "
-           % max(1, min(int(limit), 1000))) + from_sql
-    if where:
-      sql += " WHERE " + " AND ".join(where)
-    sql += (" ORDER BY is_gated, priority_score DESC, "
-            "c.ship_by_date, c.load_inches DESC, c.nx_order_numb, "
-            "c.nx_rel_numb, c.nx_item_no")
-    cursor.execute(sql, tuple(args))
-    rows = [serialize_row(r) for r in cursor.fetchall()]
-    for r in rows:
-      r['customer'] = _customer_label(r.get('nx_cust_name'), r.get('nx_cust_city'),
-                                      r.get('nx_cust_state'), r.get('shipto_code'))
-    # Total matching (pre-TOP) — so truncation is VISIBLE, never silent:
-    # with a deep overdue backlog the oldest rows can fill the cap and
-    # hide the future entirely (the "list ends at 8/24" mystery).
-    count_sql = "SELECT COUNT(*) AS n " + from_sql
-    if where:
-      count_sql += " WHERE " + " AND ".join(where)
-    cursor.execute(count_sql, tuple(args))
-    total = (cursor.fetchone() or {}).get('n', len(rows))
-    # Per-flag detail (code + note) for row tooltips — same WHERE, so
-    # the notes describe exactly the rows on screen. One more query,
-    # still ONE round trip for the client.
-    flags_sql = ("SELECT f.nx_order_numb, f.nx_rel_numb, f.nx_item_no, "
-                 "f.flag_code, f.flag_name, f.note "
-                 "FROM dbo.vw_pc_order_flags f "
-                 "JOIN dbo.vw_pc_ship_candidates c "
-                 "ON c.nx_order_numb = f.nx_order_numb "
-                 "AND c.nx_rel_numb = f.nx_rel_numb "
-                 "AND c.nx_item_no = f.nx_item_no "
-                 + cust_join +                     # the search WHERE may name so.
-                 "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
-                 "ON fs.nx_order_numb = c.nx_order_numb "
-                 "AND fs.nx_rel_numb = c.nx_rel_numb "
-                 "AND fs.nx_item_no = c.nx_item_no")
-    if where:
-      flags_sql += " WHERE " + " AND ".join(where)
-    cursor.execute(flags_sql, tuple(args))
-    fmap = {}
-    for fr in cursor.fetchall():
-      fmap.setdefault((fr['nx_order_numb'], fr['nx_rel_numb'], fr['nx_item_no']), []).append(
-        {'code': fr['flag_code'], 'name': fr['flag_name'],
-         'note': fr['note']})
-    for r in rows:
-      r['flags'] = fmap.get((r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']), [])
-    # Feed freshness for the always-on Orders chip — age computed
-    # SERVER-side (GETDATE) so browser clocks can't skew it.
-    cursor.execute("""
-        SELECT MAX(nx_last_updated) AS feed_last_updated,
-               DATEDIFF(minute, MAX(nx_last_updated), GETDATE()) AS feed_age_minutes
-        FROM dbo.sales_orders_due
-    """)
-    f = cursor.fetchone() or {}
-    return {'status': 'success', 'candidates': rows,
-            'total_count': total, 'horizon_days': horizon_days,
-            'feed_last_updated': make_serializable(f.get('feed_last_updated')),
-            'feed_age_minutes': f.get('feed_age_minutes')}
-  except Exception as e:
-    return {'status': 'error', 'message': f'Candidate load error: {e}'}
-  finally:
-    conn.close()
-
-
-# =============================================================================
-# PLAN READ (+ drift REPORT — never a re-total)
-# =============================================================================
-
-@anvil.server.callable
-def ship_plan_get_plan(plan_date):
-  plan_date = _parse_date(plan_date)
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM dbo.pc_ship_plan WHERE plan_date = %s",
-                   (plan_date,))
-    header = cursor.fetchone()
-
-    cursor.execute("""
-        SELECT l.*, live.live_qty, live.live_ordered, pr.description AS reason_desc,
-               live.nx_cust_name, live.nx_cust_city, live.nx_cust_state,
-               cr.bucket, cr.nx_sku_desc AS sku_desc,
-               CASE WHEN COALESCE(cr.element_class, src.element_class_used) = 'Non-Standard'
-                    THEN 1 ELSE 0 END                                   AS n_non_standard,
-               CAST(COALESCE(cr.class_was_defaulted, src.class_was_defaulted, 0) AS INT)
-                                                                        AS n_class_defaulted,
-               ISNULL(fs.is_gated, 0) AS is_gated, fs.gate_codes, fs.flag_codes
-        FROM dbo.pc_ship_plan_line l
-        OUTER APPLY (SELECT SUM(s.nx_qty_balance_due) AS live_qty,
-                            SUM(ISNULL(s.nx_qty_ordered, s.nx_qty_balance_due)) AS live_ordered,
-                            MAX(s.nx_cust_name) AS nx_cust_name,       -- 2026-09-15: customer
-                            MAX(s.nx_cust_city) AS nx_cust_city,
-                            MAX(s.nx_cust_state) AS nx_cust_state
-                     FROM dbo.sales_orders_due s
-                     WHERE s.nx_order_numb = l.nx_order_numb
-                       AND s.nx_rel_numb = l.nx_rel_numb
-                       AND s.nx_item_no = l.nx_item_no) live          -- 066: the e21 line
-        -- 2026-09-15: the filter row applies to the plan grid too, so each
-        -- line carries the same fields the candidate rows filter on. The
-        -- live views (no already-planned guard) give bucket / desc / class /
-        -- flags; the plan-time source row backs class up for a shipped line.
-        LEFT JOIN dbo.pc_ship_plan_line_source src
-               ON src.plan_date = l.plan_date
-              AND src.nx_order_numb = l.nx_order_numb
-              AND src.nx_rel_numb = l.nx_rel_numb
-              AND src.nx_item_no = l.nx_item_no
-        LEFT JOIN dbo.vw_pc_ship_candidate_rows cr
-               ON cr.nx_order_numb = l.nx_order_numb
-              AND cr.nx_rel_numb = l.nx_rel_numb
-              AND cr.nx_item_no = l.nx_item_no
-        LEFT JOIN dbo.vw_pc_order_flag_scores fs
-               ON fs.nx_order_numb = l.nx_order_numb
-              AND fs.nx_rel_numb = l.nx_rel_numb
-              AND fs.nx_item_no = l.nx_item_no
-        LEFT JOIN dbo.pc_priority_reasons pr
-               ON pr.reason_code = l.priority_reason
-        WHERE l.plan_date = %s
-        ORDER BY CASE l.line_status WHEN 'Unplaced' THEN 0 ELSE 1 END,
-                 CASE l.tier WHEN 'Must' THEN 0 WHEN 'Next' THEN 1
-                             ELSE 2 END,
-                 l.position, l.load_inches DESC, l.nx_order_numb, l.nx_rel_numb, l.nx_item_no
-    """, (plan_date,))
-    lines = []
-    for r in cursor.fetchall():
-      row = serialize_row(r)
-      live = row.get('live_qty')                  # e21 balance due (display)
-      ordered = row.get('live_ordered')           # e21 orditem.qty (planning qty, 066)
-      planned = float(row['qty_planned'])
-      if row['line_status'] in _ACTIVE_STATUSES:
-        if ordered is None:
-          row['drift'] = 'gone'          # nothing open — likely shipped
-        elif abs(float(ordered) - planned) > 0.005:
-          row['drift'] = f"{planned:g} → {float(ordered):g}"
-        else:
-          row['drift'] = None
-      else:
-        row['drift'] = None
-      # 065 / C05: e21 balance due vs ordered disagree -> stale balance on
-      # an e21 editing path (never a partial: e21 restates the line). The
-      # Qty column shows "ordered (balance)"; PC re-accepts the line.
-      if (live is not None and ordered is not None
-          and abs(float(live) - float(ordered)) > 0.005):
-        row['qty_warn'] = f"balance {float(live):g} vs ordered {float(ordered):g}"
-      else:
-        row['qty_warn'] = None
-      row['line_label'] = _line_label(row['nx_order_numb'], row.get('nx_rel_numb'),
-                                      row.get('nx_item_no'))
-      row['customer'] = _customer_label(row.get('nx_cust_name'), row.get('nx_cust_city'),
-                                        row.get('nx_cust_state'), row.get('shipto_code'))
-      lines.append(row)
-
-    planned_total = sum(float(l['load_inches']) for l in lines
-                        if l['line_status'] in _COUNTS_AGAINST_CAP
-                        and l.get('tier') != 'Stretch')
-    stretch_total = sum(float(l['load_inches']) for l in lines
-                        if l['line_status'] in _COUNTS_AGAINST_CAP
-                        and l.get('tier') == 'Stretch')
-    cursor.execute("""
-        SELECT TOP 1 proposal_id, status, generated_at, agent_version,
-               capacity_inches, proposed_inches, rationale,
-               (SELECT COUNT(*) FROM dbo.pc_agent_proposal_line l
-                WHERE l.proposal_id = p.proposal_id AND l.rank_no > 0) AS n_lines
-        FROM dbo.pc_agent_proposal p
-        WHERE plan_date = %s ORDER BY generated_at DESC
-    """, (plan_date,))
-    prop = cursor.fetchone()
-    n_proposed_open = sum(1 for l in lines if l['line_status'] == 'Proposed')
-    return {'status': 'success',
-            'header': serialize_row(header) if header else None,
-            'lines': lines,
-            'planned_inches': round(planned_total, 1),
-            'stretch_inches': round(stretch_total, 1),
-            'capacity': _capacity_for(cursor, plan_date),
-            'proposal': serialize_row(prop) if prop else None,
-            'n_proposed_open': n_proposed_open}
-  except Exception as e:
-    return {'status': 'error', 'message': f'Plan load error: {e}'}
-  finally:
-    conn.close()
-
-
-# =============================================================================
-# MUTATIONS — one transaction each, event row inside it
-# =============================================================================
-
-def _fetch_candidate_rows(cursor, order, rel, item):
-  """066: the ONE candidate row of an e21 line (order, release, item)."""
-  cursor.execute("""
-      SELECT * FROM dbo.vw_pc_ship_candidate_rows
-      WHERE nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-  """, (order, rel, item))
-  return cursor.fetchall()
-
-
-def _aggregate(rows):
-  """066: qty = the ORDERED quantity (e21 orditem.qty). One row per line
-  now, but the shape is kept so the load math has one home."""
-  qty = sum(float((r['nx_qty_ordered'] if r.get('nx_qty_ordered') is not None
-                   else r['nx_qty_balance_due']) or 0) for r in rows)
-  dates = [r['nx_dship_by_date'] or r['nx_hship_by_date'] for r in rows]
-  dates = [d.date() if isinstance(d, datetime) else d for d in dates if d]
-  return {
-    'qty': qty,
-    'sku': rows[0]['nx_sku'],
-    'ship_by': min(dates) if dates else None,
-    'shipto': rows[0]['nx_shipto_code'],
-    'carrier': rows[0]['nx_carrier'],
-    'minutes': sum(float(r['minutes_charged'] or 0) for r in rows),
-    'surcharge': sum(float(r['surcharge_minutes'] or 0) for r in rows),
-    'inches': sum(float(r['work_inches'] or 0) for r in rows),
-  }
-
-
-def _insert_source_rows(cursor, plan_date, order, rel, item, rows):
-  """The plan-time snapshot of the e21 line (066: one row; qty_balance
-  holds the ORDERED quantity the plan was built on)."""
-  for r in rows:
-    cursor.execute("""
-        INSERT INTO dbo.pc_ship_plan_line_source
-            (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
-             qty_balance, nx_attrib_val, element_class_used,
-             class_was_defaulted, size_inches, minutes_charged)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (plan_date, order, r['nx_sku'], rel, item,
-          (r['nx_qty_ordered'] if r.get('nx_qty_ordered') is not None
-           else r['nx_qty_balance_due']),
-          r['nx_attrib_val'],
-          (r['element_class'] if r['element_class'] in
-           ('Standard', 'Non-Standard') else 'n/a'),
-          r['class_was_defaulted'], r['size_inches'], r['minutes_charged']))
-
-
-def _delete_source_rows(cursor, plan_date, order, rel, item):
-  cursor.execute("""
-      DELETE FROM dbo.pc_ship_plan_line_source
-      WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-  """, (plan_date, order, rel, item))
-
-
-def _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
-                            role='PC', actor=None, tier='Next', reason=None):
-  cursor.execute("""
-      INSERT INTO dbo.pc_ship_plan_line
-          (plan_date, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
-           qty_planned, ship_by_date,
-           shipto_code, carrier, load_inches, load_minutes,
-           surcharge_minutes, line_status, added_by_role, created_by,
-           tier, priority_reason)
-      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Planned', %s, %s,
-              %s, %s)
-  """, (plan_date, order, rel, item, agg['sku'], agg['qty'], agg['ship_by'],
-        agg['shipto'], agg['carrier'], agg['inches'], agg['minutes'],
-        agg['surcharge'], role, actor or _current_actor(), tier, (reason or None)))
-  _insert_source_rows(cursor, plan_date, order, rel, item, rows)
-
-
-def _ensure_header(cursor, plan_date, actor):
-  cursor.execute("SELECT plan_date FROM dbo.pc_ship_plan WHERE plan_date = %s",
-                 (plan_date,))
-  if not cursor.fetchone():
-    weights = _get_active_weights(cursor)
-    cursor.execute("""
-        INSERT INTO dbo.pc_ship_plan (plan_date, weight_set_id, created_by)
-        VALUES (%s, %s, %s)
-    """, (plan_date, weights['weight_set_id'], actor))
-
-
-@anvil.server.callable
-def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None):
-  """Add one e21 line (order, release, item) to a day. The line is ALWAYS
-  added — over-cap is reported back so the client runs the cap-hit dialog
-  (snooze / unplaced / stretch / keep). Never a silent drop."""
-  plan_date = _parse_date(plan_date)
-  if tier not in ('Must', 'Next', 'Stretch'):
-    return {'status': 'error', 'message': f'Bad tier {tier}.'}
-  actor = _current_actor()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT line_status, nx_sku FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (plan_date, order, rel, item))
-    existing = cursor.fetchone()
-    label = _line_label(order, rel, item, existing['nx_sku'] if existing else None)
-    if existing and existing['line_status'] != 'Removed':
-      return {'status': 'error',
-              'message': f'{label} is already on this plan '
-              f"({existing['line_status']})."}
-
-    rows = _fetch_candidate_rows(cursor, order, rel, item)
-    if not rows:
-      return {'status': 'error',
-              'message': f'{label} has no open quantity in the feed '
-              '(shipped, or already planned on another day).'}
-    agg = _aggregate(rows)
-    label = _line_label(order, rel, item, agg['sku'])
-    _ensure_header(cursor, plan_date, actor)
-
-    if existing:  # was Removed — revive rather than violate the PK
-      _delete_source_rows(cursor, plan_date, order, rel, item)
-      cursor.execute("""
-          UPDATE dbo.pc_ship_plan_line
-          SET nx_sku = %s, qty_planned = %s, ship_by_date = %s, shipto_code = %s,
-              carrier = %s, load_inches = %s, load_minutes = %s,
-              surcharge_minutes = %s, line_status = 'Planned',
-              tier = %s, priority_reason = %s,
-              snooze_to_date = NULL, updated_by = %s, updated_at = GETDATE()
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-      """, (agg['sku'], agg['qty'], agg['ship_by'], agg['shipto'], agg['carrier'],
-            agg['inches'], agg['minutes'], agg['surcharge'],
-            tier, (reason or None), actor,
-            plan_date, order, rel, item))
-      _insert_source_rows(cursor, plan_date, order, rel, item, rows)
-    else:
-      _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
-                              actor=actor, tier=tier, reason=reason)
-
-    _log_event(cursor, plan_date, order, agg['sku'], 'Added',
-               new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in "
-               f"({tier})",
-               actor=actor, rel=rel, item=item)
-    _bump_revision(cursor, plan_date, actor)
-
-    planned = _planned_inches(cursor, plan_date)
-    cap = _capacity_for(cursor, plan_date)['capacity_inches_effective']
-    over = planned > cap
-    suggested = _suggest_day(cursor, agg['inches'], plan_date) if over else None
-    conn.commit()
-    return {'status': 'success', 'planned_inches': round(planned, 1),
-            'capacity_inches': round(cap, 1), 'over_capacity': over,
-            'line_inches': round(agg['inches'], 1),
-            'suggested_day': suggested, 'label': label}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Add failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_get_reasons():
-  """Active priority reasons, dropdown-ready. Managed in
-  pc_priority_reasons (add rows there; no code change)."""
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT reason_code, description
-        FROM dbo.pc_priority_reasons
-        WHERE is_active = 1
-        ORDER BY sort_order, reason_code
-    """)
-    return {'status': 'success',
-            'reasons': [serialize_row(r) for r in cursor.fetchall()]}
-  except Exception as e:
-    return {'status': 'error', 'message': f'{e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_set_priority(plan_date, order, rel, item, tier=None, reason=None,
-                           note=None):
-  """Set tier / reason / note on one plan line. Pass only what changes;
-  ''=clear. Each change gets its own event (TierChange / ReasonSet) and
-  counts as a revision on a Published plan. The note is the text behind
-  reason OTHER ('Other (see note)') — optional color on any reason."""
-  plan_date = _parse_date(plan_date)
-  if tier is not None and tier not in ('Must', 'Next', 'Stretch'):
-    return {'status': 'error', 'message': f'Bad tier {tier}.'}
-  actor = _current_actor()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT tier, priority_reason, priority_note, line_status, nx_sku
-        FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (plan_date, order, rel, item))
-    row = cursor.fetchone()
-    if not row:
-      return {'status': 'error', 'message': 'Line not found.'}
-    sku = row['nx_sku']
-    if row['line_status'] == 'Removed':
-      return {'status': 'error', 'message': 'Line is removed — revive it '
-              'first (re-add the order).'}
-
-    changed = False
-    if tier is not None and tier != row['tier']:
-      cursor.execute("""
-          UPDATE dbo.pc_ship_plan_line
-          SET tier = %s, updated_by = %s, updated_at = GETDATE()
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-      """, (tier, actor, plan_date, order, rel, item))
-      _log_event(cursor, plan_date, order, sku, 'TierChange',
-                 old_value=row['tier'], new_value=tier, actor=actor,
-                 rel=rel, item=item)
-      changed = True
-    if reason is not None:
-      new_reason = reason or None          # '' clears
-      if new_reason != row['priority_reason']:
-        cursor.execute("""
-            UPDATE dbo.pc_ship_plan_line
-            SET priority_reason = %s, updated_by = %s, updated_at = GETDATE()
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-        """, (new_reason, actor, plan_date, order, rel, item))
-        _log_event(cursor, plan_date, order, sku, 'ReasonSet',
-                   old_value=row['priority_reason'], new_value=new_reason,
-                   actor=actor, rel=rel, item=item)
-        changed = True
-    if note is not None:
-      new_note = (note or '').strip()[:200] or None
-      if new_note != row['priority_note']:
-        cursor.execute("""
-            UPDATE dbo.pc_ship_plan_line
-            SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-        """, (new_note, actor, plan_date, order, rel, item))
-        _log_event(cursor, plan_date, order, sku, 'ReasonSet',
-                   old_value=row['priority_note'], new_value=new_note,
-                   actor=actor, note='note edit', rel=rel, item=item)
-        changed = True
-
-    if not changed:
-      conn.rollback()
-      return {'status': 'success', 'changed': False}
-    _bump_revision(cursor, plan_date, actor)
-    planned = _planned_inches(cursor, plan_date)
-    cap = _capacity_for(cursor, plan_date)['capacity_inches_effective']
-    conn.commit()
-    return {'status': 'success', 'changed': True,
-            'planned_inches': round(planned, 1),
-            'capacity_inches': round(cap, 1),
-            'over_capacity': planned > cap}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Priority failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
-                        due_date=None):
-  """Add EVERY open e21 line of a sales order to the day — one transaction.
-  Per-line Added events plus one OrderAdded summary; a single cap check
-  at the end (the client runs one dialog for the whole order, not one
-  per line). Lines already on the plan are skipped, not errors.
-  due_date (2026-09-13, whole-order rule): only the lines with that
-  DETAIL ship-by date - the publish check's "Add the rest".
-  066: iterates e21 lines (rel, item), not SKUs."""
-  plan_date = _parse_date(plan_date)
-  if tier not in ('Must', 'Next', 'Stretch'):
-    return {'status': 'error', 'message': f'Bad tier {tier}.'}
-  actor = _current_actor()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    if due_date:
-      cursor.execute("""
-          SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.vw_pc_ship_candidate_rows
-          WHERE nx_order_numb = %s
-            AND CAST(nx_dship_by_date AS DATE) = %s
-          ORDER BY nx_rel_numb, nx_item_no
-      """, (order, _parse_date(due_date)))
-    else:
-      cursor.execute("""
-          SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.vw_pc_ship_candidate_rows
-          WHERE nx_order_numb = %s
-          ORDER BY nx_rel_numb, nx_item_no
-      """, (order,))
-    items = [(r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']) for r in cursor.fetchall()]
-    if not items:
-      return {'status': 'error',
-              'message': f'{order} has no open quantity in the feed '
-              '(shipped, or already planned on another day).'}
-
-    _ensure_header(cursor, plan_date, actor)
-    added, skipped, order_inches = [], [], 0.0
-    for rel, item, sku in items:
-      label = _line_label(order, rel, item, sku)
-      cursor.execute("""
-          SELECT line_status FROM dbo.pc_ship_plan_line
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-      """, (plan_date, order, rel, item))
-      existing = cursor.fetchone()
-      if existing and existing['line_status'] != 'Removed':
-        skipped.append(label)
-        continue
-      rows = _fetch_candidate_rows(cursor, order, rel, item)
-      if not rows:
-        skipped.append(label)
-        continue
-      agg = _aggregate(rows)
-      if existing:  # Removed — revive: clear then reinsert cleanly
-        _delete_source_rows(cursor, plan_date, order, rel, item)
-        cursor.execute("""
-            DELETE FROM dbo.pc_ship_plan_line
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-        """, (plan_date, order, rel, item))
-      _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
-                              actor=actor, tier=tier, reason=reason)
-      _log_event(cursor, plan_date, order, agg['sku'], 'Added',
-                 new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in "
-                 f"({tier})",
-                 actor=actor, note='whole order', rel=rel, item=item)
-      added.append(label)
-      order_inches += agg['inches']
-
-    if not added:
-      conn.rollback()
-      return {'status': 'error',
-              'message': f'Every open line of {order} is already on this '
-              'plan — nothing to add.'}
-
-    _log_event(cursor, plan_date, order, None, 'OrderAdded',
-               new_value=f'{len(added)} lines / {order_inches:.1f} in '
-               f'({tier})',
-               actor=actor)
-    _bump_revision(cursor, plan_date, actor)
-
-    planned = _planned_inches(cursor, plan_date)
-    cap = _capacity_for(cursor, plan_date)['capacity_inches_effective']
-    over = planned > cap
-    suggested = (_suggest_day(cursor, order_inches, plan_date)
-                 if over else None)
-    conn.commit()
-    return {'status': 'success', 'added': added, 'skipped': skipped,
-            'planned_inches': round(planned, 1),
-            'capacity_inches': round(cap, 1), 'over_capacity': over,
-            'line_inches': round(order_inches, 1),
-            'suggested_day': suggested}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Add order failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_partial_orders(plan_date):
-  """WHOLE-ORDER RULE (Dave, 2026-09-13) - the plan invariant, checked at
-  Publish for whoever built the plan (agent or person): every order on
-  the day whose open lines with the SAME detail ship-by date are not all
-  on it. Returns the missing lines per (order, due date) so the client
-  can offer 'Add the rest'. Lines already planned on another day or
-  snoozed are reported with where they went (PC decided; not auto-added).
-  Hidden lines (charges, services - pc_plan_exclusions) are not lines.
-  066: at e21-line grain (order, release, item)."""
-  plan_date = _parse_date(plan_date)
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    # The candidate-rows view carries a per-row size parser; pin the few
-    # orders on this plan into a temp table once (pooled connection: drop
-    # it before and after).
-    cursor.execute("IF OBJECT_ID('tempdb..#cr') IS NOT NULL DROP TABLE #cr")
-    cursor.execute("""
-        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, nx_sku_desc, bucket,
-               nx_qty_ordered, work_inches,
-               CAST(nx_dship_by_date AS DATE) AS due_date
-        INTO #cr
-        FROM dbo.vw_pc_ship_candidate_rows
-        WHERE nx_order_numb IN (SELECT nx_order_numb FROM dbo.pc_ship_plan_line
-                                WHERE plan_date = %s
-                                  AND line_status IN ('Planned', 'Proposed', 'Confirmed'))
-    """, (plan_date,))
-    cursor.execute("""
-        SELECT r.nx_order_numb, r.due_date, r.nx_rel_numb, r.nx_item_no, r.nx_sku,
-               r.nx_sku_desc AS sku_desc, r.bucket,
-               r.nx_qty_ordered AS qty, r.work_inches AS inches,
-               (SELECT TOP 1 CONVERT(VARCHAR(10), ISNULL(x.snooze_to_date, x.plan_date), 120)
-                             + ' ' + x.line_status
-                FROM dbo.pc_ship_plan_line x
-                WHERE x.nx_order_numb = r.nx_order_numb AND x.nx_rel_numb = r.nx_rel_numb
-                  AND x.nx_item_no = r.nx_item_no
-                  AND x.plan_date <> %s
-                  AND ((x.plan_date >= CAST(GETDATE() AS DATE)
-                        AND x.line_status IN ('Planned', 'Proposed', 'Confirmed'))
-                    OR (x.line_status = 'Snoozed'
-                        AND ISNULL(x.snooze_to_date, x.plan_date) >= CAST(GETDATE() AS DATE)))
-                ORDER BY x.plan_date DESC) AS elsewhere,
-               (SELECT MIN(CASE p.tier WHEN 'Must' THEN 0 WHEN 'Next' THEN 1 ELSE 2 END)
-                FROM dbo.pc_ship_plan_line p
-                JOIN #cr pr ON pr.nx_order_numb = p.nx_order_numb
-                           AND pr.nx_rel_numb = p.nx_rel_numb AND pr.nx_item_no = p.nx_item_no
-                WHERE p.plan_date = %s AND p.nx_order_numb = r.nx_order_numb
-                  AND p.line_status IN ('Planned', 'Proposed', 'Confirmed')
-                  AND pr.due_date = r.due_date) AS tier_rank
-        FROM #cr r
-        WHERE EXISTS (SELECT 1
-                      FROM dbo.pc_ship_plan_line p
-                      JOIN #cr pr ON pr.nx_order_numb = p.nx_order_numb
-                                 AND pr.nx_rel_numb = p.nx_rel_numb AND pr.nx_item_no = p.nx_item_no
-                      WHERE p.plan_date = %s AND p.nx_order_numb = r.nx_order_numb
-                        AND p.line_status IN ('Planned', 'Proposed', 'Confirmed')
-                        AND pr.due_date = r.due_date)
-          AND NOT EXISTS (SELECT 1 FROM dbo.pc_ship_plan_line p2
-                          WHERE p2.plan_date = %s AND p2.nx_order_numb = r.nx_order_numb
-                            AND p2.nx_rel_numb = r.nx_rel_numb AND p2.nx_item_no = r.nx_item_no
-                            AND p2.line_status IN ('Planned', 'Proposed', 'Confirmed'))
-        ORDER BY r.nx_order_numb, r.due_date, r.nx_rel_numb, r.nx_item_no
-    """, (plan_date, plan_date, plan_date, plan_date))
-    rows = cursor.fetchall()
-    cursor.execute("IF OBJECT_ID('tempdb..#cr') IS NOT NULL DROP TABLE #cr")
-    by_group = {}
-    for r in rows:
-      k = (r['nx_order_numb'], str(r['due_date'])[:10])
-      g = by_group.setdefault(k, {'order': k[0], 'due_date': k[1], 'lines': [],
-                                  'missing_inches': 0.0, 'tier': 'Next'})
-      g['lines'].append({'rel': r['nx_rel_numb'], 'item': r['nx_item_no'],
-                         'label': _line_label(k[0], r['nx_rel_numb'], r['nx_item_no']),
-                         'sku': r['nx_sku'], 'desc': r['sku_desc'], 'bucket': r['bucket'],
-                         'qty': float(r['qty'] or 0), 'inches': float(r['inches'] or 0),
-                         'elsewhere': r['elsewhere']})
-      g['missing_inches'] += float(r['inches'] or 0)
-      g['tier'] = {0: 'Must', 1: 'Next'}.get(r['tier_rank'], 'Stretch')
-    groups = list(by_group.values())
-    for g in groups:
-      g['missing_inches'] = round(g['missing_inches'], 1)
-      g['n_addable'] = sum(1 for l in g['lines'] if not l['elsewhere'])
-    return {'status': 'success', 'plan_date': plan_date.isoformat(),
-            'n_partial': len(groups), 'groups': groups}
-  except Exception as e:
-    try:
-      conn.rollback()
-      conn.cursor().execute("IF OBJECT_ID('tempdb..#cr') IS NOT NULL DROP TABLE #cr")
-    except Exception:
-      pass
-    return {'status': 'error', 'message': f'Partial-order check failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_remove_order(plan_date, order, note=None):
-  """Remove every active line of a sales order from the day — one
-  transaction, per-line Removed events plus one OrderRemoved summary.
-  Removed is a status, never a delete."""
-  plan_date = _parse_date(plan_date)
-  actor = _current_actor()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s
-          AND line_status <> 'Removed'
-    """, (plan_date, order))
-    items = [(r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']) for r in cursor.fetchall()]
-    if not items:
-      return {'status': 'error',
-              'message': f'{order} has no active lines on this plan.'}
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s
-          AND line_status <> 'Removed'
-    """, (actor, plan_date, order))
-    for rel, item, sku in items:
-      _log_event(cursor, plan_date, order, sku, 'Removed',
-                 actor=actor, note=note or 'whole order', rel=rel, item=item)
-    _log_event(cursor, plan_date, order, None, 'OrderRemoved',
-               new_value=f'{len(items)} lines', actor=actor, note=note)
-    _bump_revision(cursor, plan_date, actor)
-    conn.commit()
-    return {'status': 'success',
-            'removed': [_line_label(order, rel, item, sku) for rel, item, sku in items]}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Remove order failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_remove_line(plan_date, order, rel, item, note=None):
-  plan_date = _parse_date(plan_date)
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT nx_sku FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-          AND line_status <> 'Removed'
-    """, (plan_date, order, rel, item))
-    hit = cursor.fetchone()
-    if not hit:
-      return {'status': 'error', 'message': 'Line not found (or already removed).'}
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-          AND line_status <> 'Removed'
-    """, (_current_actor(), plan_date, order, rel, item))
-    _log_event(cursor, plan_date, order, hit['nx_sku'], 'Removed', note=note,
-               rel=rel, item=item)
-    _bump_revision(cursor, plan_date, None)
-    conn.commit()
-    return {'status': 'success'}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Remove failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_mark_unplaced(plan_date, order, rel, item, note=None):
-  """The explicit queue (DECISION §4) — visible on the day PC tried."""
-  plan_date = _parse_date(plan_date)
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT nx_sku FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (plan_date, order, rel, item))
-    hit = cursor.fetchone()
-    if not hit:
-      return {'status': 'error', 'message': 'Line not found.'}
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Unplaced', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (_current_actor(), plan_date, order, rel, item))
-    _log_event(cursor, plan_date, order, hit['nx_sku'], 'Unplaced', note=note,
-               rel=rel, item=item)
-    _bump_revision(cursor, plan_date, None)
-    conn.commit()
-    return {'status': 'success'}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Unplace failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_snooze_line(plan_date, order, rel, item, to_date):
-  """Mark this day's line Snoozed and create the future day's line —
-  ONE transaction across both days. Source rows re-captured fresh for the
-  new day (its own plan-time snapshot)."""
-  plan_date = _parse_date(plan_date)
-  to_date = _parse_date(to_date)
-  if to_date <= plan_date:
-    return {'status': 'error', 'message': 'Snooze target must be a later day.'}
-  actor = _current_actor()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT line_status FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (to_date, order, rel, item))
-    if cursor.fetchone():
-      return {'status': 'error',
-              'message': f'{_line_label(order, rel, item)} is already on {to_date}.'}
-    cursor.execute("""
-        SELECT tier, priority_reason, nx_sku FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (plan_date, order, rel, item))
-    src = cursor.fetchone() or {}
-
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Snoozed', snooze_to_date = %s,
-            updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-          AND line_status IN %s
-    """, (to_date, actor, plan_date, order, rel, item, _ACTIVE_STATUSES))
-    if cursor.rowcount == 0:
-      return {'status': 'error', 'message': 'Line not found or not active.'}
-    _log_event(cursor, plan_date, order, src.get('nx_sku'), 'Snoozed',
-               new_value=to_date.isoformat(), actor=actor, rel=rel, item=item)
-
-    rows = _fetch_candidate_rows(cursor, order, rel, item)
-    if not rows:
-      conn.rollback()
-      return {'status': 'error',
-              'message': 'No open quantity left in the feed — nothing to '
-              'snooze forward. Refresh the plan.'}
-    agg = _aggregate(rows)
-    _ensure_header(cursor, to_date, actor)
-    _insert_line_and_source(cursor, to_date, order, rel, item, rows, agg,
-                            actor=actor, tier=src.get('tier') or 'Next',
-                            reason=src.get('priority_reason'))
-    _log_event(cursor, to_date, order, agg['sku'], 'Added',
-               new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in",
-               actor=actor, note=f'snoozed from {plan_date}', rel=rel, item=item)
-    _bump_revision(cursor, plan_date, actor)
-    _bump_revision(cursor, to_date, actor)
-    conn.commit()
-    return {'status': 'success', 'to_date': to_date.isoformat()}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Snooze failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_recalc_line(plan_date, order, rel, item):
-  """THE drift-rule writer — the only path that re-totals a plan line.
-  Replaces the source snapshot and logs Recalc with old/new."""
-  plan_date = _parse_date(plan_date)
-  actor = _current_actor()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT qty_planned, load_inches FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-          AND line_status IN %s
-    """, (plan_date, order, rel, item, _ACTIVE_STATUSES))
-    old = cursor.fetchone()
-    if not old:
-      return {'status': 'error', 'message': 'Line not found or not active.'}
-
-    rows = _fetch_candidate_rows(cursor, order, rel, item)
-    if not rows:
-      return {'status': 'error',
-              'message': 'No open quantity in the feed — this line likely '
-              'shipped. Remove it rather than refreshing.'}
-    agg = _aggregate(rows)
-
-    _delete_source_rows(cursor, plan_date, order, rel, item)
-    _insert_source_rows(cursor, plan_date, order, rel, item, rows)
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET nx_sku = %s, qty_planned = %s, ship_by_date = %s, load_inches = %s,
-            load_minutes = %s, surcharge_minutes = %s,
-            updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (agg['sku'], agg['qty'], agg['ship_by'], agg['inches'], agg['minutes'],
-          agg['surcharge'], actor, plan_date, order, rel, item))
-
-    old_txt = f"{float(old['qty_planned']):g} pcs / {float(old['load_inches']):.1f} in"
-    new_txt = f"{agg['qty']:g} pcs / {agg['inches']:.1f} in"
-    _log_event(cursor, plan_date, order, agg['sku'], 'Recalc',
-               old_value=old_txt, new_value=new_txt, actor=actor, rel=rel, item=item)
-    _bump_revision(cursor, plan_date, actor)
-    conn.commit()
-    return {'status': 'success', 'old': old_txt, 'new': new_txt}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Refresh failed: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def _snapshot_flags(cursor, plan_date, revision_no, weight_set_id):
-  """Migration 051: freeze the WHOLE candidate pool (planned + not) with
-  its codes, gate state, score and per-flag weights AS OF NOW. Flags are
-  computed at read time and never stored, so this is the only record of
-  what the ranking looked like when the plan went out — the agent's
-  step-12 backtests replay from it. Idempotent per (plan_date, revision)."""
-  cursor.execute("""
-      INSERT INTO dbo.pc_plan_flag_snapshot
-          (plan_date, revision_no, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
-           was_planned, tier, is_gated, gate_codes, priority_score, flag_codes,
-           ship_by_date, qty_open, load_inches, capacity_weight_set_id)
-      SELECT %s, %s, p.nx_order_numb, p.nx_rel_numb, p.nx_item_no, p.nx_sku,
-             p.was_planned, p.tier,
-             ISNULL(fs.is_gated, 0), fs.gate_codes,
-             ISNULL(fs.priority_score, 0), fs.flag_codes,
-             p.ship_by_date, p.qty_open, p.load_inches, %s
-      FROM (
-          SELECT l.nx_order_numb, l.nx_rel_numb, l.nx_item_no, l.nx_sku,
-                 1 AS was_planned, l.tier,
-                 l.ship_by_date, l.qty_planned AS qty_open, l.load_inches
-          FROM dbo.pc_ship_plan_line l
-          WHERE l.plan_date = %s
-            AND l.line_status IN ('Planned','Proposed','Confirmed')
-          UNION ALL
-          SELECT c.nx_order_numb, c.nx_rel_numb, c.nx_item_no, c.nx_sku, 0, NULL,
-                 c.ship_by_date, c.qty_open, c.load_inches
-          FROM dbo.vw_pc_ship_candidates c
-          WHERE NOT EXISTS (
-              SELECT 1 FROM dbo.pc_ship_plan_line l2
-              WHERE l2.plan_date = %s
-                AND l2.nx_order_numb = c.nx_order_numb
-                AND l2.nx_rel_numb = c.nx_rel_numb
-                AND l2.nx_item_no = c.nx_item_no
-                AND l2.line_status IN ('Planned','Proposed','Confirmed'))
-      ) p
-      LEFT JOIN dbo.vw_pc_order_flag_scores fs
-             ON fs.nx_order_numb = p.nx_order_numb AND fs.nx_rel_numb = p.nx_rel_numb
-            AND fs.nx_item_no = p.nx_item_no
-      WHERE NOT EXISTS (
-          SELECT 1 FROM dbo.pc_plan_flag_snapshot s
-          WHERE s.plan_date = %s AND s.revision_no = %s
-            AND s.nx_order_numb = p.nx_order_numb AND s.nx_rel_numb = p.nx_rel_numb
-            AND s.nx_item_no = p.nx_item_no)
-  """, (plan_date, revision_no, weight_set_id, plan_date, plan_date,
-        plan_date, revision_no))
-  n_rows = cursor.rowcount
-  cursor.execute("""
-      INSERT INTO dbo.pc_plan_flag_snapshot_detail
-          (snapshot_id, flag_code, weight_at_time, note)
-      SELECT s.snapshot_id, f.flag_code, f.weight, LEFT(f.note, 500)
-      FROM dbo.pc_plan_flag_snapshot s
-      JOIN dbo.vw_pc_order_flags f
-        ON f.nx_order_numb = s.nx_order_numb AND f.nx_rel_numb = s.nx_rel_numb
-       AND f.nx_item_no = s.nx_item_no
-      WHERE s.plan_date = %s AND s.revision_no = %s
-        AND NOT EXISTS (
-            SELECT 1 FROM dbo.pc_plan_flag_snapshot_detail d
-            WHERE d.snapshot_id = s.snapshot_id AND d.flag_code = f.flag_code)
-  """, (plan_date, revision_no))
-  return n_rows
-
-
-@anvil.server.callable
-def ship_plan_publish(plan_date, partial_ack=None):
-  """Stamp capacity (the number sales saw) and flip Draft -> Published.
-  The plan stays editable after — real life happens; edits keep logging.
-  051: after the publish commits, the flag snapshot is taken in its OWN
-  transaction — a snapshot problem must never un-publish a plan; it comes
-  back as snapshot_warning for the client to show.
-  partial_ack (2026-09-13): the partial orders the publisher chose to
-  publish anyway, logged as one PartialAck event per order so the retro
-  can tell 'knew' from 'missed'."""
-  plan_date = _parse_date(plan_date)
-  actor = _current_actor()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cap = _capacity_for(cursor, plan_date)
-    for g in (partial_ack or []):
-      try:
-        _log_event(cursor, plan_date, g.get('order'), None, 'PartialAck',
-                   new_value=f"{len(g.get('lines') or [])} lines left off, "
-                   f"{float(g.get('missing_inches') or 0):,.0f} in",
-                   actor=actor,
-                   note='published anyway; due ' + str(g.get('due_date') or '') + ': '
-                   + ', '.join((l.get('label') or l.get('sku') or '')
-                               for l in (g.get('lines') or []))[:400])
-      except Exception:
-        pass                      # the acknowledgement must never block a publish
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan
-        SET plan_status = 'Published', capacity_inches = %s,
-            capacity_detail = %s, published_by = %s, published_at = GETDATE()
-        WHERE plan_date = %s
-    """, (cap['capacity_inches_effective'], cap['capacity_detail'][:200],
-          actor, plan_date))
-    if cursor.rowcount == 0:
-      return {'status': 'error', 'message': 'No plan exists for that day yet.'}
-    proposal_outcome = _settle_proposal_outcomes(cursor, plan_date, actor)
-    _log_event(cursor, plan_date, None, None, 'Published',
-               new_value=f"capacity {cap['capacity_inches_effective']:.0f} in",
-               actor=actor, note=cap['capacity_detail'][:500])
-    conn.commit()
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Publish failed: {e}'}
-  finally:
-    conn.close()
-  # --- flag snapshot (051), separate transaction --------------------
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("SELECT revision_no, weight_set_id FROM dbo.pc_ship_plan "
-                   "WHERE plan_date = %s", (plan_date,))
-    row = cursor.fetchone() or {}
-    n = _snapshot_flags(cursor, plan_date, int(row.get('revision_no') or 0),
-                        row.get('weight_set_id'))
-    conn.commit()
-    result = {'status': 'success', 'capacity': cap, 'snapshot_rows': n,
-              'proposal_outcome': proposal_outcome}
-  except Exception as e:
-    conn.rollback()
-    result = {'status': 'success', 'capacity': cap,
-              'proposal_outcome': proposal_outcome,
-              'snapshot_warning': f'Published, but the flag snapshot failed: {e}'}
-  finally:
-    conn.close()
-  # --- work-order stamp (056), separate transaction, best effort -----
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    stamp = _stamp_work_orders(cursor, plan_date)
-    conn.commit()
-    if stamp is not None:
-      result['wo_stamp'] = stamp
-  except Exception as e:
-    conn.rollback()
-    result['stamp_warning'] = f'Published, but the work-order stamp failed: {e}'
-  finally:
-    conn.close()
-  return result
-
-
-# =============================================================================
-# PARAMETERS / OVERRIDES / SPECIAL CUSTOMERS / EVENTS
-# =============================================================================
-
-@anvil.server.callable
-def ship_plan_get_day(plan_date, search=None, bucket=None,
-                      due_within_days=None, special_only=False,
-                      defaulted_only=False, flag_filter=None):
-  """Plan + candidates in ONE round trip. Anvil charges ~1s of transport
-  per call regardless of query size, so the form's load path (and every
-  dialog-close reload) pays it once, not twice."""
-  plan = ship_plan_get_plan(plan_date)
-  if plan.get('status') != 'success':
-    return plan
-  cands = ship_plan_get_candidates(search=search, bucket=bucket,
-                                   due_within_days=due_within_days,
-                                   special_only=special_only,
-                                   defaulted_only=defaulted_only,
-                                   flag_filter=flag_filter)
-  if cands.get('status') != 'success':
-    return cands
-  # Flag definitions ride along (22 tiny rows): the legend popup, the
-  # Flag dropdown items and the How-To all read the SAME live table, so
-  # a weight or threshold change shows up on the next load — no extra
-  # round trip, no hardcoded legend to go stale.
-  defs = ship_plan_get_flag_definitions()
-  return {'status': 'success', 'plan': plan, 'candidates': cands,
-          'flag_definitions': defs.get('definitions', [])}
-
-
-@anvil.server.callable
-def ship_plan_get_flag_definitions():
-  """Live legend source: dbo.pc_flag_definitions (migration 040), all
-  rows incl. inactive Phase-2 ones (shown greyed), category order
-  X, A, B, C then code."""
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT flag_code, category, flag_name, description, weight,
-               threshold_value, is_manual, display_glyph, phase, active
-        FROM dbo.pc_flag_definitions
-        ORDER BY CASE category WHEN 'X' THEN 0 WHEN 'A' THEN 1
-                               WHEN 'B' THEN 2 ELSE 3 END, flag_code
-    """)
-    return {'status': 'success',
-            'definitions': [serialize_row(r) for r in cursor.fetchall()]}
-  except Exception as e:
-    return {'status': 'error', 'message': f'Flag definitions error: {e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_get_params_bundle(override_date=None):
-  """Everything the Parameters panel shows, in ONE round trip (it used
-  to make three sequential calls — three seconds of frozen spinner)."""
-  p = ship_plan_get_parameters()
-  if p.get('status') != 'success':
-    return p
-  c = ship_plan_get_special_customers()
-  if c.get('status') != 'success':
-    return c
-  # overrides only when a date is asked for — the Parameters popup no
-  # longer shows that section (it lives in Mark absent / trainee...)
-  o = (ship_plan_get_overrides(override_date) if override_date
-       else {'status': 'success', 'overrides': []})
-  if o.get('status') != 'success':
-    return o
-  return {'status': 'success', 'parameters': p['parameters'],
-          'customers': c['customers'], 'overrides': o['overrides']}
-
-
-@anvil.server.callable
-def ship_plan_get_parameters():
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT param_code, param_value, description, updated_by, updated_at
-        FROM dbo.pc_plan_parameters ORDER BY param_code
-    """)
-    return {'status': 'success',
-            'parameters': [serialize_row(r) for r in cursor.fetchall()]}
-  except Exception as e:
-    return {'status': 'error', 'message': f'{e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_set_parameter(param_code, param_value):
-  actor = _current_actor()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT param_value FROM dbo.pc_plan_parameters WHERE param_code = %s
-    """, (param_code,))
-    old = cursor.fetchone()
-    if not old:
-      return {'status': 'error', 'message': f'Unknown parameter {param_code}.'}
-    cursor.execute("""
-        UPDATE dbo.pc_plan_parameters
-        SET param_value = %s, updated_by = %s, updated_at = GETDATE()
-        WHERE param_code = %s
-    """, (str(param_value).strip(), actor, param_code))
-    _log_event(cursor, date.today(), None, None, 'ParamChange',
-               old_value=f"{param_code}={old['param_value']}",
-               new_value=f"{param_code}={str(param_value).strip()}",
-               actor=actor)
-    conn.commit()
-    return {'status': 'success'}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'{e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_get_overrides(for_date):
-  """Active roster x that date's snapshot + overrides — the panel shows
-  what PC would be out-voting."""
-  for_date = _parse_date(for_date)
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT r.employee_id,
-               COALESCE(s.full_name, 'emp ' + r.employee_id) AS full_name,
-               r.shift, s.status AS snapshot_status,
-               r.default_capacity_factor,
-               o.override_type, o.capacity_factor, o.note
-        FROM dbo.em_assembler_roster r
-        LEFT JOIN dbo.em_assembler_status_daily s
-               ON s.employee_id = r.employee_id AND s.status_date = %s
-        LEFT JOIN dbo.pc_assembler_day_override o
-               ON o.employee_id = r.employee_id AND o.override_date = %s
-        WHERE r.end_date IS NULL
-        ORDER BY r.shift, full_name
-    """, (for_date, for_date))
-    return {'status': 'success',
-            'overrides': [serialize_row(r) for r in cursor.fetchall()]}
-  except Exception as e:
-    return {'status': 'error', 'message': f'{e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_set_override(for_date, employee_id, override_type,
-                           capacity_factor=None, note=None):
-  """override_type None clears the override (snapshot rules again)."""
-  for_date = _parse_date(for_date)
-  actor = _current_actor()
-  factors = {'Absent': 0.0, 'Present': 1.0, 'HalfDay': 0.5}
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    if override_type is None:
-      cursor.execute("""
-          DELETE FROM dbo.pc_assembler_day_override
-          WHERE override_date = %s AND employee_id = %s
-      """, (for_date, employee_id))
-      _log_event(cursor, for_date, None, None, 'ParamChange',
-                 old_value=f'override {employee_id}',
-                 new_value='cleared', actor=actor)
-      conn.commit()
-      return {'status': 'success'}
-
-    if override_type not in ('Absent', 'Present', 'Trainee', 'HalfDay'):
-      return {'status': 'error', 'message': f'Bad type {override_type}.'}
-    if capacity_factor is None:
-      if override_type == 'Trainee':
-        params = _get_params(cursor)
-        capacity_factor = float(params.get('TRAINEE_MULTIPLIER', 0.5))
-      else:
-        capacity_factor = factors[override_type]
-
-    cursor.execute("""
-        UPDATE dbo.pc_assembler_day_override
-        SET override_type = %s, capacity_factor = %s, note = %s,
-            entered_by = %s, entered_at = GETDATE()
-        WHERE override_date = %s AND employee_id = %s
-    """, (override_type, capacity_factor, note, actor, for_date, employee_id))
-    if cursor.rowcount == 0:
-      cursor.execute("""
-          INSERT INTO dbo.pc_assembler_day_override
-              (override_date, employee_id, override_type, capacity_factor,
-               note, entered_by)
-          VALUES (%s, %s, %s, %s, %s, %s)
-      """, (for_date, employee_id, override_type, capacity_factor, note, actor))
-    _log_event(cursor, for_date, None, None, 'ParamChange',
-               new_value=f'{employee_id} {override_type} x{capacity_factor}',
-               actor=actor, note=note)
-    conn.commit()
-    return {'status': 'success'}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'{e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_get_special_customers():
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT customer_code, customer_name, surcharge_basis,
-               surcharge_value, is_active, notes
-        FROM dbo.pc_special_customers ORDER BY customer_code
-    """)
-    return {'status': 'success',
-            'customers': [serialize_row(r) for r in cursor.fetchall()]}
-  except Exception as e:
-    return {'status': 'error', 'message': f'{e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_upsert_special_customer(customer_code, customer_name,
-                                      surcharge_value, is_active=True,
-                                      notes=None):
-  actor = _current_actor()
-  code = (customer_code or '').strip().upper()[:15]
-  if not code:
-    return {'status': 'error', 'message': 'Customer code (prefix) required.'}
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE dbo.pc_special_customers
-        SET customer_name = %s, surcharge_value = %s, is_active = %s,
-            notes = %s
-        WHERE customer_code = %s
-    """, (customer_name, surcharge_value, (1 if is_active else 0), notes, code))
-    verb = 'updated'
-    if cursor.rowcount == 0:
-      cursor.execute("""
-          INSERT INTO dbo.pc_special_customers
-              (customer_code, customer_name, surcharge_value, is_active,
-               notes, added_by)
-          VALUES (%s, %s, %s, %s, %s, %s)
-      """, (code, customer_name, surcharge_value, (1 if is_active else 0),
-            notes, actor))
-      verb = 'added'
-    _log_event(cursor, date.today(), None, None, 'ParamChange',
-               new_value=f'special customer {code} {verb} '
-               f'x{surcharge_value} active={bool(is_active)}',
-               actor=actor)
-    conn.commit()
-    return {'status': 'success'}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'{e}'}
-  finally:
-    conn.close()
-
-
-@anvil.server.callable
-def ship_plan_get_events(plan_date, limit=100):
-  plan_date = _parse_date(plan_date)
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT TOP %d event_id, plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
-               event_type, old_value, new_value, actor, event_time, note
-        FROM dbo.pc_plan_line_events
-        WHERE plan_date = %%s
-        ORDER BY event_time DESC, event_id DESC
-    """ % max(1, min(int(limit), 500)), (plan_date,))
-    return {'status': 'success',
-            'events': [serialize_row(r) for r in cursor.fetchall()]}
-  except Exception as e:
-    return {'status': 'error', 'message': f'{e}'}
-  finally:
-    conn.close()
-
-
-# =============================================================================
-# AI AGENT — PROPOSAL ENGINE  (Operating Cycle steps 2-3; migrations 051/052)
-# =============================================================================
-# The agent is "just another proposer": it adds the day's picks as Proposed
-# lines (proposed_by='agent', added_by_role='Agent') that PC confirms or
-# drops in the pane they already use. The pick is DETERMINISTIC — score
-# order, tier rule, fill to AGENT_FILL_PCT of capacity, then a Stretch tail —
-# so it is explainable line by line. The model (titan-ai-service) never
-# chooses lines; it writes the narrative on top (pc_agent_proposal.rationale)
-# and sends the SMS. v1 authority: recommend, record, ask. Nothing here
-# publishes, approves, or touches e21.
-
-_AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.1'   # 066: item-level lines, ordered qty
-
-
-def _agent_params(cursor):
-  p = _get_params(cursor)
-  def _f(k, d):
-    try:
-      return float(p.get(k, d))
-    except (TypeError, ValueError):
-      return float(d)
-  return {'enabled': str(p.get('AGENT_ENABLED', '1')).strip() == '1',
-          'fill_pct': max(0.0, min(_f('AGENT_FILL_PCT', 80), 100.0)) / 100.0,
-          'stretch_lines': max(0, int(_f('AGENT_STRETCH_LINES', 5))),
-          'horizon_days': max(0, int(_f('PLAN_HORIZON_DAYS', 3))),
-          # zero-touch lines cost no capacity, so first-fit would propose
-          # EVERY one of them (170 in the horizon on 2026-09-06). The plan
-          # measures assembly; pick-and-ship stays off it unless switched on.
-          'include_zero_touch': str(p.get('AGENT_INCLUDE_ZERO_TOUCH', '0')).strip() == '1',
-          # a single line bigger than this share of the fill target is a
-          # SPLIT decision, not a proposal (first run: one 1,631-in line
-          # took 82% of the day).
-          'max_line_pct': max(1.0, min(_f('AGENT_MAX_LINE_PCT', 50), 100.0)) / 100.0}
-
-
-def _next_business_day(d=None):
-  d = d or date.today()
+def _prev_business_day(d=None):
+  d = (d or date.today()) - timedelta(days=1)
   while d.weekday() >= 5:
-    d += timedelta(days=1)
+    d -= timedelta(days=1)
   return d
 
 
-def _horizon_end(days):
-  """Same BUSINESS-day walk as the candidates pane (2026-08-27 lesson)."""
-  end, added = date.today(), 0
-  while added < int(days):
-    end += timedelta(days=1)
-    if end.weekday() < 5:
-      added += 1
-  return end
-
-
-_REASON_WORDS = {   # short words for the reason line; notes carry detail
-  'A01': 'late', 'A02': 'due now', 'A03': 'LD/freight', 'A04': 'rush',
-  'A05': 'expedited', 'A06': 'must start', 'A07': 'carrier cutoff',
-  'B01': 'strategic', 'B02': 'high $', 'B04': 'completes order',
-  'B05': 'consolidates', 'B06': 'new customer', 'B07': 'bumped before',
-  'E01': 'exception',
-}
-
-
-def _agent_reason(c, tier, notes):
-  """One line PC reads on the row: tier, why (flag notes), load."""
-  why = []
-  for n in notes:
-    code = n['flag_code']
-    if code[:1] in ('A', 'B', 'E'):
-      why.append(n['note'] or _REASON_WORDS.get(code, code))
-  if not why:
-    why = ['within horizon, by score']
-  txt = f"{tier}: " + '; '.join(why)
-  txt += f" — {float(c.get('load_inches') or 0):,.1f} in, score {int(c.get('priority_score') or 0)}"
-  return txt[:500]
-
-
-def _upsert_proposed_line(cursor, plan_date, order, rel, item, rows, agg, tier,
-                          reason, actor):
-  """Insert (or revive a Removed) line as Proposed by the agent. Returns
-  False if PC already has the line active — the proposal records it, the
-  plan is left alone."""
-  cursor.execute("""
-      SELECT line_status FROM dbo.pc_ship_plan_line
-      WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-  """, (plan_date, order, rel, item))
-  ex = cursor.fetchone()
-  if ex and ex['line_status'] in _ACTIVE_STATUSES:
-    return False
-  if ex:   # Removed earlier today — revive under the PK
-    _delete_source_rows(cursor, plan_date, order, rel, item)
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET nx_sku = %s, qty_planned = %s, ship_by_date = %s, shipto_code = %s,
-            carrier = %s, load_inches = %s, load_minutes = %s,
-            surcharge_minutes = %s, line_status = 'Proposed',
-            added_by_role = 'Agent', tier = %s, priority_reason = NULL,
-            priority_note = %s, proposed_by = %s, snooze_to_date = NULL,
-            updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (agg['sku'], agg['qty'], agg['ship_by'], agg['shipto'], agg['carrier'],
-          agg['inches'], agg['minutes'], agg['surcharge'],
-          tier, reason, actor, actor, plan_date, order, rel, item))
-    _insert_source_rows(cursor, plan_date, order, rel, item, rows)
-  else:
-    _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
-                            role='Agent', actor=actor, tier=tier, reason=None)
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Proposed', proposed_by = %s, priority_note = %s
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (actor, reason, plan_date, order, rel, item))
-  return True
-
-
-@anvil.server.background_task
-def agent_propose_task(plan_date=None, force=False):
-  """Background task wrapper: the fill can take longer than Anvil's 30 s
-  server-call limit (first live run, 2026-09-06: ~1,100 candidates)."""
-  return _agent_propose_impl(plan_date, force)
-
-
-@anvil.server.callable
-def ship_plan_agent_propose(plan_date=None, force=False):
-  """Launch the proposal run in the background; poll with
-  ship_plan_agent_task_status(task_id)."""
-  task = anvil.server.launch_background_task('agent_propose_task',
-                                             plan_date, force)
-  return {'status': 'started', 'task_id': task.get_id()}
-
-
-@anvil.server.callable
-def ship_plan_agent_task_status(task_id):
-  try:
-    t = anvil.server.get_background_task(task_id)
-    if t.is_completed():
-      return {'status': 'done', 'result': t.get_return_value()}
-    return {'status': 'running', 'state': t.get_state() or {}}
-  except Exception as e:
-    return {'status': 'error', 'message': f'{e}'}
-
-
-def _agent_propose_impl(plan_date=None, force=False):
-  """Build the agent's proposal for a day (default: next business day).
-  Deterministic: ungated candidates within the horizon, in priority order
-  (score, oldest ship-by, biggest load); fill Must/Next up to
-  AGENT_FILL_PCT of capacity ON TOP of whatever PC already planned; then
-  AGENT_STRETCH_LINES more as Stretch (outside the cap by definition).
-  Tier rule: Must = late (A01) or due today/tomorrow (A02); else Next.
-  Re-running supersedes the earlier proposal and clears ONLY its
-  still-Proposed lines — anything PC confirmed stays and counts.
-  Refuses a Published day unless force. Takes a proposal-time flag
-  snapshot under revision_no = -1 (publish uses 0+)."""
-  actor = _AGENT_ACTOR
-  plan_date = _parse_date(plan_date) if plan_date else _next_business_day()
-  conn = get_connection()
-  try:
-    cursor = conn.cursor()
-    ap = _agent_params(cursor)
-    if not ap['enabled'] and not force:
-      return {'status': 'skipped', 'message': 'AGENT_ENABLED is 0.'}
-    cursor.execute("SELECT plan_status, weight_set_id FROM dbo.pc_ship_plan "
-                   "WHERE plan_date = %s", (plan_date,))
-    hdr = cursor.fetchone()
-    if hdr and hdr['plan_status'] == 'Published' and not force:
-      return {'status': 'skipped',
-              'message': f'{plan_date} is already published.'}
-    # 2026-09-07 (Labor Day): no roster -> 0 capacity -> a 0-line proposal
-    # and a text to four people. No capacity = no plan day; say so and stop
-    # BEFORE touching the header or superseding anything.
-    cap_probe = _capacity_for(cursor, plan_date, prefer_estimate=True)
-    if float(cap_probe.get('capacity_inches_effective') or 0) <= 0 and not force:
-      return {'status': 'skipped', 'plan_date': plan_date.isoformat(),
-              'message': (f'{plan_date}: no capacity (holiday or nobody on the '
-                          f'roster) - nothing proposed. {cap_probe.get("capacity_detail", "")}')}
-    _ensure_header(cursor, plan_date, actor)
-    cursor.execute("SELECT weight_set_id FROM dbo.pc_ship_plan "
-                   "WHERE plan_date = %s", (plan_date,))
-    weight_set_id = (cursor.fetchone() or {}).get('weight_set_id')
-
-    # --- supersede an earlier run: its untouched Proposed lines go ----
-    cursor.execute("""
-        UPDATE dbo.pc_agent_proposal SET status = 'SUPERSEDED'
-        WHERE plan_date = %s AND status = 'PROPOSED'
-    """, (plan_date,))
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND line_status = 'Proposed' AND proposed_by = %s
-    """, (actor, plan_date, actor))
-    n_cleared = cursor.rowcount
-
-    # --- capacity + what PC already planned --------------------------
-    cap = _capacity_for(cursor, plan_date, prefer_estimate=True)
-    cap_in = float(cap.get('capacity_inches_effective') or 0)
-    target = cap_in * ap['fill_pct']
-    used = float(_planned_inches(cursor, plan_date) or 0)
-    already_in = used
-
-    # --- candidates in the horizon, ranked exactly like the pane -----
-    end = _horizon_end(ap['horizon_days'])
-    cursor.execute("""
-        SELECT c.*, ISNULL(fs.is_gated, 0) AS is_gated, fs.gate_codes,
-               ISNULL(fs.priority_score, 0) AS priority_score, fs.flag_codes
-        FROM dbo.vw_pc_ship_candidates c
-        LEFT JOIN dbo.vw_pc_order_flag_scores fs
-               ON fs.nx_order_numb = c.nx_order_numb AND fs.nx_rel_numb = c.nx_rel_numb
-              AND fs.nx_item_no = c.nx_item_no
-        WHERE c.ship_by_date <= %s
-        ORDER BY ISNULL(fs.is_gated, 0), ISNULL(fs.priority_score, 0) DESC,
-                 c.ship_by_date, c.load_inches DESC, c.nx_order_numb, c.nx_rel_numb, c.nx_item_no
-    """, (end,))
-    cands = [serialize_row(r) for r in cursor.fetchall()]
-    cursor.execute("""
-        SELECT f.nx_order_numb, f.nx_rel_numb, f.nx_item_no, f.flag_code, f.note
-        FROM dbo.vw_pc_order_flags f
-        JOIN dbo.vw_pc_ship_candidates c
-          ON c.nx_order_numb = f.nx_order_numb AND c.nx_rel_numb = f.nx_rel_numb
-         AND c.nx_item_no = f.nx_item_no
-        WHERE c.ship_by_date <= %s
-        ORDER BY f.flag_code
-    """, (end,))
-    notes = {}
-    for r in cursor.fetchall():
-      notes.setdefault((r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']), []).append(r)
-    # All source rows for the horizon in ONE query (per-line view queries
-    # were the 30 s timeout on the first run). 066: one row per e21 line.
-    cursor.execute("""
-        SELECT * FROM dbo.vw_pc_ship_candidate_rows
-        WHERE CAST(COALESCE(nx_dship_by_date, nx_hship_by_date) AS DATE) <= %s
-    """, (end,))
-    rows_by_key = {}
-    for r in cursor.fetchall():
-      rows_by_key.setdefault((r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']), []).append(r)
-
-    # --- the fill: WHOLE-ORDER GROUPS (rule, Dave 2026-09-13) ---------
-    # If one line of a sales order is proposed, every other open line
-    # with the SAME detail ship-by date is proposed with it. Assembly
-    # techs run each order as a mini-project; a partial order on the
-    # board is chaos. So the ATOM is the group (order, ship_by_date):
-    #   - zero-touch and gated siblings RIDE ALONG (visible at zero /
-    #     visible blockers - e21 backorders what cannot ship). They are
-    #     never picked on their own: a group needs a DRIVER (ungated,
-    #     non-zero line) to be proposed at all.
-    #   - a sibling PC snoozed, or planned on another day, BLOCKS the
-    #     group - PC already decided; reported, never overridden.
-    #   - a ship-complete order (nx_order_type 'S') with a gated sibling
-    #     is BLOCKED: nothing on it can ship until the gate clears.
-    #   - a group bigger than the whole day, or than AGENT_MAX_LINE_PCT
-    #     of the fill target, is a SPLIT DECISION for PC - not proposed.
-    #   - first-fit by the group's best ungated line (the candidate order
-    #     already is score DESC, ship-by, load DESC); tier by its drivers
-    #     (Must = A01/A02 on any driver, else Next). Stretch is decided
-    #     AFTER the fill against the final slack - whole groups only.
-    max_line = target * ap['max_line_pct']
-    cursor.execute("""
-        SELECT pl.nx_order_numb, pl.nx_rel_numb, pl.nx_item_no, pl.nx_sku, pl.plan_date,
-               pl.line_status, pl.snooze_to_date
-        FROM dbo.pc_ship_plan_line pl
-        WHERE (pl.plan_date <> %s AND pl.plan_date >= CAST(GETDATE() AS DATE)
-               AND pl.line_status IN ('Planned', 'Proposed', 'Confirmed'))
-           OR (pl.line_status = 'Snoozed'
-               AND ISNULL(pl.snooze_to_date, pl.plan_date) >= CAST(GETDATE() AS DATE))
-    """, (plan_date,))
-    elsewhere = {(r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']): r
-                 for r in cursor.fetchall()}
-    cursor.execute("""
-        SELECT DISTINCT nx_order_numb FROM dbo.sales_orders_due
-        WHERE RTRIM(nx_order_type) = 'S'
-    """)
-    ship_complete = {r['nx_order_numb'] for r in cursor.fetchall()}
-
-    def _gkey(c):
-      return (c['nx_order_numb'], str(c.get('ship_by_date') or '')[:10])
-    groups, group_order = {}, []
-    for c in cands:
-      k = _gkey(c)
-      if k not in groups:
-        groups[k] = []
-        group_order.append(k)
-      groups[k].append(c)
-
-    picks, deferred, gated, split_needed, blocked = [], [], [], [], []
-    skipped_zero = n_groups = 0
-    for k in group_order:
-      members = groups[k]
-      order = k[0]
-      drivers = [m for m in members
-                 if not m.get('is_gated')
-                 and (float(m.get('load_inches') or 0) > 0 or ap['include_zero_touch'])]
-      if not drivers:
-        if all(m.get('is_gated') for m in members):
-          gated.extend(members)
-        else:
-          skipped_zero += len(members)   # pure pick-and-ship order: not the agent's to propose
-        continue
-      load = sum(float(m.get('load_inches') or 0) for m in members)
-      for m in members:
-        m['group_inches'] = load
-        m['group_n'] = len(members)
-        m['rides_along'] = not any(m is d for d in drivers)
-      blk = [m for m in members
-             if (order, m['nx_rel_numb'], m['nx_item_no']) in elsewhere]
-      if blk:
-        e = elsewhere[(order, blk[0]['nx_rel_numb'], blk[0]['nx_item_no'])]
-        when = str(e.get('snooze_to_date') or e.get('plan_date') or '')[:10]
-        why = (f"sibling {_line_label(order, blk[0]['nx_rel_numb'], blk[0]['nx_item_no'], blk[0]['nx_sku'])} already "
-               f"{'snoozed to' if e['line_status'] == 'Snoozed' else 'planned on'} {when}")
-        for m in members:
-          m['block_reason'] = why
-        blocked.extend(members)
-        continue
-      gm = [m for m in members if m.get('is_gated')]
-      if gm and order in ship_complete:
-        why = (f"ship-complete order; {_line_label(order, gm[0]['nx_rel_numb'], gm[0]['nx_item_no'], gm[0]['nx_sku'])} "
-               f"gated {gm[0].get('gate_codes') or ''}").strip()
-        for m in members:
-          m['block_reason'] = why
-        blocked.extend(members)
-        continue
-      if load > cap_in + 1e-9 or load > max_line + 1e-9:
-        why = ('order bigger than the whole day' if load > cap_in
-               else f"order over {int(ap['max_line_pct'] * 100)}% of the fill target")
-        for m in members:
-          m['split_reason'] = why
-        split_needed.extend(members)
-        continue
-      codes = ' '.join((m.get('flag_codes') or '') for m in drivers)
-      tier = 'Must' if ('A01' in codes or 'A02' in codes) else 'Next'
-      if used + load <= target + 1e-9:
-        picks.extend((m, tier) for m in members)
-        used += load
-        n_groups += 1
-      else:
-        deferred.append(members)
-    slack = cap_in - used
-    stretch, n_stretch_groups = [], 0
-    for members in deferred:
-      if n_stretch_groups >= ap['stretch_lines']:
-        break
-      if float(members[0].get('group_inches') or 0) <= slack + 1e-9:
-        stretch.extend((m, 'Stretch') for m in members)
-        n_stretch_groups += 1
-    skipped = sum(len(g) for g in deferred) - len(stretch)
-    oversize = split_needed          # name kept for the response below
-
-    # --- record the proposal ----------------------------------------
-    cursor.execute("""
-        INSERT INTO dbo.pc_agent_proposal
-            (plan_date, agent_version, capacity_inches, proposed_inches, status)
-        OUTPUT INSERTED.proposal_id
-        VALUES (%s, %s, %s, %s, 'PROPOSED')
-    """, (plan_date, _AGENT_VERSION, round(cap_in, 1), round(used, 1)))
-    proposal_id = cursor.fetchone()['proposal_id']
-
-    out_lines, rank, n_added = [], 0, 0
-    for c, tier in picks + stretch:
-      rank += 1
-      order, sku = c['nx_order_numb'], c['nx_sku']
-      rel, item = c['nx_rel_numb'], c['nx_item_no']
-      key = (order, rel, item)
-      due = str(c.get('ship_by_date') or '')[:10]
-      if c.get('rides_along'):
-        how = (f"gated {c.get('gate_codes') or ''}".strip() if c.get('is_gated')
-               else 'zero-touch')
-        reason = (f"{tier}: rides with order {order} — whole-order rule, due {due} "
-                  f"({how}) — {float(c.get('load_inches') or 0):,.1f} in")[:500]
-      else:
-        reason = _agent_reason(c, tier, notes.get(key, []))
-        if int(c.get('group_n') or 1) > 1:
-          reason = (reason + f" · order {int(c['group_n'])} lines, "
-                    f"{float(c.get('group_inches') or 0):,.0f} in together")[:500]
-      cursor.execute("""
-          INSERT INTO dbo.pc_agent_proposal_line
-              (proposal_id, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no,
-               proposed_tier, load_inches, priority_score, gate_codes, flag_codes, reason)
-          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-      """, (proposal_id, order, rel, item, sku, rank, tier,
-            float(c.get('load_inches') or 0), int(c.get('priority_score') or 0),
-            c.get('gate_codes'), c.get('flag_codes'), reason))
-      rows = rows_by_key.get(key) or []
-      if rows and _upsert_proposed_line(cursor, plan_date, order, rel, item, rows,
-                                        _aggregate(rows), tier, reason, actor):
-        n_added += 1
-        _log_event(cursor, plan_date, order, sku, 'Proposed',
-                   new_value=tier, actor=actor, note=reason, rel=rel, item=item)
-      out_lines.append({'rank': rank, 'order': order, 'sku': sku,
-                        'rel': rel, 'item': item, 'line': _line_label(order, rel, item),
-                        'desc': c.get('sku_desc'), 'shipto': c.get('shipto_code'),
-                        'tier': tier, 'load_inches': float(c.get('load_inches') or 0),
-                        'ship_by': c.get('ship_by_date'),
-                        'score': int(c.get('priority_score') or 0),
-                        'flags': c.get('flag_codes'), 'reason': reason})
-
-    gated_out = [{'order': g['nx_order_numb'], 'sku': g['nx_sku'],
-                  'item': g['nx_item_no'], 'line': _line_label(g['nx_order_numb'], g['nx_rel_numb'], g['nx_item_no']),
-                  'gates': g.get('gate_codes'), 'score': int(g.get('priority_score') or 0),
-                  'ship_by': g.get('ship_by_date'),
-                  'notes': [n['note'] for n in notes.get((g['nx_order_numb'], g['nx_rel_numb'], g['nx_item_no']), [])
-                            if (n['flag_code'] or '')[:1] == 'X']}
-                 for g in gated[:25]]
-
-    oversize_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
-                     'item': o['nx_item_no'], 'line': _line_label(o['nx_order_numb'], o['nx_rel_numb'], o['nx_item_no']),
-                     'load_inches': float(o.get('load_inches') or 0),
-                     'group_inches': float(o.get('group_inches') or 0),
-                     'qty_open': float(o.get('qty_open') or 0),
-                     'score': int(o.get('priority_score') or 0),
-                     'ship_by': o.get('ship_by_date'), 'flags': o.get('flag_codes'),
-                     'why': o.get('split_reason')}
-                    for o in oversize[:15]]
-    blocked_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
-                    'item': o['nx_item_no'], 'line': _line_label(o['nx_order_numb'], o['nx_rel_numb'], o['nx_item_no']),
-                    'load_inches': float(o.get('load_inches') or 0),
-                    'group_inches': float(o.get('group_inches') or 0),
-                    'score': int(o.get('priority_score') or 0),
-                    'ship_by': o.get('ship_by_date'), 'why': o.get('block_reason')}
-                   for o in blocked[:15]]
-    snapshot_warning = None
+def _retro_params(cursor):
+  p = _get_params(cursor)
+  def _i(k, d):
     try:
-      _snapshot_flags(cursor, plan_date, -1, weight_set_id)
-    except Exception as e:      # history must never block the proposal
-      snapshot_warning = str(e)
-    conn.commit()
-    return {'status': 'success', 'proposal_id': proposal_id,
-            'plan_date': plan_date.isoformat(),
-            'capacity': cap, 'capacity_inches': round(cap_in, 1),
-            'fill_pct': ap['fill_pct'], 'target_inches': round(target, 1),
-            'already_planned_inches': round(already_in, 1),
-            'proposed_inches': round(used, 1),
-            'n_proposed': len(picks), 'n_stretch': len(stretch),
-            'n_added_to_plan': n_added, 'n_cleared': n_cleared,
-            'n_gated': len(gated), 'n_skipped': skipped,
-            'n_oversize': len(oversize), 'n_split_needed': len(oversize),
-            'max_line_inches': round(max_line, 1), 'slack_inches': round(slack, 1),
-            'n_zero_touch_skipped': skipped_zero,
-            'n_candidates': len(cands), 'horizon_end': end.isoformat(),
-            'rule': 'WHOLE_ORDER', 'n_groups': n_groups,
-            'n_stretch_groups': n_stretch_groups,
-            'n_blocked': len(blocked), 'blocked': blocked_out,
-            'lines': out_lines, 'gated': gated_out, 'oversize': oversize_out,
-            'snapshot_warning': snapshot_warning}
-  except Exception as e:
-    conn.rollback()
-    return {'status': 'error', 'message': f'Agent propose failed: {e}'}
-  finally:
-    conn.close()
-
-
-def _agent_key_ok():
-  """Shared secret AGENT_API_KEY (Anvil Secrets) in the X-Agent-Key header."""
-  import anvil.secrets
-  key = (anvil.server.request.headers or {}).get('x-agent-key')
-  try:
-    expected = anvil.secrets.get_secret('AGENT_API_KEY')
-  except Exception:
-    expected = None
-  return bool(expected) and key == expected
-
-
-@anvil.server.http_endpoint('/agent/propose', methods=['POST'])
-def agent_propose_endpoint(**kwargs):
-  """titan-ai-service calls this at AGENT_RUN_TIME. Launches the
-  background run and returns its task_id; poll /agent/status."""
-  if not _agent_key_ok():
-    return anvil.server.HttpResponse(401, 'unauthorized')
-  body = anvil.server.request.body_json or {}
-  return ship_plan_agent_propose(body.get('plan_date'), bool(body.get('force')))
+      return int(float(p.get(k, d)))
+    except (TypeError, ValueError):
+      return int(d)
+  def _names(k):
+    return [s.strip() for s in str(p.get(k, '') or '').split(',') if s.strip()]
+  return {'enabled': str(p.get('RETRO_ENABLED', '1')).strip() == '1',
+          'max_q': max(0, _i('RETRO_MAX_QUESTIONS', 3)),
+          'min_sales': max(0, _i('RETRO_MIN_SALES_QUESTIONS', 1)),
+          'unplanned_min': float(p.get('RETRO_UNPLANNED_MIN_INCHES', 50) or 50),
+          'unknown_days': max(1, _i('RETRO_UNKNOWN_AFTER_DAYS', 5)),
+          'pc_owners': _names('RETRO_PC_OWNERS'),
+          'sales_owners': _names('RETRO_SALES_OWNERS'),
+          'fill_pct': max(0.0, min(float(p.get('AGENT_FILL_PCT', 80) or 80), 100.0)) / 100.0}
 
 
 def _jsonable(v):
-  """Deep make_serializable — HTTP endpoints return JSON, and the task
-  result carries dates (ship_by) and Decimals."""
   if isinstance(v, dict):
     return {k: _jsonable(x) for k, x in v.items()}
   if isinstance(v, (list, tuple)):
@@ -2328,182 +127,848 @@ def _jsonable(v):
   return make_serializable(v)
 
 
-@anvil.server.http_endpoint('/agent/status', methods=['GET'])
-def agent_status_endpoint(task_id=None, **kwargs):
-  if not _agent_key_ok():
-    return anvil.server.HttpResponse(401, 'unauthorized')
-  return _jsonable(ship_plan_agent_task_status(task_id))
+def _fmt_day(d):
+  return d.strftime('%a %m/%d')
+
+
+def _role_of(actor, rp):
+  a = (actor or '').lower()
+  if any(n.lower() in a for n in rp['sales_owners']):
+    return 'SALES'
+  if any(n.lower() in a for n in rp['pc_owners']):
+    return 'PC'
+  if 'sales' in a:
+    return 'SALES'
+  return 'PC'          # PC owns the plan; unknown removers default here
+
+
+def _owners(role, rp):
+  names = rp['sales_owners'] if role == 'SALES' else rp['pc_owners']
+  return ', '.join(names) if names else ('Sales' if role == 'SALES' else 'Production Control')
+
+
+# =============================================================================
+# THE MORNING RUN
+# =============================================================================
+
+def _retro_run_impl(plan_date=None, force=False, actor=None):
+  """Review one published day. Idempotent: unanswered rows for the day are
+  rebuilt; answered rows and the header's narrative survive a rerun."""
+  actor = actor or _current_actor()
+  plan_date = _parse_date(plan_date) if plan_date else _prev_business_day()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    rp = _retro_params(cursor)
+    if not rp['enabled'] and not force:
+      return {'status': 'skipped', 'message': 'RETRO_ENABLED is 0.'}
+
+    # --- the published snapshot = what we said we'd do -----------------
+    cursor.execute("""
+        SELECT MAX(revision_no) AS rev FROM dbo.pc_plan_flag_snapshot
+        WHERE plan_date = %s AND revision_no >= 0
+    """, (plan_date,))
+    rev = (cursor.fetchone() or {}).get('rev')
+    if rev is None:
+      return {'status': 'skipped', 'plan_date': plan_date.isoformat(),
+              'message': f'{plan_date} has no published snapshot - nothing to review.'}
+    cursor.execute("""
+        SELECT plan_status, capacity_inches, published_at FROM dbo.pc_ship_plan
+        WHERE plan_date = %s
+    """, (plan_date,))
+    hdr = cursor.fetchone() or {}
+    published_at = hdr.get('published_at')
+    cap_in = float(hdr.get('capacity_inches') or 0)
+    reserve_in = round(cap_in * (1.0 - rp['fill_pct']), 2) if cap_in else None
+
+    cursor.execute("""
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, was_planned, tier,
+               is_gated, priority_score, flag_codes, ship_by_date, qty_open, load_inches
+        FROM dbo.pc_plan_flag_snapshot
+        WHERE plan_date = %s AND revision_no = %s
+    """, (plan_date, rev))
+    snap = cursor.fetchall()
+    planned = [s for s in snap if s['was_planned']]
+    unplanned_pool = [s for s in snap if not s['was_planned']]
+
+    # v1.2.1 (Dave, 2026-09-08): plan POSITION = the order the floor saw.
+    # Same ordering as sp_stamp_plan_work_orders (tier, position, load DESC)
+    # so the first retro question is about the line released first.
+    cursor.execute("""
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
+               ROW_NUMBER() OVER (ORDER BY CASE tier WHEN 'Must' THEN 0
+                                                     WHEN 'Next' THEN 1 ELSE 2 END,
+                                           position, load_inches DESC) AS pos
+        FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND line_status IN ('Planned', 'Proposed', 'Confirmed')
+    """, (plan_date,))
+    plan_pos, plan_pos_sku = {}, {}
+    for r in cursor.fetchall():
+      plan_pos[_lk(r)] = int(r['pos'])
+      plan_pos_sku.setdefault((r['nx_order_numb'], r['nx_sku']), int(r['pos']))
+
+    # --- what the records say now -------------------------------------
+    # 066: one row per e21 line; "balance" = the ORDERED quantity (orditem.qty),
+    # the same basis as the snapshot's qty_open. An (order, sku) aggregate
+    # serves pre-066 snapshot rows.
+    cursor.execute("""
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
+               ISNULL(nx_qty_ordered, nx_qty_balance_due) AS balance,
+               nx_item_status AS item_status,
+               CAST(COALESCE(nx_dship_by_date, nx_hship_by_date) AS DATE) AS ship_by
+        FROM dbo.sales_orders_due
+    """)
+    book, book_sku = {}, {}
+    for r in cursor.fetchall():
+      book[_lk(r)] = r
+      a = book_sku.get((r['nx_order_numb'], r['nx_sku']))
+      if a is None:
+        book_sku[(r['nx_order_numb'], r['nx_sku'])] = dict(r)
+      else:
+        a['balance'] = float(a['balance'] or 0) + float(r['balance'] or 0)
+        a['item_status'] = max(a['item_status'] or '', r['item_status'] or '')
+        if r['ship_by'] and (a['ship_by'] is None or r['ship_by'] < a['ship_by']):
+          a['ship_by'] = r['ship_by']
+
+    cursor.execute("""
+        SELECT wo.sales_order_number AS o, wo.sales_order_rel AS rel,
+               CAST(wo.sales_order_line AS VARCHAR(10)) AS item, wo.part_number AS s,
+               MAX(CASE WHEN wo.status IN ('Complete','Shipped - Verify','Closed - Verify')
+                         AND wo.completed_at >= %s THEN 1 ELSE 0 END) AS done_since,
+               MAX(CASE WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END)   AS touched,
+               MAX(wo.status) AS wo_status
+        FROM dbo.work_orders wo
+        LEFT JOIN dbo.work_order_events e
+               ON e.work_order_id = wo.work_order_id
+              AND e.event_type IN ('Assign','Start','Complete','Restart')
+              AND CAST(e.event_at AS DATE) = %s
+        WHERE wo.status <> 'Cancelled'
+        GROUP BY wo.sales_order_number, wo.sales_order_rel, wo.sales_order_line, wo.part_number
+    """, (plan_date, plan_date))
+    wos, wos_sku = {}, {}
+    for r in cursor.fetchall():
+      wos[(r['o'], r['rel'], r['item'])] = r
+      a = wos_sku.get((r['o'], r['s']))
+      if a is None:
+        wos_sku[(r['o'], r['s'])] = dict(r)
+      else:
+        a['done_since'] = max(a['done_since'], r['done_since'])
+        a['touched'] = max(a['touched'], r['touched'])
+
+    # --- what Order Entry changed since publish (v1.2) -----------------
+    # dbo.work_order_changes: the EM job diffs every work order against its
+    # sales-order line every 15 min. Time-stamped evidence the open book
+    # cannot give: SO_Shipped (when), SO_Canceled / SO_Removed (gone but
+    # NOT shipped), FIELD_CHANGE due_date / quantity (old -> new, when).
+    since = published_at or datetime.combine(plan_date, datetime.min.time())
+    cursor.execute("""
+        SELECT wo.sales_order_number AS o, wo.sales_order_rel AS rel,
+               CAST(wo.sales_order_line AS VARCHAR(10)) AS item, wo.part_number AS s,
+               c.change_type, c.field_name, c.old_value, c.new_value, c.detected_at
+        FROM dbo.work_order_changes c
+        JOIN dbo.work_orders wo ON wo.work_order_id = c.work_order_id
+        WHERE c.detected_at >= %s
+          AND (c.change_type IN ('SO_Shipped', 'SO_Canceled', 'SO_Removed')
+               OR (c.change_type = 'FIELD_CHANGE'
+                   AND c.field_name IN ('due_date', 'quantity')))
+        ORDER BY c.detected_at
+    """, (since,))
+    changes, changes_sku = {}, {}
+    for c in cursor.fetchall():
+      changes.setdefault((c['o'], c['rel'], c['item']), []).append(c)
+      changes_sku.setdefault((c['o'], c['s']), []).append(c)
+
+    def _chg(s, *types, field=None):
+      k = _lk(s)
+      lst = changes.get(k, ()) if k[2] else changes_sku.get((s['nx_order_numb'], s['nx_sku']), ())
+      return [c for c in lst
+              if c['change_type'] in types and (field is None or c['field_name'] == field)]
+
+    def _hm(dt):
+      return dt.strftime('%H:%M') if dt else '?'
+
+    cursor.execute("""
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, event_type, actor, note,
+               new_value, event_time
+        FROM dbo.pc_plan_line_events
+        WHERE plan_date = %s AND event_type IN ('Removed','TierChange','OrderRemoved')
+          AND nx_order_numb IS NOT NULL
+        ORDER BY event_time
+    """, (plan_date,))
+    removals, removals_sku = {}, {}
+    for e in cursor.fetchall():
+      if published_at and e['event_time'] and e['event_time'] < published_at:
+        continue                       # pre-publish edits are the plan, not a variance
+      if e.get('nx_item_no'):
+        removals[_lk(e)] = e
+      removals_sku[(e['nx_order_numb'], e['nx_sku'])] = e
+
+    # --- classify every planned line ----------------------------------
+    rows, counts = [], {'SHIPPED': 0, 'WORKED': 0, 'REMOVED_WITH_REASON': 0,
+                        'REMOVED_NO_REASON': 0, 'UNTOUCHED': 0,
+                        'UNTOUCHED_STRETCH': 0, 'DATE_MOVED': 0, 'UNPLANNED_SHIP': 0,
+                        'CANCELLED': 0, 'QTY_CHANGED': 0, 'PARTIAL_ORDER': 0}
+    planned_in = moved_in = 0.0
+    n_stretch = 0
+    for s in planned:
+      key = (s['nx_order_numb'], s['nx_sku'])       # display / ledger key
+      lkey = _lk(s)                                  # 066: the e21 line
+      tier = s['tier'] or 'Next'
+      load = float(s['load_inches'] or 0)
+      qty0 = float(s['qty_open'] or 0)
+      if tier == 'Stretch':
+        n_stretch += 1
+      else:
+        planned_in += load
+      b = _look(book, book_sku, s)
+      w = _look(wos, wos_sku, s)
+      bal = float(b['balance'] or 0) if b else 0.0
+      # 2026-09-07 test: item status 15 (Material Received/Shipped) is NOT a
+      # shipped signal by itself - 86 candidate lines sat at 15 before the
+      # plan existed. Until the snapshot records the status at publish,
+      # shipped = the line left the open book or its balance dropped.
+      shp = _chg(s, 'SO_Shipped')
+      cxl = _chg(s, 'SO_Canceled', 'SO_Removed')
+      qch = _chg(s, 'FIELD_CHANGE', field='quantity')
+      dch = _chg(s, 'FIELD_CHANGE', field='due_date')
+      # v1.2: the change log outranks the open-book inference. A line that
+      # left the book because Order Entry cancelled it did not ship; a
+      # balance that dropped because the quantity was edited did not ship.
+      cancelled = bool(cxl) and not shp
+      qty_edited = bool(qch) and not shp and b is not None
+      shipped = bool(shp) or ((b is None or bal < qty0 - 0.001)
+                              and not cancelled and not qty_edited)
+      worked = bool(w and (w['done_since'] or w['touched']))
+      rem = removals.get(lkey) if lkey[2] else removals_sku.get(key)
+      late = (s['ship_by_date'] and s['ship_by_date'] < plan_date)
+      # date moved: the change log (old -> new, when) or the open book
+      new_ship_by = None
+      if dch:
+        try:
+          new_ship_by = date.fromisoformat((dch[-1]['new_value'] or '')[:10])
+        except ValueError:
+          new_ship_by = None
+      if new_ship_by is None and b is not None and b['ship_by'] and s['ship_by_date'] \
+      and b['ship_by'] != s['ship_by_date']:
+        new_ship_by = b['ship_by']
+      date_moved = bool(new_ship_by and s['ship_by_date'] and new_ship_by != s['ship_by_date'])
+      base = (f"{tier} on {_fmt_day(plan_date)}, {load:,.0f} in"
+              + (f", late since {s['ship_by_date']:%m-%d}" if late else '')
+              + (f", flags {s['flag_codes']}" if s.get('flag_codes') else ''))
+      row = {'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+             'line': _line_txt(s), 'tier': tier, 'load': load,
+             'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
+             'pos': (plan_pos.get(lkey) if lkey[2] else plan_pos_sku.get(key)) or 10 ** 6,
+             'expected': 'SHIPPED', 'expected_value': qty0,
+             'actual_value': (None if b is None else bal),
+             'observed': False, 'case': None, 'routed_to': None,
+             'explanation': base, 'question': None, 'asked_to': None,
+             'cause_key': None, 'resolution': 'OPEN', 'removed_by_role': None}
+      if cancelled:
+        c0 = cxl[-1]
+        row.update(case='CANCELLED', observed=True, routed_to='SALES',
+                   explanation=base + f"; {c0['change_type']} at {_hm(c0['detected_at'])} "
+                   "per the work-order change log - left the book, did not ship",
+                   question=(f"Order {_line_txt(s)} was {tier} on {_fmt_day(plan_date)} "
+                             f"and was cancelled/removed at {_hm(c0['detected_at'])} after the plan "
+                             "was published. Customer cancellation, or an entry change?"))
+      elif shipped:
+        row.update(case='SHIPPED', observed=True, resolution='EXPLAINED',
+                   explanation=base + (f"; shipped {_hm(shp[-1]['detected_at'])} per the "
+                                       "work-order change log" if shp else
+                                       '; line left the open book' if b is None else
+                                       f"; balance {qty0:,.0f} -> {bal:,.0f}"))
+        if tier != 'Stretch':
+          moved_in += load
+      elif qty_edited:
+        q0 = qch[-1]
+        row.update(case='QTY_CHANGED', observed=True, routed_to='SALES',
+                   explanation=base + f"; quantity {q0['old_value']} -> {q0['new_value']} at "
+                   f"{_hm(q0['detected_at'])} per the work-order change log - not a shipment",
+                   question=(f"Order {_line_txt(s)} quantity changed from {q0['old_value']} "
+                             f"to {q0['new_value']} at {_hm(q0['detected_at'])} after "
+                             f"{_fmt_day(plan_date)}'s plan was published. Customer change, "
+                             "or an entry correction?"))
+      elif worked:
+        row.update(case='WORKED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
+                   explanation=base + f"; work order {w['wo_status']}"
+                   + (' completed since the plan day' if w['done_since'] else ' had floor activity on the day'))
+        if tier != 'Stretch':
+          moved_in += load
+      elif rem:
+        role = _role_of(rem['actor'], rp)
+        reason = (rem['note'] or '').strip()
+        when = rem['event_time'].strftime('%H:%M') if rem['event_time'] else ''
+        if reason:
+          row.update(case='REMOVED_WITH_REASON', expected='WORKED_ON', resolution='EXPLAINED',
+                     removed_by_role=role, cause_key=None,
+                     explanation=base + f"; {rem['event_type']} at {when} by {rem['actor']}: {reason}")
+        else:
+          row.update(case='REMOVED_NO_REASON', expected='WORKED_ON', routed_to=role,
+                     removed_by_role=role,
+                     explanation=base + f"; {rem['event_type']} at {when} by {rem['actor']}, no reason recorded",
+                     question=(f"Order {_line_txt(s)} was removed from {_fmt_day(plan_date)}'s "
+                               f"plan at {when} with no reason recorded. What was the reason?"))
+      elif tier == 'Stretch':
+        row.update(case='UNTOUCHED_STRETCH', expected='WORKED_ON', resolution='EXPLAINED',
+                   explanation=base + '; Stretch line not reached (no question)')
+      elif date_moved:
+        # v1.2: Sales moved the date after publish - the PC question
+        # ('what stopped it?') is stale; the DATE_MOVED row below asks Sales.
+        row.update(case='UNTOUCHED', expected='WORKED_ON', resolution='EXPLAINED',
+                   explanation=base + f"; no activity, but ship-by moved to {new_ship_by:%m/%d} "
+                   "after publish - Sales is asked instead")
+      else:
+        row.update(case='UNTOUCHED', expected='WORKED_ON', routed_to='PC',
+                   explanation=base + '; no shipment and no work-order activity recorded',
+                   question=(f"Order {_line_txt(s)} was {tier} on {_fmt_day(plan_date)} "
+                             f"({load:,.0f} in" + (f", late since {s['ship_by_date']:%m-%d}" if late else '')
+                             + ") and shows no shipment or work-order activity. "
+                             "Was it started? If not, what stopped it?"))
+      counts[row['case']] += 1
+      rows.append(row)
+
+      # date moved is a SECOND row for the same line (different 'expected')
+      if date_moved and not cancelled:
+        counts['DATE_MOVED'] += 1
+        when = f" at {_hm(dch[-1]['detected_at'])}" if dch else ''
+        rows.append({'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+                     'line': _line_txt(s), 'tier': tier, 'load': load,
+                     'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
+                     'expected': 'DATE_HELD', 'expected_value': None, 'actual_value': None,
+                     'observed': bool(dch), 'case': 'DATE_MOVED', 'routed_to': 'SALES',
+                     'explanation': (f"ship-by at publish {s['ship_by_date']:%m/%d}, now "
+                                     f"{new_ship_by:%m/%d}" + (f", changed{when} per the "
+                                                               "work-order change log" if dch else '')),
+                     'question': (f"Order {_line_txt(s)} ship-by moved from "
+                                  f"{s['ship_by_date']:%m/%d} to {new_ship_by:%m/%d}{when} after "
+                                  f"{_fmt_day(plan_date)}'s plan was published. Customer change, "
+                                  "or an entry correction?"),
+                     'asked_to': None, 'cause_key': None, 'resolution': 'OPEN',
+                     'removed_by_role': None})
+
+    # --- WHOLE-ORDER RULE (Dave, 2026-09-13): partial orders at publish ---
+    # From the snapshot alone: a planned line's same-due-date siblings that
+    # were NOT on the plan. One ledger row per missing sibling, case
+    # PARTIAL_ORDER, routed to PC, no question (measured, not asked - the
+    # Publish check already offered "Add the rest"). A PartialAck event at
+    # publish means PC knew and chose to; the row says so and closes as
+    # EXPLAINED. A sibling that shipped anyway is NOT an UNPLANNED_SHIP
+    # (no rush question to Sales) - it is this.
+    cursor.execute("""
+        SELECT DISTINCT nx_order_numb FROM dbo.pc_plan_line_events
+        WHERE plan_date = %s AND event_type = 'PartialAck'
+    """, (plan_date,))
+    acked = {r['nx_order_numb'] for r in cursor.fetchall()}
+    planned_groups = {(s['nx_order_numb'], str(s['ship_by_date'] or '')[:10])
+                      for s in planned}
+    partial_keys = set()
+    for s in unplanned_pool:
+      gk = (s['nx_order_numb'], str(s['ship_by_date'] or '')[:10])
+      if gk not in planned_groups:
+        continue
+      key = (s['nx_order_numb'], s['nx_sku'])
+      lkey = _lk(s)
+      partial_keys.add(lkey)
+      load = float(s['load_inches'] or 0)
+      b = _look(book, book_sku, s)
+      shipped_anyway = bool(_chg(s, 'SO_Shipped')) or b is None
+      knew = key[0] in acked
+      counts['PARTIAL_ORDER'] += 1
+      rows.append({'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+                   'line': _line_txt(s), 'tier': None, 'load': load,
+                   'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
+                   'expected': 'ON_PLAN', 'expected_value': float(s['qty_open'] or 0),
+                   'actual_value': (None if b is None else float(b['balance'] or 0)),
+                   'observed': shipped_anyway, 'case': 'PARTIAL_ORDER', 'routed_to': 'PC',
+                   'explanation': (f"whole-order rule: sibling of a planned line (order "
+                                   f"{key[0]}, due {gk[1]}) was left off the plan, {load:,.0f} in"
+                                   + ('; PC published anyway (acknowledged)' if knew else '')
+                                   + ('; shipped anyway' if shipped_anyway else '; did not ship')),
+                   'question': None, 'asked_to': None, 'cause_key': None,
+                   'resolution': ('EXPLAINED' if knew else 'OPEN'),
+                   'removed_by_role': None})
+
+    # --- demand side: shipped without being planned --------------------
+    unplanned_in, n_unplanned_all = 0.0, 0
+    for s in unplanned_pool:
+      key = (s['nx_order_numb'], s['nx_sku'])
+      lkey = _lk(s)
+      if lkey in partial_keys:
+        continue                       # whole-order rule: that is a PARTIAL_ORDER row
+      load = float(s['load_inches'] or 0)
+      if load <= 0:
+        continue                       # zero-touch never counts against the reserve
+      qty0 = float(s['qty_open'] or 0)
+      b = _look(book, book_sku, s)
+      bal = float(b['balance'] or 0) if b else 0.0
+      shp = _chg(s, 'SO_Shipped')
+      if _chg(s, 'SO_Canceled', 'SO_Removed') and not shp:
+        continue                       # v1.2: cancelled, not shipped
+      if _chg(s, 'FIELD_CHANGE', field='quantity') and not shp and b is not None:
+        continue                       # v1.2: quantity edited, not shipped
+      shipped = bool(shp) or (b is None) or (bal < qty0 - 0.001)   # status 15 alone: no
+      if not shipped:
+        continue
+      n_unplanned_all += 1
+      unplanned_in += load
+      if load >= rp['unplanned_min']:
+        counts['UNPLANNED_SHIP'] += 1
+        rows.append({'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+                     'line': _line_txt(s), 'tier': None, 'load': load,
+                     'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
+                     'expected': 'ON_PLAN', 'expected_value': qty0,
+                     'actual_value': (None if b is None else bal), 'observed': True,
+                     'case': 'UNPLANNED_SHIP', 'routed_to': 'SALES',
+                     'explanation': (f"not on {_fmt_day(plan_date)}'s plan, {load:,.0f} in, "
+                                     + ('gated at publish' if s['is_gated'] else f"score {int(s['priority_score'] or 0)}")
+                                     + '; shipped anyway'),
+                     'question': (f"Order {_line_txt(s)} ({load:,.0f} in) shipped on "
+                                  f"{_fmt_day(plan_date)}"
+                                  + (f" at {_hm(shp[-1]['detected_at'])}" if shp else '')
+                                  + " without being on the plan. Was this a "
+                                  "customer-requested rush, and when was it requested?"),
+                     'asked_to': None, 'cause_key': None, 'resolution': 'OPEN',
+                     'removed_by_role': None})
+
+    # --- ration the questions: max_q total, min_sales floor ------------
+    order_key = {'UNTOUCHED': 0, 'REMOVED_NO_REASON': 1, 'UNPLANNED_SHIP': 2,
+                 'CANCELLED': 3, 'QTY_CHANGED': 4, 'DATE_MOVED': 5, 'PARTIAL_ORDER': 6}
+    def _rank(r):
+      # v1.2.1: planned lines rank by PLAN POSITION (the order the floor
+      # saw on the Production grid), not by priority_score - one 'most
+      # important' order for the day. Unplanned/demand rows keep score, load.
+      return (order_key.get(r['case'], 9), 0 if r['tier'] == 'Must' else 1,
+              r.get('pos', 10 ** 6), -r['score'], -r['load'])
+    askable = sorted([r for r in rows if r['question']], key=_rank)
+    sales_q = [r for r in askable if r['routed_to'] == 'SALES']
+    pc_q = [r for r in askable if r['routed_to'] != 'SALES']
+    chosen = []
+    floor = min(rp['min_sales'], len(sales_q), rp['max_q'])
+    chosen += sales_q[:floor]
+    for r in askable:
+      if len(chosen) >= rp['max_q']:
+        break
+      if r not in chosen:
+        chosen.append(r)
+    for i, r in enumerate(askable, start=1):
+      r['rank'] = i
+    for r in chosen:
+      r['asked'] = True
+      r['asked_to'] = _owners(r['routed_to'], rp)
+
+    # --- write the ledger (keep answered rows) -------------------------
+    cursor.execute("""
+        DELETE FROM dbo.pc_plan_variance
+        WHERE plan_date = %s AND answer_text IS NULL AND reading_confirmed_at IS NULL
+    """, (plan_date,))
+    cursor.execute("""
+        SELECT nx_order_numb, nx_sku, nx_rel_numb, nx_item_no, expected
+        FROM dbo.pc_plan_variance WHERE plan_date = %s
+    """, (plan_date,))
+    kept = {(r['nx_order_numb'], r['nx_sku'], r['nx_rel_numb'] or '', r['nx_item_no'] or '',
+             r['expected']) for r in cursor.fetchall()}
+    n_ins = 0
+    for r in rows:
+      if (r['order'], r['sku'], r.get('rel') or '', r.get('item') or '', r['expected']) in kept:
+        continue
+      asked = bool(r.get('asked'))
+      cursor.execute("""
+          INSERT INTO dbo.pc_plan_variance
+              (plan_date, nx_order_numb, nx_sku, nx_rel_numb, nx_item_no,
+               expected, expected_value, actual_value,
+               actual_observed, variance_kind, routed_to, system_explanation,
+               question_text, asked_to, asked_at, cause_key, resolution, resolved_at,
+               variance_case, tier, load_inches, question_rank, removed_by_role,
+               evidence_class)
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'UNCLASSIFIED', %s, %s,
+                  %s, %s, CASE WHEN %s = 1 THEN GETDATE() END, %s, %s,
+                  CASE WHEN %s = 1 THEN GETDATE() END,
+                  %s, %s, %s, %s, %s, %s)
+      """, (plan_date, r['order'], r['sku'], (r.get('rel') or None), (r.get('item') or None),
+            r['expected'], r['expected_value'],
+            r['actual_value'], 1 if r['observed'] else 0, r['routed_to'],
+            r['explanation'][:500], (r['question'][:500] if r['question'] else None),
+            (r['asked_to'] if asked else None), (1 if asked else 0),
+            r['cause_key'], r['resolution'],
+            (1 if r['resolution'] != 'OPEN' else 0),
+            r['case'], r['tier'], round(r['load'], 2), r.get('rank'), r['removed_by_role'],
+            ('Probable' if r['resolution'] == 'EXPLAINED' else None)))
+      n_ins += 1
+
+    # --- header ---------------------------------------------------------
+    n_planned = len([s for s in planned if (s['tier'] or 'Next') != 'Stretch'])
+    reserve_used = (round(unplanned_in / reserve_in * 100.0, 2) if reserve_in else None)
+    cursor.execute("""
+        MERGE dbo.pc_plan_retro AS t
+        USING (SELECT %s AS plan_date) AS s ON t.plan_date = s.plan_date
+        WHEN MATCHED THEN UPDATE SET run_at = SYSDATETIME(), revision_no = %s,
+             n_planned = %s, n_stretch = %s, n_shipped = %s, n_worked = %s,
+             n_removed_reason = %s, n_removed_noreason = %s, n_untouched = %s,
+             n_date_moved = %s, n_unplanned_ship = %s, n_questions_asked = %s,
+             planned_inches = %s, moved_inches = %s, unplanned_inches = %s,
+             reserve_inches = %s, reserve_used_pct = %s, run_by = %s
+        WHEN NOT MATCHED THEN INSERT
+             (plan_date, revision_no, n_planned, n_stretch, n_shipped, n_worked,
+              n_removed_reason, n_removed_noreason, n_untouched, n_date_moved,
+              n_unplanned_ship, n_questions_asked, planned_inches, moved_inches,
+              unplanned_inches, reserve_inches, reserve_used_pct, run_by)
+             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+    """, (plan_date,
+          rev, n_planned, n_stretch, counts['SHIPPED'], counts['WORKED'],
+          counts['REMOVED_WITH_REASON'], counts['REMOVED_NO_REASON'], counts['UNTOUCHED'],
+          counts['DATE_MOVED'], n_unplanned_all, len(chosen),
+          round(planned_in, 2), round(moved_in, 2), round(unplanned_in, 2),
+          reserve_in, reserve_used, actor,
+          plan_date, rev, n_planned, n_stretch, counts['SHIPPED'], counts['WORKED'],
+          counts['REMOVED_WITH_REASON'], counts['REMOVED_NO_REASON'], counts['UNTOUCHED'],
+          counts['DATE_MOVED'], n_unplanned_all, len(chosen),
+          round(planned_in, 2), round(moved_in, 2), round(unplanned_in, 2),
+          reserve_in, reserve_used, actor))
+    # --- 067: the day's ACTUAL crew and capacity (pro-rated attendance) ---
+    # Same formula as vw_pc_capacity_day, on the plan date's credited
+    # attendance (vw_em_assembler_credit): day override > standing factor x
+    # credit > credit. Stored beside the stamped (morning) capacity so the
+    # calibration can compare shipped inches with hours actually worked.
+    crew_actual = cap_actual = None
+    try:
+      cursor.execute("""
+          SELECT SUM(COALESCE(o.capacity_factor,
+                              r.default_capacity_factor * ISNULL(c.credit, 0),
+                              ISNULL(c.credit, 0))) AS crew
+          FROM dbo.em_assembler_roster r
+          LEFT JOIN dbo.vw_em_assembler_credit c
+                 ON c.employee_id = r.employee_id AND c.status_date = %s
+          LEFT JOIN dbo.pc_assembler_day_override o
+                 ON o.employee_id = r.employee_id AND o.override_date = %s
+          WHERE r.end_date IS NULL
+            AND (r.start_date IS NULL OR r.start_date <= %s)
+      """, (plan_date, plan_date, plan_date))
+      crew_actual = float((cursor.fetchone() or {}).get('crew') or 0)
+      cursor.execute("""
+          SELECT MAX(CASE WHEN pw.factor_code = 'ST_STD' THEN pw.factor_value END) AS st_std,
+                 MAX(CASE WHEN pw.factor_code = 'BASE_OVERHEAD' THEN pw.factor_value END) AS base_hrs
+          FROM dbo.pc_weight_set ws JOIN dbo.pc_weight pw ON pw.weight_set_id = ws.weight_set_id
+          WHERE ws.retired_date IS NULL
+      """)
+      w = cursor.fetchone() or {}
+      p = _get_params(cursor)
+      hours = float(p.get('HOURS_PER_DAY', 8.0)); eff = float(p.get('EFFICIENCY_FACTOR', 1.2)) or 1.0
+      st_std = float(w.get('st_std') or 0); base = float(w.get('base_hrs') or 0)
+      if st_std:
+        cap_actual = round(crew_actual * (hours * 60.0 - base * 60.0 / 5.0) / eff / st_std, 1)
+      cursor.execute("""
+          UPDATE dbo.pc_plan_retro SET crew_actual = %s, capacity_actual_inches = %s
+          WHERE plan_date = %s
+      """, (round(crew_actual, 2), cap_actual, plan_date))
+    except Exception:
+      pass                          # 067 not applied yet, or no attendance: the retro still stands
+    conn.commit()
+
+    return _jsonable({
+      'status': 'success', 'plan_date': plan_date.isoformat(), 'revision_no': rev,
+      'version': _RETRO_VERSION, 'capacity_inches': cap_in,
+      'crew_actual': crew_actual, 'capacity_actual_inches': cap_actual,
+      'n_planned': n_planned, 'n_stretch': n_stretch, 'counts': counts,
+      'n_unplanned_all': n_unplanned_all,
+      'planned_inches': round(planned_in, 1), 'moved_inches': round(moved_in, 1),
+      'unplanned_inches': round(unplanned_in, 1), 'reserve_inches': reserve_in,
+      'reserve_used_pct': reserve_used,
+      'n_questions': len(chosen), 'n_askable': len(askable), 'rows_written': n_ins,
+      'questions': [{'order': r['order'], 'sku': r['sku'], 'item': r.get('item'),
+                     'line': r.get('line'), 'case': r['case'],
+                     'to': r['routed_to'], 'owners': r['asked_to'], 'rank': r['rank'],
+                     'text': r['question']} for r in chosen],
+      'not_asked': [{'order': r['order'], 'sku': r['sku'], 'item': r.get('item'),
+                     'line': r.get('line'), 'case': r['case'],
+                     'to': r['routed_to'], 'rank': r['rank'], 'text': r['question']}
+                    for r in askable if r not in chosen],
+      'lines': [{'order': r['order'], 'sku': r['sku'], 'item': r.get('item'),
+                 'line': r.get('line'), 'tier': r['tier'], 'load': r['load'],
+                 'case': r['case'], 'explanation': r['explanation']}
+                for r in rows if r['expected'] != 'DATE_HELD']})
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Retro run failed: {e}'}
+  finally:
+    conn.close()
 
 
 @anvil.server.callable
-def ship_plan_confirm_line(plan_date, order, rel, item):
-  """PC accepts one Proposed line: it becomes Planned, tier unchanged."""
-  plan_date = _parse_date(plan_date)
-  actor = _current_actor()
+def retro_run(plan_date=None, force=False):
+  return _retro_run_impl(plan_date, force)
+
+
+@anvil.server.http_endpoint('/agent/retro', methods=['POST'])
+def agent_retro_endpoint(**kwargs):
+  """titan-ai-service calls this at 06:30 (before the proposal). Runs
+  synchronously - one day, a handful of queries."""
+  if not _agent_key_ok():
+    return anvil.server.HttpResponse(401, 'unauthorized')
+  body = anvil.server.request.body_json or {}
+  return _retro_run_impl(body.get('plan_date'), bool(body.get('force')), actor='agent')
+
+
+# =============================================================================
+# THE RETRO FORM
+# =============================================================================
+
+@anvil.server.callable
+def retro_get_day(plan_date=None):
+  """Everything the Retro form shows for one day, plus Dave's queue across
+  all days and the cause list."""
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    rp = _retro_params(cursor)
+    if plan_date:
+      plan_date = _parse_date(plan_date)
+    else:
+      cursor.execute("SELECT MAX(plan_date) AS d FROM dbo.pc_plan_retro")
+      plan_date = (cursor.fetchone() or {}).get('d') or _prev_business_day()
+    cursor.execute("SELECT * FROM dbo.pc_plan_retro WHERE plan_date = %s", (plan_date,))
+    hdr = cursor.fetchone()
+    cursor.execute("""
+        SELECT v.*, k.label AS proposed_cause_label
+        FROM dbo.pc_plan_variance v
+        LEFT JOIN dbo.pc_plan_cause_keys k ON k.cause_key = v.proposed_cause_key
+        WHERE v.plan_date = %s
+        ORDER BY CASE WHEN v.asked_at IS NOT NULL THEN 0
+                      WHEN v.question_text IS NOT NULL THEN 1 ELSE 2 END,
+                 v.question_rank, v.load_inches DESC
+    """, (plan_date,))
+    rows = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.nx_rel_numb,
+               v.nx_item_no, v.variance_case,
+               v.routed_to, v.question_text, v.answer_text, v.answered_by, v.answered_at,
+               v.proposed_reading, v.proposed_evidence_class, v.proposed_cause_key
+        FROM dbo.pc_plan_variance v
+        WHERE v.answer_text IS NOT NULL AND v.reading_confirmed_at IS NULL
+          AND v.resolution IN ('OPEN','DISPUTED')
+        ORDER BY v.answered_at
+    """)
+    queue = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT cause_key, label, side, variance_kind FROM dbo.pc_plan_cause_keys
+        WHERE is_active = 1 ORDER BY sort_order
+    """)
+    causes = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT cause_key, COUNT(*) AS n
+        FROM dbo.pc_plan_variance
+        WHERE cause_key IS NOT NULL AND reading_confirmed_at IS NOT NULL
+          AND evidence_class IN ('Verified','Probable')
+          AND plan_date >= DATEADD(day, -14, %s)
+        GROUP BY cause_key ORDER BY n DESC
+    """, (plan_date,))
+    week = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("SELECT MIN(plan_date) AS lo, MAX(plan_date) AS hi FROM dbo.pc_plan_retro")
+    rng = cursor.fetchone() or {}
+    cursor.execute("""
+        SELECT TOP 15 r.plan_date,
+               (SELECT COUNT(*) FROM dbo.pc_plan_variance v
+                WHERE v.plan_date = r.plan_date AND v.asked_at IS NOT NULL
+                  AND v.answer_text IS NULL AND v.resolution = 'OPEN') AS n_open
+        FROM dbo.pc_plan_retro r ORDER BY r.plan_date DESC
+    """)
+    days = [{'plan_date': make_serializable(d['plan_date']), 'n_open': int(d['n_open'] or 0)}
+            for d in cursor.fetchall()]
+    n_open = {'PC': 0, 'SALES': 0}
+    for v in rows:
+      if v.get('asked_at') and not v.get('answer_text') and v.get('resolution') == 'OPEN':
+        n_open['SALES' if v.get('routed_to') == 'SALES' else 'PC'] += 1
+    return {'status': 'success', 'plan_date': plan_date.isoformat(),
+            'header': serialize_row(hdr) if hdr else None,
+            'variances': rows, 'dave_queue': queue, 'causes': causes,
+            'week_causes': week, 'params': {k: v for k, v in rp.items()},
+            'answerers': {'PC': rp['pc_owners'], 'SALES': rp['sales_owners']},
+            'days': days, 'n_open': n_open,
+            'first_day': make_serializable(rng.get('lo')),
+            'last_day': make_serializable(rng.get('hi'))}
+  except Exception as e:
+    return {'status': 'error', 'message': f'{e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def retro_get_review():
+  """Dave's #retrev form: every answered-but-unconfirmed question across
+  all days (the queue), the last confirmed ones, the cause list, the
+  14-day cause counts, and which days still owe answers."""
   conn = get_connection()
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT nx_sku FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-          AND line_status = 'Proposed'
-    """, (plan_date, order, rel, item))
-    hit = cursor.fetchone()
-    if not hit:
-      return {'status': 'error', 'message': 'Line is not Proposed.'}
+        SELECT v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.nx_rel_numb,
+               v.nx_item_no, v.variance_case,
+               v.routed_to, v.tier, v.load_inches, v.system_explanation, v.question_text,
+               v.asked_to, v.answer_text, v.answered_by, v.answered_at,
+               v.proposed_reading, v.proposed_evidence_class, v.proposed_cause_key,
+               k.label AS proposed_cause_label, v.resolution
+        FROM dbo.pc_plan_variance v
+        LEFT JOIN dbo.pc_plan_cause_keys k ON k.cause_key = v.proposed_cause_key
+        WHERE v.answer_text IS NOT NULL AND v.reading_confirmed_at IS NULL
+        ORDER BY v.answered_at
+    """)
+    queue = [serialize_row(r) for r in cursor.fetchall()]
     cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-          AND line_status = 'Proposed'
-    """, (actor, plan_date, order, rel, item))
-    _log_event(cursor, plan_date, order, hit['nx_sku'], 'Confirmed', actor=actor,
-               rel=rel, item=item)
-    _bump_revision(cursor, plan_date, actor)
+        SELECT TOP 20 v.variance_id, v.plan_date, v.nx_order_numb, v.nx_sku, v.nx_rel_numb,
+               v.nx_item_no, v.variance_case,
+               v.routed_to, v.answer_text, v.answered_by, v.confirmed_reading,
+               v.evidence_class, v.cause_key, v.resolution, v.reading_confirmed_at
+        FROM dbo.pc_plan_variance v
+        WHERE v.reading_confirmed_at IS NOT NULL
+        ORDER BY v.reading_confirmed_at DESC
+    """)
+    recent = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT plan_date,
+               SUM(CASE WHEN asked_at IS NOT NULL THEN 1 ELSE 0 END) AS n_asked,
+               SUM(CASE WHEN asked_at IS NOT NULL AND answer_text IS NULL
+                         AND resolution = 'OPEN' THEN 1 ELSE 0 END) AS n_unanswered,
+               SUM(CASE WHEN answer_text IS NOT NULL AND reading_confirmed_at IS NULL
+                        THEN 1 ELSE 0 END) AS n_awaiting_dave
+        FROM dbo.pc_plan_variance
+        WHERE plan_date >= DATEADD(day, -21, CAST(GETDATE() AS DATE))
+        GROUP BY plan_date ORDER BY plan_date DESC
+    """)
+    days = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT cause_key, label, side, variance_kind FROM dbo.pc_plan_cause_keys
+        WHERE is_active = 1 ORDER BY sort_order
+    """)
+    causes = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT v.cause_key, k.label, COUNT(*) AS n
+        FROM dbo.pc_plan_variance v
+        LEFT JOIN dbo.pc_plan_cause_keys k ON k.cause_key = v.cause_key
+        WHERE v.cause_key IS NOT NULL AND v.reading_confirmed_at IS NOT NULL
+          AND v.evidence_class IN ('Verified','Probable')
+          AND v.plan_date >= DATEADD(day, -14, CAST(GETDATE() AS DATE))
+        GROUP BY v.cause_key, k.label ORDER BY n DESC
+    """)
+    week = [serialize_row(r) for r in cursor.fetchall()]
+    cursor.execute("""
+        SELECT rule_id, title, status, cause_key, recurrence_count, proposed_at
+        FROM dbo.pc_plan_rule_register
+        WHERE status IN ('PROPOSED','NEEDS_BUILD') ORDER BY proposed_at DESC
+    """)
+    rules = [serialize_row(r) for r in cursor.fetchall()]
+    return {'status': 'success', 'queue': queue, 'recent': recent, 'days': days,
+            'causes': causes, 'week_causes': week, 'rule_candidates': rules}
+  except Exception as e:
+    return {'status': 'error', 'message': f'{e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def retro_answer(variance_id, answer_text, answered_by):
+  """Free text, verbatim. Anyone can answer; the form asks who."""
+  answer_text = (answer_text or '').strip()
+  answered_by = (answered_by or '').strip() or _current_actor()
+  if not answer_text:
+    return {'status': 'error', 'message': 'Answer is empty.'}
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE dbo.pc_plan_variance
+        SET answer_text = %s, answered_by = %s, answered_at = GETDATE(),
+            proposed_reading = NULL, proposed_evidence_class = NULL,
+            proposed_cause_key = NULL
+        WHERE variance_id = %s AND reading_confirmed_at IS NULL
+    """, (answer_text[:2000], answered_by[:50], int(variance_id)))
+    if cursor.rowcount == 0:
+      return {'status': 'error', 'message': 'Question not found, or already confirmed by Dave.'}
     conn.commit()
     return {'status': 'success'}
   except Exception as e:
     conn.rollback()
-    return {'status': 'error', 'message': f'Confirm failed: {e}'}
+    return {'status': 'error', 'message': f'{e}'}
   finally:
     conn.close()
 
 
+def _arbiter_ok(pin):
+  """Dave confirms readings - always Dave. The app has no login yet, so
+  the confirm step takes a PIN held in the Anvil Secret RETRO_ARBITER_PIN.
+  No secret configured = open (first days), and the response says so."""
+  try:
+    expected = anvil.secrets.get_secret('RETRO_ARBITER_PIN')
+  except Exception:
+    expected = None
+  if not expected:
+    return True, 'no RETRO_ARBITER_PIN secret - confirm is unguarded'
+  return (str(pin or '').strip() == str(expected).strip()), None
+
+
 @anvil.server.callable
-def ship_plan_confirm_all_proposed(plan_date):
-  """PC accepts every Proposed line on the day in one go."""
-  plan_date = _parse_date(plan_date)
-  actor = _current_actor()
+def retro_confirm(variance_id, reading, evidence_class, cause_key,
+                  resolution='EXPLAINED', pin=None, note=None):
+  ok, warn = _arbiter_ok(pin)
+  if not ok:
+    return {'status': 'error', 'message': 'Wrong PIN - only Dave confirms readings.'}
+  if evidence_class not in ('Verified', 'Probable', 'Unverified', 'Disputed', 'Unknown'):
+    return {'status': 'error', 'message': f'Bad evidence class {evidence_class}.'}
+  if resolution not in ('EXPLAINED', 'EXCEPTION', 'RULE_CANDIDATE', 'CLOSED_UNKNOWN', 'DISPUTED'):
+    return {'status': 'error', 'message': f'Bad resolution {resolution}.'}
   conn = get_connection()
   try:
     cursor = conn.cursor()
+    cursor.execute("SELECT variance_kind FROM dbo.pc_plan_cause_keys WHERE cause_key = %s",
+                   (cause_key,))
+    ck = cursor.fetchone()
+    if not ck:
+      return {'status': 'error', 'message': f'Unknown cause key {cause_key}.'}
     cursor.execute("""
-        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND line_status = 'Proposed'
-    """, (plan_date,))
-    todo = cursor.fetchall()
-    for r in todo:
-      cursor.execute("""
-          UPDATE dbo.pc_ship_plan_line
-          SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-            AND line_status = 'Proposed'
-      """, (actor, plan_date, r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']))
-      _log_event(cursor, plan_date, r['nx_order_numb'], r['nx_sku'],
-                 'Confirmed', actor=actor, note='accept all',
-                 rel=r['nx_rel_numb'], item=r['nx_item_no'])
-    if todo:
-      _bump_revision(cursor, plan_date, actor)
+        UPDATE dbo.pc_plan_variance
+        SET confirmed_reading = %s, reading_confirmed_at = GETDATE(),
+            evidence_class = %s, evidence_note = %s, cause_key = %s,
+            variance_kind = %s, resolution = %s, resolved_at = GETDATE()
+        WHERE variance_id = %s AND answer_text IS NOT NULL
+    """, ((reading or '')[:500], evidence_class, (note or None), cause_key,
+          ck['variance_kind'], resolution, int(variance_id)))
+    if cursor.rowcount == 0:
+      return {'status': 'error', 'message': 'Nothing to confirm (no answer yet?).'}
     conn.commit()
-    return {'status': 'success', 'confirmed': len(todo)}
+    return {'status': 'success', 'warning': warn}
   except Exception as e:
     conn.rollback()
-    return {'status': 'error', 'message': f'Confirm-all failed: {e}'}
+    return {'status': 'error', 'message': f'{e}'}
   finally:
     conn.close()
 
 
-def _settle_proposal_outcomes(cursor, plan_date, actor):
-  """At publish: auto-confirm any line still Proposed (publishing IS the
-  acceptance), then score the latest proposal line by line —
-  KEPT / RETIERED / DROPPED, plus ADDED_BY_PC for plan lines the agent
-  did not propose. Proposal status: ACCEPTED (all kept, nothing added),
-  MODIFIED, or REJECTED (nothing kept). This is the hit-rate record."""
-  cursor.execute("""
-      SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku FROM dbo.pc_ship_plan_line
-      WHERE plan_date = %s AND line_status = 'Proposed'
-  """, (plan_date,))
-  for r in cursor.fetchall():
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Planned', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (actor, plan_date, r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']))
-    _log_event(cursor, plan_date, r['nx_order_numb'], r['nx_sku'],
-               'Confirmed', actor=actor, note='auto-confirmed at publish',
-               rel=r['nx_rel_numb'], item=r['nx_item_no'])
-  cursor.execute("""
-      SELECT TOP 1 proposal_id FROM dbo.pc_agent_proposal
-      WHERE plan_date = %s AND status = 'PROPOSED'
-      ORDER BY generated_at DESC
-  """, (plan_date,))
-  prop = cursor.fetchone()
-  if not prop:
-    return None
-  pid = prop['proposal_id']
-  cursor.execute("""
-      SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, tier, line_status
-      FROM dbo.pc_ship_plan_line WHERE plan_date = %s
-  """, (plan_date,))
-  plan = {(r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']): r for r in cursor.fetchall()}
-  cursor.execute("""
-      SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, proposed_tier
-      FROM dbo.pc_agent_proposal_line WHERE proposal_id = %s
-  """, (pid,))
-  kept = retiered = dropped = 0
-  proposed_keys = set()
-  for r in cursor.fetchall():
-    key = (r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no'])
-    proposed_keys.add(key)
-    pl = plan.get(key)
-    if pl and pl['line_status'] in _COUNTS_AGAINST_CAP:
-      outcome = 'KEPT' if pl['tier'] == r['proposed_tier'] else 'RETIERED'
-      kept += outcome == 'KEPT'
-      retiered += outcome == 'RETIERED'
-    else:
-      outcome, dropped = 'DROPPED', dropped + 1
-    cursor.execute("""
-        UPDATE dbo.pc_agent_proposal_line SET outcome = %s
-        WHERE proposal_id = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (outcome, pid, key[0], key[1], key[2]))
-  added = 0
-  for key, pl in plan.items():
-    if key in proposed_keys or pl['line_status'] not in _COUNTS_AGAINST_CAP:
-      continue
-    added += 1
-    cursor.execute("""
-        INSERT INTO dbo.pc_agent_proposal_line
-            (proposal_id, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no,
-             proposed_tier, reason, outcome)
-        VALUES (%s, %s, %s, %s, %s, 0, %s, 'not proposed by the agent', 'ADDED_BY_PC')
-    """, (pid, key[0], key[1], key[2], pl['nx_sku'], pl['tier'] or 'Next'))
-  if kept + retiered == 0:
-    status = 'REJECTED'
-  elif dropped == 0 and retiered == 0 and added == 0:
-    status = 'ACCEPTED'
-  else:
-    status = 'MODIFIED'
-  cursor.execute("""
-      UPDATE dbo.pc_agent_proposal
-      SET status = %s, reviewed_by = %s, reviewed_at = GETDATE()
-      WHERE proposal_id = %s
-  """, (status, actor, pid))
-  return {'proposal_id': pid, 'status': status, 'kept': kept,
-          'retiered': retiered, 'dropped': dropped, 'added_by_pc': added}
-
-
 @anvil.server.callable
-def ship_plan_get_proposal(plan_date):
-  """Latest proposal for the day (any status) — header + lines, for the
-  'Agent proposal' popup and the retro."""
-  plan_date = _parse_date(plan_date)
+def retro_ask_anyway(variance_id):
+  """Promote a 'not asked today' variance to an asked question."""
   conn = get_connection()
   try:
     cursor = conn.cursor()
+    rp = _retro_params(cursor)
+    cursor.execute("SELECT routed_to FROM dbo.pc_plan_variance WHERE variance_id = %s",
+                   (int(variance_id),))
+    r = cursor.fetchone()
+    if not r:
+      return {'status': 'error', 'message': 'Not found.'}
     cursor.execute("""
-        SELECT TOP 1 * FROM dbo.pc_agent_proposal
-        WHERE plan_date = %s ORDER BY generated_at DESC
-    """, (plan_date,))
-    hdr = cursor.fetchone()
-    if not hdr:
-      return {'status': 'success', 'proposal': None, 'lines': []}
+        UPDATE dbo.pc_plan_variance
+        SET asked_at = GETDATE(), asked_to = %s
+        WHERE variance_id = %s AND question_text IS NOT NULL AND asked_at IS NULL
+    """, (_owners(r['routed_to'], rp), int(variance_id)))
+    if cursor.rowcount == 0:
+      return {'status': 'error', 'message': 'Already asked, or not a question.'}
     cursor.execute("""
-        SELECT * FROM dbo.pc_agent_proposal_line
-        WHERE proposal_id = %s ORDER BY rank_no
-    """, (hdr['proposal_id'],))
-    return {'status': 'success', 'proposal': serialize_row(hdr),
-            'lines': [serialize_row(r) for r in cursor.fetchall()]}
+        UPDATE dbo.pc_plan_retro SET n_questions_asked = n_questions_asked + 1
+        WHERE plan_date = (SELECT plan_date FROM dbo.pc_plan_variance WHERE variance_id = %s)
+    """, (int(variance_id),))
+    conn.commit()
+    return {'status': 'success'}
   except Exception as e:
+    conn.rollback()
     return {'status': 'error', 'message': f'{e}'}
   finally:
     conn.close()
