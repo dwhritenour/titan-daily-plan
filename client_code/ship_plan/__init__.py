@@ -32,6 +32,11 @@ class ship_plan(ship_planTemplate):
                     cb_defaulted_only, lbl_feed_note,
                     dd_flag (Flag filter) + btn_flag_legend ('Flag legend')
                     — both hand-added 2026-09-01, hasattr-guarded
+                    2026-09-15: search / bucket / flag / non-standard /
+                    unclassified filter BOTH grids. The plan grid filters
+                    its cached lines client-side (no round trip); the due
+                    window is a candidate-pool horizon and leaves the plan
+                    alone (a pulled-ahead line must stay visible).
       grids:        rp_candidates (ShipPlanCandidateRow),
                     rp_plan_lines (ShipPlanLineRow), cb_show_removed
       row buttons (hand-added in the designer, hasattr-guarded until
@@ -75,8 +80,9 @@ class ship_plan(ship_planTemplate):
     self.tb_search.set_event_handler('pressed_enter', self._filters_changed)
     self.dd_bucket.set_event_handler('change', self._filters_changed)
     for cb in (self.cb_due_window, self.cb_special_only,
-               self.cb_defaulted_only, self.cb_show_removed):
+               self.cb_defaulted_only):
       cb.set_event_handler('change', self._filters_changed)
+    self.cb_show_removed.set_event_handler('change', self._plan_filter_changed)
     self.timer_drift.set_event_handler('tick', self._timer_tick)
     # Canvas fires 'reset' when it (re)sizes — redraw the bar then.
     self.cv_capacity.set_event_handler('reset', self._draw_capacity_bar)
@@ -93,6 +99,16 @@ class ship_plan(ship_planTemplate):
       self.dd_flag.set_event_handler('change', self._filters_changed)
     if hasattr(self, 'btn_flag_legend'):
       self.btn_flag_legend.set_event_handler('click', self._show_flag_legend)
+    # --- Clear filters (2026-09-15): designer button if present, else a
+    #     code-added Link at the end of the filter row -----------------
+    if hasattr(self, 'btn_clear_filters'):
+      self.btn_clear_filters.set_event_handler('click', self._clear_filters)
+    else:
+      self.flow_filters.add_component(
+        Link(text='Clear filters', icon='fa:times-circle', font_size=13,
+             tooltip='Reset every filter on both grids'))
+      self.flow_filters.get_components()[-1].set_event_handler(
+        'click', self._clear_filters)
     # --- AI agent (proposal engine, 051/052; designer links guarded) ---
     self._proposal = None
     if hasattr(self, 'lk_proposal'):
@@ -253,7 +269,70 @@ class ship_plan(ship_planTemplate):
       self.lbl_feed_note.text = f'Orders ✓ {ts}'
       self.lbl_feed_note.foreground = '#006300'
 
-  _filters_changed = refresh_candidates
+  def _filters_changed(self, **event_args):
+    """2026-09-15: one filter row, two grids. The plan re-renders from
+    the cached lines first (instant), then the candidates round-trip."""
+    self._render_lines(self._lines)
+    self.refresh_candidates()
+
+  def _plan_filter_changed(self, **event_args):
+    self._render_lines(self._lines)
+
+  def _clear_filters(self, **event_args):
+    """Back to the opening state of the filter row (due window ON, as at
+    load); both grids re-render. Show removed is a plan-grid switch, not
+    a filter, so it is left alone."""
+    self.tb_search.text = ''
+    self.dd_bucket.selected_value = None
+    if hasattr(self, 'dd_flag'):
+      self.dd_flag.selected_value = 'ALL'
+    self.cb_due_window.checked = True
+    self.cb_special_only.checked = False
+    self.cb_defaulted_only.checked = False
+    self._filters_changed()
+
+  def _line_matches(self, l):
+    """Same meaning as the server-side candidate WHERE (get_candidates):
+    search = order / SKU / description / ship-to substring (plus the
+    order-release-item label, so '607462-002' finds a release); bucket;
+    Non-Standard; Unclassified; flag dropdown on is_gated / flag_codes.
+    Fields ride on each line from get_plan (2026-09-15 enrichment); a line
+    e21 no longer knows (shipped) has no bucket or flags and only matches
+    the search."""
+    q = (self.tb_search.text or '').strip().upper()
+    if q:
+      hay = ' '.join(str(l.get(k) or '') for k in
+                     ('nx_order_numb', 'nx_sku', 'sku_desc', 'shipto_code',
+                      'line_label')).upper()
+      if q not in hay:
+        return False
+    bucket = self.dd_bucket.selected_value
+    if bucket in ('ST', 'ZERO', 'OTHER') and l.get('bucket') != bucket:
+      return False
+    if self.cb_special_only.checked and not int(l.get('n_non_standard') or 0):
+      return False
+    if self.cb_defaulted_only.checked and not int(l.get('n_class_defaulted') or 0):
+      return False
+    ff = (self._flag_filter() or 'ALL').upper()
+    if ff != 'ALL':
+      gated = bool(l.get('is_gated'))
+      codes = [c for c in (l.get('flag_codes') or '').split(',') if c]
+      if ff == 'PLANNABLE' and gated:
+        return False
+      if ff == 'GATED' and not gated:
+        return False
+      if ff in ('ANY_A', 'ANY_B') and not any(c.startswith(ff[-1]) for c in codes):
+        return False
+      if len(ff) == 3 and ff[0] in 'XABC' and ff[1:].isdigit() and ff not in codes:
+        return False
+    return True
+
+  def _plan_filter_active(self):
+    return bool((self.tb_search.text or '').strip()
+                or self.dd_bucket.selected_value in ('ST', 'ZERO', 'OTHER')
+                or self.cb_special_only.checked
+                or self.cb_defaulted_only.checked
+                or (self._flag_filter() or 'ALL').upper() != 'ALL')
 
   # =================================================================
   # Flag filter + legend (2026-09-01) — both read the LIVE definitions
@@ -568,8 +647,18 @@ class ship_plan(ship_planTemplate):
 
   def _render_lines(self, lines):
     self._lines = lines
-    shown = [l for l in lines
-             if self.cb_show_removed.checked or l['line_status'] != 'Removed']
+    visible = [l for l in lines
+               if self.cb_show_removed.checked or l['line_status'] != 'Removed']
+    shown = [l for l in visible if self._line_matches(l)]
+    # Header says what the grid IS - a filtered plan must never look like
+    # a short plan (the capacity bar still totals EVERY active line).
+    if hasattr(self, 'lbl_plan_header'):
+      txt = "THIS DAY'S PLAN"
+      if self._plan_filter_active():
+        txt += f' — showing {len(shown)} of {len(visible)} (filtered)'
+      elif visible:
+        txt += f' — {len(visible)}'
+      self.lbl_plan_header.text = txt
     for it in shown:
       if self.is_pc:
         it['on_recalc'] = self._recalc_line

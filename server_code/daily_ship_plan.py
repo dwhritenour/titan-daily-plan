@@ -623,7 +623,13 @@ def ship_plan_get_plan(plan_date):
     header = cursor.fetchone()
 
     cursor.execute("""
-        SELECT l.*, live.live_qty, live.live_ordered, pr.description AS reason_desc
+        SELECT l.*, live.live_qty, live.live_ordered, pr.description AS reason_desc,
+               cr.bucket, cr.nx_sku_desc AS sku_desc,
+               CASE WHEN COALESCE(cr.element_class, src.element_class_used) = 'Non-Standard'
+                    THEN 1 ELSE 0 END                                   AS n_non_standard,
+               CAST(COALESCE(cr.class_was_defaulted, src.class_was_defaulted, 0) AS INT)
+                                                                        AS n_class_defaulted,
+               ISNULL(fs.is_gated, 0) AS is_gated, fs.gate_codes, fs.flag_codes
         FROM dbo.pc_ship_plan_line l
         OUTER APPLY (SELECT SUM(s.nx_qty_balance_due) AS live_qty,
                             SUM(ISNULL(s.nx_qty_ordered, s.nx_qty_balance_due)) AS live_ordered
@@ -631,6 +637,23 @@ def ship_plan_get_plan(plan_date):
                      WHERE s.nx_order_numb = l.nx_order_numb
                        AND s.nx_rel_numb = l.nx_rel_numb
                        AND s.nx_item_no = l.nx_item_no) live          -- 066: the e21 line
+        -- 2026-09-15: the filter row applies to the plan grid too, so each
+        -- line carries the same fields the candidate rows filter on. The
+        -- live views (no already-planned guard) give bucket / desc / class /
+        -- flags; the plan-time source row backs class up for a shipped line.
+        LEFT JOIN dbo.pc_ship_plan_line_source src
+               ON src.plan_date = l.plan_date
+              AND src.nx_order_numb = l.nx_order_numb
+              AND src.nx_rel_numb = l.nx_rel_numb
+              AND src.nx_item_no = l.nx_item_no
+        LEFT JOIN dbo.vw_pc_ship_candidate_rows cr
+               ON cr.nx_order_numb = l.nx_order_numb
+              AND cr.nx_rel_numb = l.nx_rel_numb
+              AND cr.nx_item_no = l.nx_item_no
+        LEFT JOIN dbo.vw_pc_order_flag_scores fs
+               ON fs.nx_order_numb = l.nx_order_numb
+              AND fs.nx_rel_numb = l.nx_rel_numb
+              AND fs.nx_item_no = l.nx_item_no
         LEFT JOIN dbo.pc_priority_reasons pr
                ON pr.reason_code = l.priority_reason
         WHERE l.plan_date = %s
