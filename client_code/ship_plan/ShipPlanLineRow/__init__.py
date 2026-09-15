@@ -49,7 +49,9 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
                            else item['nx_order_numb'])      # always order-release-item
     self.lbl_order.tooltip = f"order {item['nx_order_numb']}, release {rel or '?'}, item {itm or '?'}"
     self.lbl_what.text = item['nx_sku']
-    sub = item.get('shipto_code') or ''
+    # 2026-09-15: customer 'name - city, ST' (sales' ask), ship-to in the tip
+    sub = item.get('customer') or item.get('shipto_code') or ''
+    self.lbl_sub.tooltip = f"ship-to {item.get('shipto_code') or '?'}"
     if float(item.get('surcharge_minutes') or 0) > 0.5:
       sub += f"  · +{float(item['surcharge_minutes']):,.0f} min surcharge"
     reason_txt = item.get('reason_desc')

@@ -282,6 +282,17 @@ def _log_event(cursor, plan_date, order, sku, event_type,
         (actor or _current_actor()), (note[:500] if note else None)))
 
 
+def _customer_label(name, city, state, fallback=None):
+  """2026-09-15: 'FERGUSON ENTERPRISES #61 - EULESS, TX' for the Item
+  column sub-line on both grids (sales asked for customer, not ship-to).
+  Falls back to the ship-to code when e21 no longer has the line."""
+  name = (name or '').strip()
+  if not name:
+    return fallback or ''
+  place = ', '.join(p for p in ((city or '').strip(), (state or '').strip()) if p)
+  return f"{name} - {place}" if place else name
+
+
 def _line_label(order, rel, item, sku=None):
   """'595613-001-20' - order, RELEASE, item, always all three (Dave
   2026-09-15: a release shown only sometimes reads as an error), + ' / SKU'."""
@@ -504,8 +515,9 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     if search:
       like = f'%{search.strip()}%'
       where.append("(c.nx_order_numb LIKE %s OR c.nx_sku LIKE %s "
-                   "OR c.sku_desc LIKE %s OR c.shipto_code LIKE %s)")
-      args += [like, like, like, like]
+                   "OR c.sku_desc LIKE %s OR c.shipto_code LIKE %s "
+                   "OR so.nx_cust_name LIKE %s)")          # 2026-09-15: customer
+      args += [like, like, like, like, like]
     if bucket in ('ST', 'ZERO', 'OTHER'):
       where.append("c.bucket = %s")
       args.append(bucket)
@@ -537,7 +549,14 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
       args.append('%,' + ff + ',%')
     # One FROM for all three queries below: the scores join is needed by
     # the filter, the count and the sort alike.
+    # 2026-09-15: the customer (name / city / state) rides along from the
+    # feed row itself - one row per e21 line, so the join never fans out.
+    cust_join = ("LEFT JOIN dbo.sales_orders_due so "
+                 "ON so.nx_order_numb = c.nx_order_numb "
+                 "AND so.nx_rel_numb = c.nx_rel_numb "
+                 "AND so.nx_item_no = c.nx_item_no ")
     from_sql = ("FROM dbo.vw_pc_ship_candidates c "
+                + cust_join +
                 "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
                 "ON fs.nx_order_numb = c.nx_order_numb "
                 "AND fs.nx_rel_numb = c.nx_rel_numb "
@@ -549,7 +568,8 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     sql = ("SELECT TOP %d c.*, ISNULL(fs.is_gated, 0) AS is_gated, "
            "fs.gate_codes, "
            "ISNULL(fs.priority_score, 0) AS priority_score, "
-           "fs.flag_codes "
+           "fs.flag_codes, "
+           "so.nx_cust_name, so.nx_cust_city, so.nx_cust_state "
            % max(1, min(int(limit), 1000))) + from_sql
     if where:
       sql += " WHERE " + " AND ".join(where)
@@ -558,6 +578,9 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
             "c.nx_rel_numb, c.nx_item_no")
     cursor.execute(sql, tuple(args))
     rows = [serialize_row(r) for r in cursor.fetchall()]
+    for r in rows:
+      r['customer'] = _customer_label(r.get('nx_cust_name'), r.get('nx_cust_city'),
+                                      r.get('nx_cust_state'), r.get('shipto_code'))
     # Total matching (pre-TOP) — so truncation is VISIBLE, never silent:
     # with a deep overdue backlog the oldest rows can fill the cap and
     # hide the future entirely (the "list ends at 8/24" mystery).
@@ -576,6 +599,7 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
                  "ON c.nx_order_numb = f.nx_order_numb "
                  "AND c.nx_rel_numb = f.nx_rel_numb "
                  "AND c.nx_item_no = f.nx_item_no "
+                 + cust_join +                     # the search WHERE may name so.
                  "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
                  "ON fs.nx_order_numb = c.nx_order_numb "
                  "AND fs.nx_rel_numb = c.nx_rel_numb "
@@ -624,6 +648,7 @@ def ship_plan_get_plan(plan_date):
 
     cursor.execute("""
         SELECT l.*, live.live_qty, live.live_ordered, pr.description AS reason_desc,
+               live.nx_cust_name, live.nx_cust_city, live.nx_cust_state,
                cr.bucket, cr.nx_sku_desc AS sku_desc,
                CASE WHEN COALESCE(cr.element_class, src.element_class_used) = 'Non-Standard'
                     THEN 1 ELSE 0 END                                   AS n_non_standard,
@@ -632,7 +657,10 @@ def ship_plan_get_plan(plan_date):
                ISNULL(fs.is_gated, 0) AS is_gated, fs.gate_codes, fs.flag_codes
         FROM dbo.pc_ship_plan_line l
         OUTER APPLY (SELECT SUM(s.nx_qty_balance_due) AS live_qty,
-                            SUM(ISNULL(s.nx_qty_ordered, s.nx_qty_balance_due)) AS live_ordered
+                            SUM(ISNULL(s.nx_qty_ordered, s.nx_qty_balance_due)) AS live_ordered,
+                            MAX(s.nx_cust_name) AS nx_cust_name,       -- 2026-09-15: customer
+                            MAX(s.nx_cust_city) AS nx_cust_city,
+                            MAX(s.nx_cust_state) AS nx_cust_state
                      FROM dbo.sales_orders_due s
                      WHERE s.nx_order_numb = l.nx_order_numb
                        AND s.nx_rel_numb = l.nx_rel_numb
@@ -687,6 +715,8 @@ def ship_plan_get_plan(plan_date):
         row['qty_warn'] = None
       row['line_label'] = _line_label(row['nx_order_numb'], row.get('nx_rel_numb'),
                                       row.get('nx_item_no'))
+      row['customer'] = _customer_label(row.get('nx_cust_name'), row.get('nx_cust_city'),
+                                        row.get('nx_cust_state'), row.get('shipto_code'))
       lines.append(row)
 
     planned_total = sum(float(l['load_inches']) for l in lines

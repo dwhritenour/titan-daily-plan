@@ -303,7 +303,7 @@ class ship_plan(ship_planTemplate):
     if q:
       hay = ' '.join(str(l.get(k) or '') for k in
                      ('nx_order_numb', 'nx_sku', 'sku_desc', 'shipto_code',
-                      'line_label')).upper()
+                      'customer', 'line_label')).upper()
       if q not in hay:
         return False
     bucket = self.dd_bucket.selected_value

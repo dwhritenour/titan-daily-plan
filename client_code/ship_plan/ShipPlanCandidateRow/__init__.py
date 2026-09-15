@@ -39,7 +39,10 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
                            else item['nx_order_numb'])      # always order-release-item
     self.lbl_order.tooltip = f"order {item['nx_order_numb']}, release {rel or '?'}, item {itm or '?'}"
     self.lbl_what.text = f"{item.get('sku_desc') or item['nx_sku']}"
-    self.lbl_sub.text = f"{item.get('shipto_code') or ''} · {item.get('part_line') or item.get('bucket', '')}"
+    # 2026-09-15: customer 'name - city, ST' (sales' ask), ship-to in the tip
+    self.lbl_sub.text = (f"{item.get('customer') or item.get('shipto_code') or ''}"
+                         f" · {item.get('part_line') or item.get('bucket', '')}")
+    self.lbl_sub.tooltip = f"ship-to {item.get('shipto_code') or '?'}"
     # Qty = e21 ORDERED (orditem.qty) = qty_open since 066; "(balance)" only
     # when e21's balance due disagrees (065 / C05).
     ordered = float(item['qty_open'])
