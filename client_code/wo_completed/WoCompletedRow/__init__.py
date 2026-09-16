@@ -33,6 +33,8 @@ class WoCompletedRow(WoCompletedRowTemplate):
     who = it.get('assigned_assembler') or ''
     if who:
       sub += f"  · {who}"
+    if it.get('customer'):                       # ship-1.0.0: shipped rows carry the customer
+      sub += f"  · {it['customer']}"
     self.lbl_sub.text = sub
     self.lbl_status.text = it.get('status') or ''
     self.lbl_status.foreground = '#006300' if it.get('status') == 'Complete' else '#595959'

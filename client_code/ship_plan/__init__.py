@@ -65,6 +65,9 @@ class ship_plan(ship_planTemplate):
     if _hash == 'done':                     # wo-1.0.0: completed WOs by day
       open_form('wo_completed')
       return
+    if _hash == 'shipped':                  # ship-1.0.0: e21 shipments by day
+      open_form('orders_shipped')
+      return
 
     # --- role gate (Wk-2: Sales = read-only) -------------------------
     # TODO(Dave/Chuck): wire to the app's real role source, same pattern
@@ -131,8 +134,11 @@ class ship_plan(ship_planTemplate):
       self.lk_retro_review.text = 'Retro review'
       self.lk_retro_review.set_event_handler('click', lambda **e: open_form('retro_review'))
     if hasattr(self, 'lk_completed'):        # wo-1.0.0 (2026-09-16)
-      self.lk_completed.text = 'Completed'
+      self.lk_completed.text = 'WO Progress'
       self.lk_completed.set_event_handler('click', lambda **e: open_form('wo_completed'))
+    if hasattr(self, 'lk_shipped'):          # ship-1.0.0 (2026-09-16)
+      self.lk_shipped.text = 'WO Shipped'
+      self.lk_shipped.set_event_handler('click', lambda **e: open_form('orders_shipped'))
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
     # read PLAN_HORIZON_DAYS itself, so a saved change applies on the
