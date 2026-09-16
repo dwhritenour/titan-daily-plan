@@ -62,6 +62,9 @@ class ship_plan(ship_planTemplate):
     if _hash == 'retrev':
       open_form('retro_review')
       return
+    if _hash == 'done':                     # wo-1.0.0: completed WOs by day
+      open_form('wo_completed')
+      return
 
     # --- role gate (Wk-2: Sales = read-only) -------------------------
     # TODO(Dave/Chuck): wire to the app's real role source, same pattern
@@ -127,6 +130,9 @@ class ship_plan(ship_planTemplate):
     if hasattr(self, 'lk_retro_review'):
       self.lk_retro_review.text = 'Retro review'
       self.lk_retro_review.set_event_handler('click', lambda **e: open_form('retro_review'))
+    if hasattr(self, 'lk_completed'):        # wo-1.0.0 (2026-09-16)
+      self.lk_completed.text = 'Completed'
+      self.lk_completed.set_event_handler('click', lambda **e: open_form('wo_completed'))
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
     # read PLAN_HORIZON_DAYS itself, so a saved change applies on the
@@ -230,6 +236,7 @@ class ship_plan(ship_planTemplate):
     for it in items:
       it['on_add'] = self._add_line if self.is_pc else None
       it['on_add_order'] = self._add_order if self.is_pc else None
+      it['on_release_hold'] = self._release_hold if self.is_pc else None   # 068
     self.rp_candidates.items = items
     # Header says what the list IS — gated-last / priority-first
     # (flag system 041), and exactly how much of the match survived
@@ -684,6 +691,24 @@ class ship_plan(ship_planTemplate):
     if result.get('over_capacity'):
       self._cap_hit_dialog(item['nx_order_numb'],
                            [(item['nx_rel_numb'], item['nx_item_no'])], result)
+    self.load_day()
+
+  def _release_hold(self, item):
+    """068: PC releases a material hold (X05) - stock arrived, or the
+    retro answer was wrong. Reason is optional; the line re-ranks now."""
+    lbl = line_label(item, with_sku=False)
+    tb = TextBox(placeholder='why (optional) - e.g. stock received')
+    ok = alert(content=tb, title=f'Release material hold on {lbl}?',
+               buttons=[('Release', True), ('Cancel', False)], large=False)
+    if not ok:
+      return
+    r = anvil.server.call('ship_plan_release_hold', item['nx_order_numb'],
+                          item['nx_rel_numb'], item['nx_item_no'],
+                          tb.text or None)
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Release failed'))
+      return
+    Notification(f'Hold released on {lbl}', timeout=3).show()
     self.load_day()
 
   def _add_order(self, item):

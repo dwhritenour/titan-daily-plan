@@ -11,9 +11,12 @@ unique_ids:
     ship_plan.ShipPlanCandidateRow: '1787664042168.0034883675678857307'
     ship_plan.ShipPlanLineRow: '1787664050457.9924833923128128'
     ship_plan.ShipPlanParamsPanel: '1787664056833.30892416189296157'
+    wo_completed: '1789558017885.7841849131975173'
+    wo_completed.WoCompletedRow: '1789558017881.8847646585797426'
   modules: {}
   scripts: {}
   server_modules:
     daily_plan_retro: '1788796547704535203357196.94714'
     daily_ship_plan: '1787664623550535807975063.2075'
     db_config: '1787664724217840339488662.1838'
+    wo_completed: '1789558017887.6753202345543304'

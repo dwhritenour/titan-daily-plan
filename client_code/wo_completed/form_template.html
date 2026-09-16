@@ -1,0 +1,26 @@
+<anvil-form container="HtmlTemplate" prop:html="@theme:standard-page.html">
+  <anvil-component type="ColumnPanel" name="content_panel" container:slot="default">
+    <!-- Header row: back-link, title, day stepper, zero-touch filter -->
+    <anvil-component type="ColumnPanel" name="oc_header" prop:role="outlined-card" container:grid_position="WCHDRW,WCHDCL" container:full_width_row="true">
+      <anvil-component type="FlowPanel" name="flow_header" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"5",null]}' container:grid_position="WCHFRW,WCHFCL" container:full_width_row="true">
+        <anvil-component type="Link" name="lk_back" prop:text="← Daily Plan" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+        <anvil-component type="Label" name="lbl_title" prop:text="Completed work orders" prop:bold="true" prop:font_size="22" prop:spacing='{"margin":["2",null,"0",null],"padding":["0","10","0","10"]}'></anvil-component>
+        <anvil-component type="Button" name="btn_prev" prop:text="‹" prop:role="outlined-button"></anvil-component>
+        <anvil-component type="DatePicker" name="dp_day" prop:format="%a %m/%d/%Y" prop:role="outlined"></anvil-component>
+        <anvil-component type="Button" name="btn_next" prop:text="›" prop:role="outlined-button"></anvil-component>
+        <anvil-component type="CheckBox" name="cb_hide_zero" prop:text="Hide zero-touch" prop:font_size="13"></anvil-component>
+      </anvil-component>
+    </anvil-component>
+    <!-- Summary card: actual vs plan, then the plan/publish detail line -->
+    <anvil-component type="ColumnPanel" name="oc_summary" prop:role="outlined-card" container:grid_position="WCSMRW,WCSMCL" container:full_width_row="true">
+      <anvil-component type="Label" name="lbl_summary" prop:text="Tue 09/15 — actual 1,448 in vs plan 1,937 in (75% of plan)" prop:bold="true" prop:font_size="20" prop:spacing='{"margin":["5",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="WCSARW,WCSACL" container:full_width_row="true"></anvil-component>
+      <anvil-component type="Label" name="lbl_plan" prop:text="Plan PUBLISHED 08:52 · capacity 2,150 in · 66 plan lines, 3 of them done · 163 work orders done: 5 closed on the floor, 158 by e21 shipment" prop:font_size="13" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"5",null],"padding":["0",null,"0",null]}' container:grid_position="WCSBRW,WCSBCL" container:full_width_row="true"></anvil-component>
+    </anvil-component>
+    <!-- Completed work orders, one row per WO, with running work-inch total -->
+    <anvil-component type="DataGrid" name="dg_done" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="200" prop:show_page_controls="true" prop:columns='[{"id":"time","title":"Time","data_key":"","width":"70"},{"id":"line","title":"Order-Rel-Item","data_key":"","width":"150"},{"id":"item","title":"Item","data_key":""},{"id":"status","title":"Status","data_key":"","width":"140"},{"id":"plan","title":"Plan","data_key":"","width":"110"},{"id":"load","title":"Load","data_key":"","width":"90"},{"id":"running","title":"Running","data_key":"","width":"90"}]' container:grid_position="WCDGRW,WCDGCL" container:full_width_row="true">
+      <anvil-component type="RepeatingPanel" name="rp_rows" prop:item_template="Titan_Daily_Plan.wo_completed.WoCompletedRow"></anvil-component>
+    </anvil-component>
+    <anvil-component type="Label" name="lbl_footer" prop:text="On plan 87 in · unplanned 1,361 in · 4 zero-touch (Z, not totalled) · 21 with no load estimate" prop:font_size="13" prop:foreground="#595959" prop:spacing='{"margin":["5",null,"5",null],"padding":["0",null,"0",null]}' container:grid_position="WCFTRW,WCFTCL" container:full_width_row="true"></anvil-component>
+  </anvil-component>
+  <anvil-component type="Label" name="lbl_app_title" prop:text="Titan Daily Plan — Completed Work Orders" prop:bold="true" prop:font_size="26" prop:icon="fa:check-circle-o" container:slot="title"></anvil-component>
+</anvil-form>
