@@ -5,7 +5,14 @@ from .daily_ship_plan import (get_connection, _parse_date, serialize_row,
 make_serializable, _line_label)
 
 # =============================================================================
-# COMPLETED WORK ORDERS BY DAY  (wo-1.0.0, 2026-09-16)
+# COMPLETED WORK ORDERS BY DAY  (wo-1.0.1, 2026-09-16)
+#
+# Server module name: daily_plan_completed. It was first shipped as
+# 'wo_completed', the same name as the client FORM package; Anvil puts
+# client packages and server modules in one import namespace, so the
+# downlink resolved 'wo_completed' to the form (RuntimeError: Cannot
+# import Form templates on the server). Server modules here follow
+# daily_ship_plan / daily_plan_retro - never a form's name.
 #
 # Dave, before the 09:00 PC/Sales meeting: "an additional form that displays
 # which work orders were completed by day ... a running total of the
