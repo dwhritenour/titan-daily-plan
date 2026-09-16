@@ -134,10 +134,10 @@ class ship_plan(ship_planTemplate):
       self.lk_retro_review.text = 'Retro review'
       self.lk_retro_review.set_event_handler('click', lambda **e: open_form('retro_review'))
     if hasattr(self, 'lk_completed'):        # wo-1.0.0 (2026-09-16)
-      self.lk_completed.text = 'Completed'
+      self.lk_completed.text = 'WO Progress'
       self.lk_completed.set_event_handler('click', lambda **e: open_form('wo_completed'))
     if hasattr(self, 'lk_shipped'):          # ship-1.0.0 (2026-09-16)
-      self.lk_shipped.text = 'Shipped'
+      self.lk_shipped.text = 'WO Shipped'
       self.lk_shipped.set_event_handler('click', lambda **e: open_form('orders_shipped'))
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
