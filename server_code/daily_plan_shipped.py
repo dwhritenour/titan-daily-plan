@@ -5,7 +5,7 @@ from .daily_ship_plan import (get_connection, _parse_date, serialize_row,
 make_serializable, _line_label, _customer_label)
 
 # =============================================================================
-# ORDERS SHIPPED BY DAY  (ship-1.1.0, 2026-09-16)
+# ORDERS SHIPPED BY DAY  (ship-1.1.1, 2026-09-16)
 #
 # Twin of daily_plan_completed / the wo_completed form, but the SOURCE is
 # e21: dbo.sales_orders_ship, Dave's extract of sales-order lines with an
@@ -38,7 +38,8 @@ SELECT RTRIM(s.nx_order_numb) AS nx_order_numb, RTRIM(s.nx_rel_numb) AS nx_rel_n
        RTRIM(s.nx_item_status_desc) AS status, RTRIM(s.nx_carrier) AS carrier, RTRIM(s.nx_mos) AS mos,
        RTRIM(s.nx_cust_name) AS nx_cust_name, RTRIM(s.nx_cust_city) AS nx_cust_city,
        RTRIM(s.nx_cust_state) AS nx_cust_state, RTRIM(s.nx_shipto_code) AS shipto_code,
-       s.nx_ddate_invoice AS invoice_date, s.nx_ship_date, s.nx_ship_time,
+       s.nx_ddate_invoice AS invoice_date, s.nx_ship_date,
+       CONVERT(VARCHAR(8), s.nx_ship_time, 108) AS nx_ship_time,   -- TIME is not serializable; send 'HH:MM:SS'
        CASE WHEN s.nx_ship_date IS NOT NULL
             THEN CAST(s.nx_ship_date AS DATETIME) + CAST(ISNULL(s.nx_ship_time, '00:00') AS DATETIME)
             END                                          AS shipped_at,   -- clerk's Ship punch

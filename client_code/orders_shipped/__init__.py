@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 
 class orders_shipped(orders_shippedTemplate):
   """
-    Orders shipped by day (ship-1.0.0, 2026-09-16) - what e21 says left the
+    Orders shipped by day (ship-1.1.0, 2026-09-16) - what e21 says left the
     building (dbo.sales_orders_ship, invoice date = ship date), against the
     PUBLISHED plan, with a running work-inch total in e21-detection order.
     Twin of wo_completed; that form is the shop's WORK, this one is what
@@ -34,13 +34,22 @@ class orders_shipped(orders_shippedTemplate):
       self.cb_hide_zero.set_event_handler('change', lambda **e: self._render_rows())
     if hasattr(self, 'lk_back'):
       self.lk_back.set_event_handler('click', lambda **e: open_form('ship_plan'))
-    self.dp_day.date = date.today()
+    # ship-1.1.0: sales_orders_ship is loaded by a NIGHTLY EasyMorph job, so
+    # today is always empty until tomorrow - open on the last business day.
+    self.dp_day.date = self._prev_business_day(date.today())
     self.load_day()
 
   # -----------------------------------------------------------------
   @property
   def day(self):
     return self.dp_day.date or date.today()
+
+  @staticmethod
+  def _prev_business_day(d):
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+      d -= timedelta(days=1)
+    return d
 
   def _step(self, n):
     d = self.day
@@ -68,7 +77,11 @@ class orders_shipped(orders_shippedTemplate):
     actual = float(t.get('actual_inches') or 0)
     pct = r.get('pct_of_plan')
     dtxt = self.day.strftime('%a %m/%d')
-    if hdr is None:
+    if not r.get('rows') and self.day >= date.today():
+      self.lbl_summary.text = (f"{dtxt} — nothing yet: the e21 extract loads overnight; "
+                               f"today's shipments appear tomorrow morning")
+      self.lbl_summary.foreground = '#595959'
+    elif hdr is None:
       self.lbl_summary.text = (f"{dtxt} — {actual:,.0f} in shipped · no plan was built for this day")
       self.lbl_summary.foreground = '#595959'
     else:
