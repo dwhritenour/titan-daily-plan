@@ -134,10 +134,10 @@ class ship_plan(ship_planTemplate):
       self.lk_retro_review.text = 'Retro review'
       self.lk_retro_review.set_event_handler('click', lambda **e: open_form('retro_review'))
     if hasattr(self, 'lk_completed'):        # wo-1.0.0 (2026-09-16)
-      self.lk_completed.text = 'WO Progress'
+      self.lk_completed.text = 'Completed'
       self.lk_completed.set_event_handler('click', lambda **e: open_form('wo_completed'))
     if hasattr(self, 'lk_shipped'):          # ship-1.0.0 (2026-09-16)
-      self.lk_shipped.text = 'WO Shipped'
+      self.lk_shipped.text = 'Shipped'
       self.lk_shipped.set_event_handler('click', lambda **e: open_form('orders_shipped'))
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
@@ -830,19 +830,42 @@ class ship_plan(ship_planTemplate):
     self.load_day()
 
   def _snooze_line(self, item):
+    """Snooze this line - or, 2026-09-16, every active line of the order
+    on this day (same dialog, a checkbox, like Remove). Active = Planned /
+    Proposed / Confirmed; Snoozed and Removed siblings are left alone."""
+    order = item['nx_order_numb']
+    siblings = [l for l in self._lines
+                if l['nx_order_numb'] == order
+                and l['line_status'] in ('Planned', 'Proposed', 'Confirmed')]
     tb = TextBox(text=item.get('snooze_suggestion') or '',
                  placeholder='YYYY-MM-DD')
+    cb_all = None
+    content = tb
+    if len(siblings) > 1:
+      cb_all = CheckBox(text=f'Snooze ALL {len(siblings)} lines of {order} on this plan')
+      content = ColumnPanel()
+      content.add_component(cb_all)
+      content.add_component(tb)
     if not confirm(f"Snooze {line_label(item)} "
-                   "to which day?", content=tb):
+                   "to which day?", content=content):
       return
     try:
       to_date = datetime.strptime((tb.text or '').strip(), '%Y-%m-%d').date()
     except ValueError:
       alert('Enter a date as YYYY-MM-DD.')
       return
-    r = anvil.server.call('ship_plan_snooze_line', self.plan_date,
-                          item['nx_order_numb'], item['nx_rel_numb'],
-                          item['nx_item_no'], to_date)
+    if cb_all and cb_all.checked:
+      r = anvil.server.call('ship_plan_snooze_order', self.plan_date, order, to_date)
+      if r.get('status') == 'success':
+        note = f"{order}: {len(r.get('moved') or [])} line(s) snoozed to {r.get('to_date')}"
+        if r.get('skipped'):
+          note += f"; {len(r['skipped'])} skipped"
+          alert('\n'.join(r['skipped']), title=f'{order}: not every line moved')
+        Notification(note, timeout=4).show()
+    else:
+      r = anvil.server.call('ship_plan_snooze_line', self.plan_date,
+                            order, item['nx_rel_numb'],
+                            item['nx_item_no'], to_date)
     if r.get('status') != 'success':
       alert(r.get('message', 'Snooze failed'))
     self.load_day()

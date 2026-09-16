@@ -1308,6 +1308,74 @@ def ship_plan_mark_unplaced(plan_date, order, rel, item, note=None):
 
 
 @anvil.server.callable
+def ship_plan_release_hold(order, rel, item, note=None):
+  """068: PC releases a material hold (X05) from the candidate flag
+  popup - stock arrived, or the answer was wrong. The line re-enters
+  ranking on the next refresh."""
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        EXEC dbo.sp_pc_release_line_hold @order = %s, @rel = %s, @item = %s,
+             @released_by = %s, @note = %s
+    """, (order, rel, item, _current_actor(), (note or None)))
+    r = cursor.fetchone() or {}
+    conn.commit()
+    if not int(r.get('released') or 0):
+      return {'status': 'error', 'message': 'No live hold on that line.'}
+    return {'status': 'success'}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Release failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def _snooze_line_tx(cursor, plan_date, order, rel, item, to_date, actor, note=None):
+  """The per-line snooze, inside the caller's transaction (no commit):
+  checks, marks this day's line Snoozed, re-captures the feed rows fresh
+  for the new day and inserts the future line. Returns (ok, message).
+  2026-09-16: shared by the single-line and the whole-order snooze. The
+  feed check runs BEFORE the UPDATE so a skipped line leaves no mark."""
+  cursor.execute("""
+      SELECT line_status FROM dbo.pc_ship_plan_line
+      WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+  """, (to_date, order, rel, item))
+  if cursor.fetchone():
+    return False, f'{_line_label(order, rel, item)} is already on {to_date}.'
+  cursor.execute("""
+      SELECT tier, priority_reason, nx_sku FROM dbo.pc_ship_plan_line
+      WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+  """, (plan_date, order, rel, item))
+  src = cursor.fetchone() or {}
+  rows = _fetch_candidate_rows(cursor, order, rel, item)
+  if not rows:
+    return False, (f'{_line_label(order, rel, item)}: no open quantity left in the '
+                   'feed - nothing to snooze forward.')
+  cursor.execute("""
+      UPDATE dbo.pc_ship_plan_line
+      SET line_status = 'Snoozed', snooze_to_date = %s,
+          updated_by = %s, updated_at = GETDATE()
+      WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+        AND line_status IN %s
+  """, (to_date, actor, plan_date, order, rel, item, _ACTIVE_STATUSES))
+  if cursor.rowcount == 0:
+    return False, f'{_line_label(order, rel, item)}: not found or not active.'
+  _log_event(cursor, plan_date, order, src.get('nx_sku'), 'Snoozed',
+             new_value=to_date.isoformat(), actor=actor, rel=rel, item=item, note=note)
+  agg = _aggregate(rows)
+  _ensure_header(cursor, to_date, actor)
+  _insert_line_and_source(cursor, to_date, order, rel, item, rows, agg,
+                          actor=actor, tier=src.get('tier') or 'Next',
+                          reason=src.get('priority_reason'))
+  _log_event(cursor, to_date, order, agg['sku'], 'Added',
+             new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in",
+             actor=actor, note=f'snoozed from {plan_date}', rel=rel, item=item)
+  return True, None
+
+
+@anvil.server.callable
 def ship_plan_snooze_line(plan_date, order, rel, item, to_date):
   """Mark this day's line Snoozed and create the future day's line —
   ONE transaction across both days. Source rows re-captured fresh for the
@@ -1320,45 +1388,10 @@ def ship_plan_snooze_line(plan_date, order, rel, item, to_date):
   conn = get_connection()
   try:
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT line_status FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (to_date, order, rel, item))
-    if cursor.fetchone():
-      return {'status': 'error',
-              'message': f'{_line_label(order, rel, item)} is already on {to_date}.'}
-    cursor.execute("""
-        SELECT tier, priority_reason, nx_sku FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (plan_date, order, rel, item))
-    src = cursor.fetchone() or {}
-
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Snoozed', snooze_to_date = %s,
-            updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-          AND line_status IN %s
-    """, (to_date, actor, plan_date, order, rel, item, _ACTIVE_STATUSES))
-    if cursor.rowcount == 0:
-      return {'status': 'error', 'message': 'Line not found or not active.'}
-    _log_event(cursor, plan_date, order, src.get('nx_sku'), 'Snoozed',
-               new_value=to_date.isoformat(), actor=actor, rel=rel, item=item)
-
-    rows = _fetch_candidate_rows(cursor, order, rel, item)
-    if not rows:
+    ok, msg = _snooze_line_tx(cursor, plan_date, order, rel, item, to_date, actor)
+    if not ok:
       conn.rollback()
-      return {'status': 'error',
-              'message': 'No open quantity left in the feed — nothing to '
-              'snooze forward. Refresh the plan.'}
-    agg = _aggregate(rows)
-    _ensure_header(cursor, to_date, actor)
-    _insert_line_and_source(cursor, to_date, order, rel, item, rows, agg,
-                            actor=actor, tier=src.get('tier') or 'Next',
-                            reason=src.get('priority_reason'))
-    _log_event(cursor, to_date, order, agg['sku'], 'Added',
-               new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in",
-               actor=actor, note=f'snoozed from {plan_date}', rel=rel, item=item)
+      return {'status': 'error', 'message': msg}
     _bump_revision(cursor, plan_date, actor)
     _bump_revision(cursor, to_date, actor)
     conn.commit()
@@ -1366,6 +1399,53 @@ def ship_plan_snooze_line(plan_date, order, rel, item, to_date):
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Snooze failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def ship_plan_snooze_order(plan_date, order, to_date):
+  """2026-09-16 (Dave, after the first snooze in the PC/Sales meeting):
+  snooze EVERY line of a sales order that is on this day's plan
+  (Planned / Proposed / Confirmed) to one later day - one transaction,
+  per-line Snoozed + Added events, one OrderSnoozed summary. A line the
+  feed no longer has open, or that already sits on the target day, is
+  skipped and reported; the rest move. Nothing moves if nothing can."""
+  plan_date = _parse_date(plan_date)
+  to_date = _parse_date(to_date)
+  if to_date <= plan_date:
+    return {'status': 'error', 'message': 'Snooze target must be a later day.'}
+  actor = _current_actor()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND line_status IN %s
+        ORDER BY nx_rel_numb, nx_item_no
+    """, (plan_date, order, _COUNTS_AGAINST_CAP))
+    items = [(r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']) for r in cursor.fetchall()]
+    if not items:
+      return {'status': 'error', 'message': f'{order} has no active lines on this plan.'}
+    moved, skipped = [], []
+    for rel, item, sku in items:
+      ok, msg = _snooze_line_tx(cursor, plan_date, order, rel, item, to_date, actor,
+                                note='whole order')
+      (moved if ok else skipped).append(_line_label(order, rel, item, sku) if ok else msg)
+    if not moved:
+      conn.rollback()
+      return {'status': 'error', 'message': 'Nothing snoozed: ' + ' '.join(skipped)}
+    _log_event(cursor, plan_date, order, None, 'OrderSnoozed',
+               new_value=f'{len(moved)} lines -> {to_date.isoformat()}', actor=actor,
+               note=(('skipped: ' + ' '.join(skipped))[:500] if skipped else None))
+    _bump_revision(cursor, plan_date, actor)
+    _bump_revision(cursor, to_date, actor)
+    conn.commit()
+    return {'status': 'success', 'to_date': to_date.isoformat(),
+            'moved': moved, 'skipped': skipped}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Snooze order failed: {e}'}
   finally:
     conn.close()
 
