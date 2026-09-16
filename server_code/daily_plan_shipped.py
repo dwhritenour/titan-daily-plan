@@ -5,7 +5,7 @@ from .daily_ship_plan import (get_connection, _parse_date, serialize_row,
 make_serializable, _line_label, _customer_label)
 
 # =============================================================================
-# ORDERS SHIPPED BY DAY  (ship-1.0.0, 2026-09-16)
+# ORDERS SHIPPED BY DAY  (ship-1.1.0, 2026-09-16)
 #
 # Twin of daily_plan_completed / the wo_completed form, but the SOURCE is
 # e21: dbo.sales_orders_ship, Dave's extract of sales-order lines with an
@@ -16,10 +16,12 @@ make_serializable, _line_label, _customer_label)
 #                    e21 detection; the tablets will make this the build log)
 #   orders_shipped -> what actually left the building, per e21
 #
-# Facts (checked 2026-09-16): invoice date is a DATE, no time - so the day's
-# order comes from the work order's e21-shipped detection time when the line
-# has a work order (167 of 168 on 09/15), else the line sorts last with no
-# time. Work-inches: publish-time snapshot by item (pre-066 days fall back to
+# ship-1.1.0: the nightly EasyMorph job now carries nx_ship_date and
+# nx_ship_time - the moment the shipping clerk pressed Ship in e21. That is
+# the day basis and the clock (invoice date is the fallback if a row has no
+# ship date). Checked 09/15: all 168 rows stamped, e21 detection trails the
+# clerk's punch by 1-15 min, so the picture is the same only sharper.
+# Work-inches: publish-time snapshot by item (pre-066 days fall back to
 # order + SKU), else the day's plan line, else '-'. Zero-touch shown as Z, not
 # totalled. Comparison is against the PUBLISHED plan. Payload keys match the
 # wo_completed row template so the same row form renders both grids.
@@ -36,7 +38,10 @@ SELECT RTRIM(s.nx_order_numb) AS nx_order_numb, RTRIM(s.nx_rel_numb) AS nx_rel_n
        RTRIM(s.nx_item_status_desc) AS status, RTRIM(s.nx_carrier) AS carrier, RTRIM(s.nx_mos) AS mos,
        RTRIM(s.nx_cust_name) AS nx_cust_name, RTRIM(s.nx_cust_city) AS nx_cust_city,
        RTRIM(s.nx_cust_state) AS nx_cust_state, RTRIM(s.nx_shipto_code) AS shipto_code,
-       s.nx_ddate_invoice AS invoice_date,
+       s.nx_ddate_invoice AS invoice_date, s.nx_ship_date, s.nx_ship_time,
+       CASE WHEN s.nx_ship_date IS NOT NULL
+            THEN CAST(s.nx_ship_date AS DATETIME) + CAST(ISNULL(s.nx_ship_time, '00:00') AS DATETIME)
+            END                                          AS shipped_at,   -- clerk's Ship punch
        w.work_order_number, w.status AS wo_status, w.assigned_assembler, w.completed_at,
        fc.event_at AS floor_complete_at, sh.detected_at AS shipped_detected_at,
        snap.load_inches AS snap_load, snap.was_planned, snap.flag_codes,
@@ -78,8 +83,8 @@ LEFT JOIN dbo.pc_ship_plan_line pl
       AND pl.nx_order_numb = s.nx_order_numb
       AND pl.nx_rel_numb   = s.nx_rel_numb
       AND pl.nx_item_no    = CAST(s.nx_item_no AS VARCHAR(3))
-WHERE CAST(s.nx_ddate_invoice AS DATE) = %s
-ORDER BY CASE WHEN sh.detected_at IS NULL THEN 1 ELSE 0 END, sh.detected_at,
+WHERE ISNULL(s.nx_ship_date, CAST(s.nx_ddate_invoice AS DATE)) = %s
+ORDER BY CASE WHEN s.nx_ship_time IS NULL THEN 1 ELSE 0 END, s.nx_ship_time, sh.detected_at,
          s.nx_order_numb, s.nx_rel_numb, s.nx_item_no
 """
 
@@ -144,14 +149,14 @@ def orders_shipped_get_day(day):
     or ((r.get('part_type') or '') in ('CV', 'BV', 'MS') and load is None)
     state = _plan_state(r, was_planned)
     on_plan = state in ('Planned', 'Stretch')
-    basis = ('floor' if r.get('floor_complete_at') else
+    basis = ('ship' if r.get('shipped_at') else
              'e21' if r.get('shipped_detected_at') else 'invoice')
     tot['n'] += 1
     if r.get('work_order_number') is None:
       tot['n_no_wo'] += 1
     if (r.get('part_type') or '') in ('CV', 'BV', 'MS'):
       tot['n_stock_type'] += 1
-    tot['n_floor' if basis == 'floor' else 'n_e21'] += 1
+    tot['n_e21'] += 1
     if on_plan:
       tot['n_planned_done'] += 1
     if zero:
@@ -163,7 +168,7 @@ def orders_shipped_get_day(day):
       tot['actual_inches'] += float(load)
       tot['actual_planned_inches' if on_plan else 'actual_unplanned_inches'] += float(load)
     r.update({
-      'done_at': r.get('shipped_detected_at') or r.get('invoice_date'),   # row's Time column
+      'done_at': r.get('shipped_at') or r.get('shipped_detected_at') or r.get('invoice_date'),
       'line_label': _line_label(r['nx_order_numb'], r.get('nx_rel_numb'), r.get('nx_item_no')),
       'customer': _customer_label(r.get('nx_cust_name'), r.get('nx_cust_city'),
                                   r.get('nx_cust_state'), r.get('shipto_code')),

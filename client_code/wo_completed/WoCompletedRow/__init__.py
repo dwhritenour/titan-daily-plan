@@ -20,7 +20,9 @@ class WoCompletedRow(WoCompletedRowTemplate):
     self.lbl_time.text = (it.get('done_at') or '')[11:16]
     self.lbl_time.tooltip = {'floor': 'closed on the floor (Complete event)',
                              'e21': 'e21 shows the line shipped (import detection)',
-                             'completed_at': 'work order completed_at'}.get(it.get('basis'), '')
+                             'completed_at': 'work order completed_at',
+                             'ship': 'shipping clerk pressed Ship in e21',
+                             'invoice': 'e21 invoice date (no time)'}.get(it.get('basis'), '')
     self.lbl_line.text = it.get('line_label') or it.get('nx_order_numb') or ''
     self.lbl_line.bold = True
     self.lbl_what.text = it.get('nx_sku') or ''
