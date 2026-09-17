@@ -152,6 +152,10 @@ def _s_2(v):
   return None if v is None else f"{float(v):.2f}"
 
 
+def _s_3(v):
+  return None if v is None else f"{float(v):.3f}"
+
+
 def _s_pct(v):
   return None if v is None else f"{float(v):.0f}"
 
@@ -263,8 +267,8 @@ def _numbers(cursor, plan_date, run, p, np):
         'shipped_inches': _s_int(shipped),
         'shipped_planned': _s_int(L.get('shipped_planned_inches')),
         'unplanned_pct': _s_pct(unplanned_pct),
-        'daily_ratio': _s_2(L.get('daily_ratio')),
-        'rolling_ratio': _s_2(rolling),
+        'daily_ratio': _s_3(L.get('daily_ratio')),
+        'rolling_ratio': _s_3(rolling),
         'rolling_days': str(rolling_days) if rolling_days else None,
         'band_text': band_text,
         'attainment_pct': _s_1(L.get('attainment_pct')),
@@ -577,15 +581,16 @@ def _week_impl(cursor, end_date):
       ORDER BY n.seq
   """)
   next_up = [dict(r) for r in cursor.fetchall()]
+  # (SQL Server refuses a subquery inside an aggregate - error 130 - so
+  # three scalar subqueries, not one SUM(CASE WHEN EXISTS ...))
   cursor.execute("""
-      SELECT COUNT(*) AS active,
-             SUM(CASE WHEN EXISTS (SELECT 1 FROM dbo.pc_teaching_nugget_log l
-                                   WHERE l.nugget_id = n.nugget_id AND l.channel = 'MEETING')
-                      THEN 1 ELSE 0 END) AS taught_meeting,
-             SUM(CASE WHEN EXISTS (SELECT 1 FROM dbo.pc_teaching_nugget_log l
-                                   WHERE l.nugget_id = n.nugget_id AND l.channel = 'ASSEMBLY')
-                      THEN 1 ELSE 0 END) AS taught_assembly
-      FROM dbo.pc_teaching_nugget n WHERE n.is_active = 1
+      SELECT (SELECT COUNT(*) FROM dbo.pc_teaching_nugget WHERE is_active = 1) AS active,
+             (SELECT COUNT(DISTINCT l.nugget_id) FROM dbo.pc_teaching_nugget_log l
+              JOIN dbo.pc_teaching_nugget n ON n.nugget_id = l.nugget_id
+              WHERE n.is_active = 1 AND l.channel = 'MEETING') AS taught_meeting,
+             (SELECT COUNT(DISTINCT l.nugget_id) FROM dbo.pc_teaching_nugget_log l
+              JOIN dbo.pc_teaching_nugget n ON n.nugget_id = l.nugget_id
+              WHERE n.is_active = 1 AND l.channel = 'ASSEMBLY') AS taught_assembly
   """)
   c = cursor.fetchone()
   return {
