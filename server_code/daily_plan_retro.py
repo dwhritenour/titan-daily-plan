@@ -933,13 +933,59 @@ def retro_confirm(variance_id, reading, evidence_class, cause_key,
           ck['variance_kind'], resolution, int(variance_id)))
     if cursor.rowcount == 0:
       return {'status': 'error', 'message': 'Nothing to confirm (no answer yet?).'}
+    # 071: a CONFIRMED material_short reading places a material hold on the
+    # e21 line (X05 gate) - Dave is the gatekeeper, so it happens here and
+    # nowhere earlier. Silent no-op until migration 071 is applied.
+    hold = None
+    if cause_key == 'material_short' and resolution in ('EXPLAINED', 'EXCEPTION', 'RULE_CANDIDATE'):
+      hold = _place_material_hold(cursor, int(variance_id), reading)
     conn.commit()
-    return {'status': 'success', 'warning': warn}
+    return {'status': 'success', 'warning': warn, 'hold': hold}
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'{e}'}
   finally:
     conn.close()
+
+
+def _place_material_hold(cursor, variance_id, reading):
+  """071: EXEC dbo.sp_pc_place_line_hold for the variance's e21 line.
+  The proc inserts/extends the hold, unplaces live plan lines for the item
+  (today onward), logs the events and re-stamps published days. Returns a
+  small dict for the review form's notification, or None."""
+  cursor.execute("SELECT OBJECT_ID('dbo.sp_pc_place_line_hold') AS o")
+  if not (cursor.fetchone() or {}).get('o'):
+    return None
+  cursor.execute("""
+      SELECT v.plan_date, v.nx_order_numb, v.nx_sku, v.nx_rel_numb, v.nx_item_no
+      FROM dbo.pc_plan_variance v WHERE v.variance_id = %s
+  """, (variance_id,))
+  v = cursor.fetchone()
+  if not v:
+    return None
+  rel, item = v.get('nx_rel_numb'), v.get('nx_item_no')
+  if not (rel and item):
+    # pre-066 variance row: resolve the item through the plan line
+    cursor.execute("""
+        SELECT TOP 1 nx_rel_numb, nx_item_no FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_sku = %s
+        ORDER BY nx_rel_numb, nx_item_no
+    """, (v['plan_date'], v['nx_order_numb'], v['nx_sku']))
+    pl = cursor.fetchone()
+    if not pl:
+      return None
+    rel, item = pl['nx_rel_numb'], pl['nx_item_no']
+  reason = (reading or '').strip() or 'Material short (retro answer)'
+  cursor.execute("""
+      EXEC dbo.sp_pc_place_line_hold @order = %s, @rel = %s, @item = %s,
+           @reason = %s, @placed_by = %s, @source_variance_id = %s
+  """, (v['nx_order_numb'], rel, item, reason[:500], 'Dave (retro)', variance_id))
+  r = cursor.fetchone() or {}
+  return {'line': _line_txt({'nx_order_numb': v['nx_order_numb'], 'nx_rel_numb': rel,
+                             'nx_item_no': item, 'nx_sku': v.get('nx_sku')}),
+          'expires_on': make_serializable(r.get('expires_on')),
+          'n_unplaced': int(r.get('n_unplaced') or 0),
+          'created': bool(r.get('created'))}
 
 
 @anvil.server.callable

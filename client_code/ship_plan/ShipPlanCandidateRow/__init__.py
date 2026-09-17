@@ -184,6 +184,19 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
                               color='#a16207'))
     if len(lines) == 2 and not item.get('flags'):
       lines.append(self._line('No flags on this line.'))
+    # 071: a material hold (X05) can be released by PC right here
+    on_release = item.get('on_release_hold')
+    held = any(f['code'] == 'X05' for f in (item.get('flags') or []))
+    if held and on_release:
+      panel = ColumnPanel(spacing_above='none', spacing_below='none')
+      for l in lines:
+        panel.add_component(l)
+      choice = alert(content=panel, title='Flags',
+                     buttons=[('Release hold', 'release'), ('Close', None)],
+                     large=False)
+      if choice == 'release':
+        on_release(self.item)
+      return
     self._popup('Flags', lines)
 
   def _show_load_details(self, **event_args):

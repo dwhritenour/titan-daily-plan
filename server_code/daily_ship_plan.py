@@ -1309,7 +1309,7 @@ def ship_plan_mark_unplaced(plan_date, order, rel, item, note=None):
 
 @anvil.server.callable
 def ship_plan_release_hold(order, rel, item, note=None):
-  """068: PC releases a material hold (X05) from the candidate flag
+  """071: PC releases a material hold (X05) from the candidate flag
   popup - stock arrived, or the answer was wrong. The line re-enters
   ranking on the next refresh."""
   conn = get_connection()

@@ -1,81 +1,84 @@
-from ._anvil_designer import retro_reviewTemplate
+from ._anvil_designer import RetroReviewRowTemplate
 from anvil import *
 import anvil.server
 
 
-class retro_review(retro_reviewTemplate):
+class RetroReviewRow(RetroReviewRowTemplate):
   """
-    Retro review — Dave confirms the agent's reading of each answer.
-    Reached from the completion text (<app-url>#retrev). Everything
-    answered-but-unconfirmed, across all days, in one list; the PIN is
-    typed once at the top and sent with every Confirm.
-
-    Designer components (spec: documents/Retro_Forms_Specification.md):
-      header:  lk_plan ('← Daily Plan'), lbl_title, lbl_summary, btn_refresh,
-               tb_pin (TextBox, hide_text=True, placeholder "PIN")
-      grid:    rp_queue (RepeatingPanel, item_template RetroReviewRow)
-      panels:  ta_days (TextArea read-only: which days still owe answers),
-               ta_recent (TextArea read-only: last confirmed readings),
-               ta_causes (TextArea read-only: 14-day cause counts + rule candidates)
+    One answered question for Dave to confirm. Designer components:
+      lbl_head      date · order / SKU · case · side (bold)
+      lbl_question  the question
+      lbl_answer    "Answer (Tara, 09/09 08:12): …"
+      tb_reading    TextBox — the agent's reading, editable
+      dd_evidence   DropDown — Verified / Probable / Unverified / Disputed / Unknown
+      dd_cause      DropDown — cause keys (label shown, key stored)
+      dd_resolution DropDown — EXPLAINED / EXCEPTION / RULE_CANDIDATE / CLOSED_UNKNOWN / DISPUTED
+      btn_confirm   'Confirm reading'
+      lbl_status    small status line (optional)
   """
 
-  _CASE_TXT = {'UNTOUCHED': 'no recorded activity',
-               'REMOVED_NO_REASON': 'removed, no reason recorded',
-               'REMOVED_WITH_REASON': 'removed with reason',
-               'UNPLANNED_SHIP': 'shipped, not on the plan',
-               'DATE_MOVED': 'ship-by moved', 'SHIPPED': 'shipped',
-               'WORKED': 'worked', 'UNTOUCHED_STRETCH': 'stretch, not reached'}
+  _EVIDENCE = ['Verified', 'Probable', 'Unverified', 'Disputed', 'Unknown']
+  _RESOLUTION = ['EXPLAINED', 'EXCEPTION', 'RULE_CANDIDATE', 'CLOSED_UNKNOWN', 'DISPUTED']
 
   def __init__(self, **properties):
     self.init_components(**properties)
-    self.data = {}
-    self.lk_plan.set_event_handler('click', self._go_plan)
-    self.btn_refresh.set_event_handler('click', lambda **e: self.load())
-    self.tb_pin.placeholder = 'PIN'
-    self.load()
+    self.btn_confirm.set_event_handler('click', self._confirm)
+    self._paint()
 
-  def _go_plan(self, **event_args):
-    set_url_hash('')
-    open_form('ship_plan')
+  def _paint(self):
+    q = self.item or {}
+    side = 'Sales' if q.get('routed_to') == 'SALES' else 'Production Control'
+    self.lbl_head.text = (f"{q.get('plan_date')}  ·  {q.get('nx_order_numb')}{('-' + (q.get('nx_rel_numb') or '') + '-' + q['nx_item_no']) if q.get('nx_item_no') else ''} / {q.get('nx_sku')}"
+                          f"  ·  {q.get('case_text', '')}  ·  {side}")
+    self.lbl_question.text = q.get('question_text') or ''
+    self.lbl_answer.text = (f"Answer ({q.get('answered_by') or '—'}, "
+                            f"{(q.get('answered_at') or '')[:16]}): {q.get('answer_text') or ''}")
 
-  def pin(self):
-    return (self.tb_pin.text or '').strip()
+    pending = not q.get('proposed_reading')
+    self.tb_reading.text = q.get('proposed_reading') or ''
+    self.tb_reading.placeholder = ('Agent reading pending — refresh in a minute'
+                                   if pending else 'Reading')
+    self.dd_evidence.items = self._EVIDENCE
+    self.dd_evidence.selected_value = q.get('proposed_evidence_class') or 'Probable'
+    causes = []
+    try:
+      causes = get_open_form().causes()
+    except Exception:
+      pass
+    self.dd_cause.items = [(f"{c['cause_key']} — {c['label']}", c['cause_key']) for c in causes]
+    self.dd_cause.selected_value = q.get('proposed_cause_key') or (causes[0]['cause_key'] if causes else None)
+    self.dd_resolution.items = self._RESOLUTION
+    self.dd_resolution.selected_value = 'EXPLAINED'
+    self.btn_confirm.text = 'Confirm reading'
+    self.btn_confirm.enabled = not pending
+    if hasattr(self, 'lbl_status'):
+      self.lbl_status.text = ''
 
-  def causes(self):
-    return self.data.get('causes') or []
-
-  def load(self):
-    r = anvil.server.call('retro_get_review')
-    if r.get('status') != 'success':
-      alert(r.get('message', 'Review load failed'))
+  def _confirm(self, **event_args):
+    q = self.item or {}
+    pin = ''
+    try:
+      pin = get_open_form().pin()
+    except Exception:
+      pass
+    res = anvil.server.call('retro_confirm', q['variance_id'], self.tb_reading.text,
+                            self.dd_evidence.selected_value, self.dd_cause.selected_value,
+                            self.dd_resolution.selected_value, pin)
+    if res.get('status') != 'success':
+      alert(res.get('message', 'Confirm failed'))
       return
-    self.data = r
-    queue = r.get('queue') or []
-    for q in queue:
-      q['case_text'] = self._CASE_TXT.get(q.get('variance_case'), q.get('variance_case'))
-    self.lbl_title.text = 'Retro review'
-    self.lbl_summary.text = (f"{len(queue)} answer(s) awaiting your reading"
-                             if queue else 'Nothing awaiting you.')
-    self.rp_queue.items = queue
-
-    if hasattr(self, 'ta_days'):
-      days = r.get('days') or []
-      self.ta_days.text = '\n'.join(
-        f"{d['plan_date']}: {d['n_asked']} asked · {d['n_unanswered']} unanswered · "
-        f"{d['n_awaiting_dave']} awaiting you" for d in days) or 'No retro days yet.'
-    if hasattr(self, 'ta_recent'):
-      rec = r.get('recent') or []
-      self.ta_recent.text = '\n'.join(
-        f"{c['plan_date']}  {c['nx_order_numb']}{('-' + (c.get('nx_rel_numb') or '') + '-' + c['nx_item_no']) if c.get('nx_item_no') else ''} / {c['nx_sku']}  [{c.get('routed_to')}]  "
-        f"{c.get('confirmed_reading')}  — {c.get('evidence_class')} · {c.get('cause_key')} · "
-        f"{c.get('resolution')}" for c in rec) or 'No confirmed readings yet.'
-    if hasattr(self, 'ta_causes'):
-      wk = r.get('week_causes') or []
-      rules = r.get('rule_candidates') or []
-      lines = [f"{c.get('cause_key')} × {c['n']}" + ('   ● rule candidate' if int(c['n']) >= 3 else '')
-               for c in wk] or ['No confirmed causes in the last 14 days.']
-      if rules:
-        lines.append('')
-        lines.append('Rule candidates awaiting you:')
-        lines += [f"  #{x['rule_id']}  {x['title']}  [{x['status']}]" for x in rules]
-      self.ta_causes.text = '\n'.join(lines)
+    for c in (self.tb_reading, self.dd_evidence, self.dd_cause, self.dd_resolution, self.btn_confirm):
+      c.enabled = False
+    self.btn_confirm.text = 'Confirmed'
+    status_txt = 'Confirmed.' + (f"  ({res['warning']})" if res.get('warning') else '')
+    # 071: a confirmed material_short reading placed (or extended) a hold
+    h = res.get('hold')
+    if h:
+      what = 'placed' if h.get('created') else 'extended'
+      txt = f"Material hold {what} on {h.get('line')} until {h.get('expires_on')}"
+      if h.get('n_unplaced'):
+        txt += f"; {h['n_unplaced']} plan line(s) unplaced"
+      status_txt += '  ' + txt
+      Notification(txt, timeout=6).show()
+    if hasattr(self, 'lbl_status'):
+      self.lbl_status.text = status_txt

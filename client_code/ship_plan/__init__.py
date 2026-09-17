@@ -134,10 +134,10 @@ class ship_plan(ship_planTemplate):
       self.lk_retro_review.text = 'Retro review'
       self.lk_retro_review.set_event_handler('click', lambda **e: open_form('retro_review'))
     if hasattr(self, 'lk_completed'):        # wo-1.0.0 (2026-09-16)
-      self.lk_completed.text = 'WO Progress'
+      self.lk_completed.text = 'Completed'
       self.lk_completed.set_event_handler('click', lambda **e: open_form('wo_completed'))
     if hasattr(self, 'lk_shipped'):          # ship-1.0.0 (2026-09-16)
-      self.lk_shipped.text = 'WO Shipped'
+      self.lk_shipped.text = 'Shipped'
       self.lk_shipped.set_event_handler('click', lambda **e: open_form('orders_shipped'))
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
@@ -242,7 +242,7 @@ class ship_plan(ship_planTemplate):
     for it in items:
       it['on_add'] = self._add_line if self.is_pc else None
       it['on_add_order'] = self._add_order if self.is_pc else None
-      it['on_release_hold'] = self._release_hold if self.is_pc else None   # 068
+      it['on_release_hold'] = self._release_hold if self.is_pc else None   # 071
     self.rp_candidates.items = items
     # Header says what the list IS — gated-last / priority-first
     # (flag system 041), and exactly how much of the match survived
@@ -700,7 +700,7 @@ class ship_plan(ship_planTemplate):
     self.load_day()
 
   def _release_hold(self, item):
-    """068: PC releases a material hold (X05) - stock arrived, or the
+    """071: PC releases a material hold (X05) - stock arrived, or the
     retro answer was wrong. Reason is optional; the line re-ranks now."""
     lbl = line_label(item, with_sku=False)
     tb = TextBox(placeholder='why (optional) - e.g. stock received')
