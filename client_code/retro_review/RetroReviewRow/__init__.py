@@ -70,5 +70,15 @@ class RetroReviewRow(RetroReviewRowTemplate):
     for c in (self.tb_reading, self.dd_evidence, self.dd_cause, self.dd_resolution, self.btn_confirm):
       c.enabled = False
     self.btn_confirm.text = 'Confirmed'
+    status_txt = 'Confirmed.' + (f"  ({res['warning']})" if res.get('warning') else '')
+    # 071: a confirmed material_short reading placed (or extended) a hold
+    h = res.get('hold')
+    if h:
+      what = 'placed' if h.get('created') else 'extended'
+      txt = f"Material hold {what} on {h.get('line')} until {h.get('expires_on')}"
+      if h.get('n_unplaced'):
+        txt += f"; {h['n_unplaced']} plan line(s) unplaced"
+      status_txt += '  ' + txt
+      Notification(txt, timeout=6).show()
     if hasattr(self, 'lbl_status'):
-      self.lbl_status.text = ('Confirmed.' + (f"  ({res['warning']})" if res.get('warning') else ''))
+      self.lbl_status.text = status_txt
