@@ -929,7 +929,7 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
           UPDATE dbo.pc_ship_plan_line
           SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
           WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-      """, (board_note[:500], actor, plan_date, order, rel, item))
+      """, (board_note[:200], actor, plan_date, order, rel, item))
       _log_event(cursor, plan_date, order, agg['sku'], 'GateOverride',
                  new_value=gate_codes, actor=actor,
                  note=(why or 'pre-build straining element'), rel=rel, item=item)
@@ -2086,6 +2086,10 @@ def _upsert_proposed_line(cursor, plan_date, order, rel, item, rows, agg, tier,
   ex = cursor.fetchone()
   if ex and ex['line_status'] in _ACTIVE_STATUSES:
     return False
+  # priority_note is VARCHAR(200); the proposal reason may run to 500 now
+  # that v1.2 appends the SHORT clause (2026-09-18 review). Truncating
+  # here keeps the full text on pc_agent_proposal_line.reason.
+  note = (reason or '')[:200] or None
   if ex:   # Removed earlier today — revive under the PK
     _delete_source_rows(cursor, plan_date, order, rel, item)
     cursor.execute("""
@@ -2099,7 +2103,7 @@ def _upsert_proposed_line(cursor, plan_date, order, rel, item, rows, agg, tier,
         WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
     """, (agg['sku'], agg['qty'], agg['ship_by'], agg['shipto'], agg['carrier'],
           agg['inches'], agg['minutes'], agg['surcharge'],
-          tier, reason, actor, actor, plan_date, order, rel, item))
+          tier, note, actor, actor, plan_date, order, rel, item))
     _insert_source_rows(cursor, plan_date, order, rel, item, rows)
   else:
     _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
@@ -2108,7 +2112,7 @@ def _upsert_proposed_line(cursor, plan_date, order, rel, item, rows, agg, tier,
         UPDATE dbo.pc_ship_plan_line
         SET line_status = 'Proposed', proposed_by = %s, priority_note = %s
         WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (actor, reason, plan_date, order, rel, item))
+    """, (actor, note, plan_date, order, rel, item))
   return True
 
 
