@@ -55,6 +55,7 @@ Created: August 2026
 import anvil.server
 import threading
 import os
+import re
 import time
 from datetime import datetime, date, timedelta
 from decimal import Decimal
@@ -1984,7 +1985,32 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.1'   # 066: item-level lines, ordered qty
+_AGENT_VERSION = 'v1.2'   # 066: item-level lines, ordered qty; v1.2: planned-short rule
+
+_DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
+
+
+def _due_in_eta(line_notes):
+  """The ETA in a line's X06 note - the view's contract (075) is that the
+  note ALWAYS starts 'Due in <yyyy-mm-dd>' or 'Due in (no ETA on PO)'.
+  None when there is no X06, no ETA, or the text is not a date."""
+  for n in line_notes or []:
+    if (n.get('flag_code') or '') == 'X06':
+      m = _DUE_IN_RE.match(n.get('note') or '')
+      if m:
+        try:
+          return date.fromisoformat(m.group(1))
+        except ValueError:
+          return None
+  return None
+
+
+def _short_clause(m):
+  """'608467-001-190 / SKU X02 no stock' - one gated sibling left off."""
+  first = (m.get('short_note') or '').split(' - ')[0].split(':')[0].split(' (')[0].strip()
+  return (f"{_line_label(m['nx_order_numb'], m['nx_rel_numb'], m['nx_item_no'], m['nx_sku'])} "
+          f"{(m.get('gate_codes') or '').replace(',', ' ')}"
+          + (f' {first.lower()}' if first else '')).strip()
 
 
 def _agent_params(cursor):
@@ -2211,14 +2237,23 @@ def _agent_propose_impl(plan_date=None, force=False):
     # with the SAME detail ship-by date is proposed with it. Assembly
     # techs run each order as a mini-project; a partial order on the
     # board is chaos. So the ATOM is the group (order, ship_by_date):
-    #   - zero-touch and gated siblings RIDE ALONG (visible at zero /
-    #     visible blockers - e21 backorders what cannot ship). They are
-    #     never picked on their own: a group needs a DRIVER (ungated,
-    #     non-zero line) to be proposed at all.
+    #   - zero-touch siblings RIDE ALONG (visible at zero). A GATED
+    #     sibling rides ONLY when its gate is X06 with stock due in between
+    #     today and the plan date - the order can still ship complete
+    #     (planned-short rule, Dave 2026-09-18). Any other gate (X01 hold,
+    #     X02 no stock, X03 committed elsewhere, X05 material hold, X06
+    #     overdue / due later / no ETA) leaves the line OFF the plan and the order
+    #     is proposed SHORT - every driver's reason names the line, so
+    #     the plan never says 'build 23' when 22 can be built. Visible is
+    #     enough; no confirmation step. The check runs every morning, so
+    #     a slipped ETA drops the line the next run. Neither kind is
+    #     picked on its own: a group needs a DRIVER (ungated, non-zero
+    #     line) to be proposed at all.
     #   - a sibling PC snoozed, or planned on another day, BLOCKS the
     #     group - PC already decided; reported, never overridden.
-    #   - a ship-complete order (nx_order_type 'S') with a gated sibling
-    #     is BLOCKED: nothing on it can ship until the gate clears.
+    #   - a ship-complete order (nx_order_type 'S') with a SHORT sibling
+    #     is BLOCKED: it cannot go short, nothing on it ships until the
+    #     gate clears (an X06 due in by the plan date is not short).
     #   - a group bigger than the whole day, or than AGENT_MAX_LINE_PCT
     #     of the fill target, is a SPLIT DECISION for PC - not proposed.
     #   - first-fit by the group's best ungated line (the candidate order
@@ -2254,6 +2289,7 @@ def _agent_propose_impl(plan_date=None, force=False):
       groups[k].append(c)
 
     picks, deferred, gated, split_needed, blocked = [], [], [], [], []
+    short_lines = []
     skipped_zero = n_groups = 0
     for k in group_order:
       members = groups[k]
@@ -2267,10 +2303,48 @@ def _agent_propose_impl(plan_date=None, force=False):
         else:
           skipped_zero += len(members)   # pure pick-and-ship order: not the agent's to propose
         continue
+      # planned-short rule (v1.2): split the group into the lines that
+      # ride (ungated, or X06 due in by the plan date) and the SHORT
+      # lines (any other gate) that stay off the plan.
+      riders, short = [], []
+      for m in members:
+        if not m.get('is_gated'):
+          riders.append(m)
+          continue
+        lnotes = notes.get((order, m['nx_rel_numb'], m['nx_item_no']), [])
+        eta = _due_in_eta(lnotes)
+        # an ETA already in the past with on-hand still 0 is a slipped PO,
+        # not stock on the way (X06 says OVERDUE): that line goes short.
+        if eta is not None and date.today() <= eta <= plan_date:
+          m['due_in'] = eta.isoformat()
+          riders.append(m)
+        else:
+          xn = [n['note'] for n in lnotes if (n['flag_code'] or '')[:1] == 'X']
+          m['short_note'] = xn[0] if xn else ''
+          short.append(m)
+      # a ship-complete order (nx_order_type 'S') cannot go short: nothing
+      # on it ships until the gate clears. Checked BEFORE the elsewhere
+      # test so the block reason names the real cause.
+      if short and order in ship_complete:
+        why = (f"ship-complete order; {_line_label(order, short[0]['nx_rel_numb'], short[0]['nx_item_no'], short[0]['nx_sku'])} "
+               f"gated {short[0].get('gate_codes') or ''}").strip()
+        for m in members:
+          m['block_reason'] = why
+        blocked.extend(members)
+        continue
+      short_txt = ''
+      if short:
+        short_txt = ('SHORT ' + str(len(short)) + (' line' if len(short) == 1 else ' lines')
+                     + ' off the plan: ' + '; '.join(_short_clause(m) for m in short))[:200]
+        for m in short:
+          m['short_of'] = order
+        short_lines.extend(short)
+      members = riders
       load = sum(float(m.get('load_inches') or 0) for m in members)
       for m in members:
         m['group_inches'] = load
         m['group_n'] = len(members)
+        m['group_short'] = short_txt
         m['rides_along'] = not any(m is d for d in drivers)
       blk = [m for m in members
              if (order, m['nx_rel_numb'], m['nx_item_no']) in elsewhere]
@@ -2279,14 +2353,6 @@ def _agent_propose_impl(plan_date=None, force=False):
         when = str(e.get('snooze_to_date') or e.get('plan_date') or '')[:10]
         why = (f"sibling {_line_label(order, blk[0]['nx_rel_numb'], blk[0]['nx_item_no'], blk[0]['nx_sku'])} already "
                f"{'snoozed to' if e['line_status'] == 'Snoozed' else 'planned on'} {when}")
-        for m in members:
-          m['block_reason'] = why
-        blocked.extend(members)
-        continue
-      gm = [m for m in members if m.get('is_gated')]
-      if gm and order in ship_complete:
-        why = (f"ship-complete order; {_line_label(order, gm[0]['nx_rel_numb'], gm[0]['nx_item_no'], gm[0]['nx_sku'])} "
-               f"gated {gm[0].get('gate_codes') or ''}").strip()
         for m in members:
           m['block_reason'] = why
         blocked.extend(members)
@@ -2334,8 +2400,9 @@ def _agent_propose_impl(plan_date=None, force=False):
       key = (order, rel, item)
       due = str(c.get('ship_by_date') or '')[:10]
       if c.get('rides_along'):
-        how = (f"gated {c.get('gate_codes') or ''}".strip() if c.get('is_gated')
-               else 'zero-touch')
+        how = ((f"stock due in {c.get('due_in')}, gated {c.get('gate_codes') or ''}".strip()
+                if c.get('due_in') else f"gated {c.get('gate_codes') or ''}".strip())
+               if c.get('is_gated') else 'zero-touch')
         reason = (f"{tier}: rides with order {order} — whole-order rule, due {due} "
                   f"({how}) — {float(c.get('load_inches') or 0):,.1f} in")[:500]
       else:
@@ -2343,6 +2410,8 @@ def _agent_propose_impl(plan_date=None, force=False):
         if int(c.get('group_n') or 1) > 1:
           reason = (reason + f" · order {int(c['group_n'])} lines, "
                     f"{float(c.get('group_inches') or 0):,.0f} in together")[:500]
+      if c.get('group_short'):
+        reason = (reason + ' · ' + c['group_short'])[:500]
       cursor.execute("""
           INSERT INTO dbo.pc_agent_proposal_line
               (proposal_id, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no,
@@ -2382,6 +2451,13 @@ def _agent_propose_impl(plan_date=None, force=False):
                      'ship_by': o.get('ship_by_date'), 'flags': o.get('flag_codes'),
                      'why': o.get('split_reason')}
                     for o in oversize[:15]]
+    short_out = [{'order': s['nx_order_numb'], 'sku': s['nx_sku'],
+                  'item': s['nx_item_no'], 'line': _line_label(s['nx_order_numb'], s['nx_rel_numb'], s['nx_item_no']),
+                  'load_inches': float(s.get('load_inches') or 0),
+                  'gates': s.get('gate_codes'), 'score': int(s.get('priority_score') or 0),
+                  'ship_by': s.get('ship_by_date'), 'note': s.get('short_note'),
+                  'short_of': s.get('short_of')}
+                 for s in short_lines[:25]]
     blocked_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
                     'item': o['nx_item_no'], 'line': _line_label(o['nx_order_numb'], o['nx_rel_numb'], o['nx_item_no']),
                     'load_inches': float(o.get('load_inches') or 0),
@@ -2411,6 +2487,7 @@ def _agent_propose_impl(plan_date=None, force=False):
             'rule': 'WHOLE_ORDER', 'n_groups': n_groups,
             'n_stretch_groups': n_stretch_groups,
             'n_blocked': len(blocked), 'blocked': blocked_out,
+            'n_short': len(short_lines), 'short': short_out,
             'lines': out_lines, 'gated': gated_out, 'oversize': oversize_out,
             'snapshot_warning': snapshot_warning}
   except Exception as e:
