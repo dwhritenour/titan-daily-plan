@@ -494,6 +494,8 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
   flag_filter (2026-09-01, the single Flag dropdown): None/'ALL' = all;
   'PLANNABLE' / 'GATED' = by is_gated; 'ANY_A' / 'ANY_B' = carries any
   flag of that category; or one code ('X03', 'B02') = carries it.
+  'GATED_DUE_IN' (075, 2026-09-18) = gated AND a PO is on the way for the
+  SKU (gate X06) - the Sales / PC review list for "when can we ship it".
   Applied server-side so the header count stays honest."""
   conn = get_connection()
   try:
@@ -540,6 +542,11 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
       where.append("ISNULL(fs.is_gated, 0) = 0")
     elif ff == 'GATED':
       where.append("ISNULL(fs.is_gated, 0) = 1")
+    elif ff == 'GATED_DUE_IN':
+      # 075: X06 rides in gate_codes (CSV) like any X code (parameter, not
+      # a literal - the shared WHERE is %-formatted by pymssql)
+      where.append("',' + ISNULL(fs.gate_codes, '') + ',' LIKE %s")
+      args.append('%,X06,%')
     elif ff in ('ANY_A', 'ANY_B'):
       # flag_codes is a CSV ('A01,A05,B02'); wrap in commas, LIKE ',A__,'
       where.append("',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s")
@@ -836,10 +843,18 @@ def _ensure_header(cursor, plan_date, actor):
 
 
 @anvil.server.callable
-def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None):
+def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
+                       override_note=None):
   """Add one e21 line (order, release, item) to a day. The line is ALWAYS
   added — over-cap is reported back so the client runs the cap-hit dialog
-  (snooze / unplaced / stretch / keep). Never a silent drop."""
+  (snooze / unplaced / stretch / keep). Never a silent drop.
+  override_note (075, 2026-09-18): NOT None means PC is adding a line the
+  gates say cannot ship - today only X06 'No stock - due in', to pre-build
+  the straining element while the body is on the water. The live gate
+  codes are recorded in a GateOverride event (new_value) and the note is
+  written to priority_note so the board shows PRE-BUILD on the line. The
+  retro judges lines on WORKED_ON, so a pre-build SE starts closes as
+  WORKED and one nobody touched earns the normal PC question."""
   plan_date = _parse_date(plan_date)
   if tier not in ('Must', 'Next', 'Stretch'):
     return {'status': 'error', 'message': f'Bad tier {tier}.'}
@@ -847,6 +862,18 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None):
   conn = get_connection()
   try:
     cursor = conn.cursor()
+    gate_codes = None
+    if override_note is not None:
+      cursor.execute("""
+          SELECT gate_codes FROM dbo.vw_pc_order_flag_scores
+          WHERE nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+            AND is_gated = 1
+      """, (order, rel, item))
+      grow = cursor.fetchone()
+      gate_codes = (grow or {}).get('gate_codes')
+      if not gate_codes:
+        # the gate cleared between the popup and the click - a plain add
+        override_note = None
     cursor.execute("""
         SELECT line_status, nx_sku FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
@@ -890,6 +917,21 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None):
                new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in "
                f"({tier})",
                actor=actor, rel=rel, item=item)
+    if override_note is not None:
+      # 075: the override is its own event (the Added event stays plain so
+      # every add reads the same in the retro); the note goes on the line.
+      why = (override_note or '').strip()
+      board_note = 'PRE-BUILD (gate ' + gate_codes.replace(',', ' ') + ' overridden)'
+      if why:
+        board_note += ': ' + why
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (board_note[:500], actor, plan_date, order, rel, item))
+      _log_event(cursor, plan_date, order, agg['sku'], 'GateOverride',
+                 new_value=gate_codes, actor=actor,
+                 note=(why or 'pre-build straining element'), rel=rel, item=item)
     _bump_revision(cursor, plan_date, actor)
 
     planned = _planned_inches(cursor, plan_date)
@@ -900,7 +942,8 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None):
     return {'status': 'success', 'planned_inches': round(planned, 1),
             'capacity_inches': round(cap, 1), 'over_capacity': over,
             'line_inches': round(agg['inches'], 1),
-            'suggested_day': suggested, 'label': label}
+            'suggested_day': suggested, 'label': label,
+            'gate_override': gate_codes}
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Add failed: {e}'}

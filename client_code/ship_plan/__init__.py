@@ -243,6 +243,7 @@ class ship_plan(ship_planTemplate):
       it['on_add'] = self._add_line if self.is_pc else None
       it['on_add_order'] = self._add_order if self.is_pc else None
       it['on_release_hold'] = self._release_hold if self.is_pc else None   # 071
+      it['on_add_due_in'] = self._add_due_in if self.is_pc else None        # 075
     self.rp_candidates.items = items
     # Header says what the list IS — gated-last / priority-first
     # (flag system 041), and exactly how much of the match survived
@@ -260,8 +261,13 @@ class ship_plan(ship_planTemplate):
         else:
           txt += f' — {total}'
       n_gated = sum(1 for it in items if it.get('is_gated'))
+      # 075: how many of the gated rows have stock on the way (X06)
+      n_due_in = sum(1 for it in items
+                     if 'X06' in (it.get('gate_codes') or '').split(','))
       if n_gated:
         txt += f' · {n_gated} gated'
+        if n_due_in:
+          txt += f' ({n_due_in} due in)'
       self.lbl_candidates_header.text = txt
     self._render_feed_chip(result)
 
@@ -334,6 +340,8 @@ class ship_plan(ship_planTemplate):
         return False
       if ff == 'GATED' and not gated:
         return False
+      if ff == 'GATED_DUE_IN' and 'X06' not in codes:      # 075
+        return False
       if ff in ('ANY_A', 'ANY_B') and not any(c.startswith(ff[-1]) for c in codes):
         return False
       if len(ff) == 3 and ff[0] in 'XABC' and ff[1:].isdigit() and ff not in codes:
@@ -366,6 +374,7 @@ class ship_plan(ship_planTemplate):
     items = [('All flags', 'ALL'),
              ('Plannable only (no gate)', 'PLANNABLE'),
              ('Gated only', 'GATED'),
+             ('Gated — due in (stock on the way)', 'GATED_DUE_IN'),   # 075
              ('Any A — urgency', 'ANY_A'),
              ('Any B — value', 'ANY_B')]
     for f in self._flag_defs:
@@ -715,6 +724,38 @@ class ship_plan(ship_planTemplate):
       alert(r.get('message', 'Release failed'))
       return
     Notification(f'Hold released on {lbl}', timeout=3).show()
+    self.load_day()
+
+  def _add_due_in(self, item):
+    """075: PC adds a line gated ONLY by X06 (no stock, PO on the way) to
+    pre-build the straining element while the body is on the water. The
+    server records a GateOverride event and puts PRE-BUILD on the line.
+    Offered from the flag popup, never as a bare Add button."""
+    lbl = line_label(item, with_sku=False)
+    x06 = next((f for f in (item.get('flags') or []) if f.get('code') == 'X06'), None)
+    panel = ColumnPanel(spacing_above='none', spacing_below='none')
+    panel.add_component(Label(text=(x06 or {}).get('note') or 'Stock is on the way.',
+                              font_size=14, spacing_above='none', spacing_below='none'))
+    panel.add_component(Label(text='This line cannot ship until the body arrives. '
+                              'Add it to build the element ahead?',
+                              font_size=14, bold=True,
+                              spacing_above='small', spacing_below='none'))
+    tb = TextBox(placeholder='why (optional) - e.g. build element for Friday container')
+    panel.add_component(tb)
+    ok = alert(content=panel, title=f'Add {lbl} anyway (pre-build)?',
+               buttons=[('Add anyway', True), ('Cancel', False)], large=False)
+    if not ok:
+      return
+    result = anvil.server.call('ship_plan_add_line', self.plan_date,
+                               item['nx_order_numb'], item['nx_rel_numb'],
+                               item['nx_item_no'], override_note=(tb.text or ''))
+    if result.get('status') != 'success':
+      alert(result.get('message', 'Add failed'))
+      return
+    Notification(f'{lbl} added as PRE-BUILD', timeout=3).show()
+    if result.get('over_capacity'):
+      self._cap_hit_dialog(item['nx_order_numb'],
+                           [(item['nx_rel_numb'], item['nx_item_no'])], result)
     self.load_day()
 
   def _add_order(self, item):

@@ -17,6 +17,8 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
 
   Flags column (word + glyph, never color alone):
     ⛔ Xnn  = eligibility gate (hold / stock / no-WO) — row not plannable
+    ⛔ X06 due 09-30 = gated, but stock is on the way (075): amber, and
+             the flag popup offers 'Add anyway' (pre-build the element)
     A/B    = urgency / value flag codes (flag system 040/041)
     ⚠ DEF  = classification defaulted conservative (PC review — 002_pratik)
     S      = non-standard elements present
@@ -87,14 +89,21 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
       glyphs.append('⚠ QTY')
     ab_codes = ' '.join(f['code'] for f in flag_list
                         if f['code'][:1] in ('A', 'B'))
-    parts = []
-    if gate_codes:
-      parts.append('⛔ ' + gate_codes)
+    # Two lines when gated (Dave 2026-09-18, readability on the board):
+    #   line 1 = the gate(s) + due date  -> 'can it ship'
+    #   line 2 = A/B codes + glyphs      -> priority and context
+    # Ungated rows stay one line. Anvil Label/Link render '\n'.
+    rest = []
     if ab_codes:
-      parts.append(ab_codes)
+      rest.append(ab_codes)
     if glyphs:
-      parts.append('  '.join(glyphs))
-    self.lbl_flags.text = ' · '.join(parts)
+      rest.append('  '.join(glyphs))
+    rest_txt = ' · '.join(rest)
+    if gate_codes:
+      gate_txt = '⛔ ' + gate_codes + self._due_in_suffix(flag_list)   # 075
+      self.lbl_flags.text = (gate_txt + '\n' + rest_txt) if rest_txt else gate_txt
+    else:
+      self.lbl_flags.text = rest_txt
     score = int(item.get('priority_score') or 0)
     tip_lines = [f'Priority score {score}']
     tip_lines += [f"{f['code']} — {f['note']}" for f in flag_list]
@@ -104,8 +113,10 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     self.lbl_flags.tooltip = '\n'.join(tip_lines)
     if item.get('is_gated'):
       # Gated — red (#C62828, light-surface step) + the ⛔ word/glyph,
-      # so color is never the only signal.
-      self.lbl_flags.foreground = '#C62828'
+      # so color is never the only signal. 075: gated ONLY by X06 (stock
+      # on the way) is amber — waiting, not dead; the word 'due' says so.
+      self.lbl_flags.foreground = ('#a16207' if self._only_due_in(item)
+                                   else '#C62828')
       self.lbl_flags.bold = True
     elif item.get('n_class_defaulted'):
       self.lbl_flags.foreground = '#a16207'
@@ -136,6 +147,31 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
       if on_add_order:
         self.btn_add_order.set_event_handler(
           'click', lambda **e: on_add_order(self.item))
+
+  # ---------------------------------------------------------------
+  # 075: X06 helpers. The X06 note ALWAYS starts 'Due in YYYY-MM-DD'
+  # or 'Due in (no ETA on PO)' (vw_pc_order_flags contract) — the row
+  # shows just the date; the popup shows the whole note.
+  # ---------------------------------------------------------------
+  @staticmethod
+  def _only_due_in(item):
+    codes = [c for c in (item.get('gate_codes') or '').split(',') if c]
+    return codes == ['X06']
+
+  @staticmethod
+  def _due_in_suffix(flag_list):
+    for f in flag_list:
+      if f.get('code') != 'X06':
+        continue
+      note = f.get('note') or ''
+      head = note.split(' - ')[0]                 # 'Due in 2026-09-30 OVERDUE 7 d (...)'
+      if '(no ETA' in head:
+        return ' due ?'
+      toks = head.split()
+      d = toks[2] if len(toks) > 2 else ''
+      mmdd = d[5:] if len(d) == 10 else d
+      return f' due {mmdd}' + (' OVERDUE' if 'OVERDUE' in head else '')
+    return ''
 
   # ---------------------------------------------------------------
   # Tap-to-see popups (the 75" Vibe boards have no hover). Data is
@@ -196,6 +232,22 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
                      large=False)
       if choice == 'release':
         on_release(self.item)
+      return
+    # 075: gated ONLY by X06 (stock on the way) - PC may add it anyway to
+    # pre-build the straining element. Any other gate keeps the row shut.
+    on_add_due_in = item.get('on_add_due_in')
+    if self._only_due_in(item) and on_add_due_in:
+      lines.append(self._line('Stock is on the way - PC may add this line '
+                              'anyway to build the element ahead (PRE-BUILD).',
+                              color='#a16207'))
+      panel = ColumnPanel(spacing_above='none', spacing_below='none')
+      for l in lines:
+        panel.add_component(l)
+      choice = alert(content=panel, title='Flags',
+                     buttons=[('Add anyway', 'add'), ('Close', None)],
+                     large=False)
+      if choice == 'add':
+        on_add_due_in(self.item)
       return
     self._popup('Flags', lines)
 
