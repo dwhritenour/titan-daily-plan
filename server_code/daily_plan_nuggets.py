@@ -593,12 +593,20 @@ def _week_impl(cursor, end_date):
               WHERE n.is_active = 1 AND l.channel = 'ASSEMBLY') AS taught_assembly
   """)
   c = cursor.fetchone()
+  # rule candidates the Monday scan proposed and nobody has decided yet -
+  # a standing line in the digest so a skipped proposal keeps resurfacing
+  pending_rules = None
+  if _obj_exists(cursor, 'pc_plan_rule_register'):
+    cursor.execute("SELECT COUNT(*) AS n FROM dbo.pc_plan_rule_register "
+                   "WHERE status IN ('PROPOSED','NEEDS_BUILD')")
+    pending_rules = int(cursor.fetchone()['n'] or 0)
   return {
     'status': 'success', 'version': _NUGGET_VERSION,
     'week_start': mon.isoformat(), 'week_end': fri.isoformat(),
     'lessons': lessons, 'fired_untaught': fired_untaught, 'next_up': next_up,
     'counts': {'active': int(c['active'] or 0), 'taught_meeting': int(c['taught_meeting'] or 0),
                'taught_assembly': int(c['taught_assembly'] or 0)},
+    'pending_rules': pending_rules,
   }
 
 
