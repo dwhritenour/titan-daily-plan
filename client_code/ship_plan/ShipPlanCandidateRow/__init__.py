@@ -19,6 +19,8 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     ⛔ Xnn  = eligibility gate (hold / stock / no-WO) — row not plannable
     ⛔ X06 due 09-30 = gated, but stock is on the way (075): amber, and
              the flag popup offers 'Add anyway' (pre-build the element)
+    ⛔ X06 at vendor = gated, PO released to the vendor but not shipped
+             (077): no date on purpose - purchasing does not keep one
     A/B    = urgency / value flag codes (flag system 040/041)
     ⚠ DEF  = classification defaulted conservative (PC review — 002_pratik)
     S      = non-standard elements present
@@ -152,6 +154,8 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
   # 075: X06 helpers. The X06 note ALWAYS starts 'Due in YYYY-MM-DD'
   # or 'Due in (no ETA on PO)' (vw_pc_order_flags contract) — the row
   # shows just the date; the popup shows the whole note.
+  # 077: or 'At vendor (released, not shipped)' — released to the vendor,
+  # no transfer PO yet, no trusted date — the row shows 'at vendor'.
   # ---------------------------------------------------------------
   @staticmethod
   def _only_due_in(item):
@@ -165,6 +169,8 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
         continue
       note = f.get('note') or ''
       head = note.split(' - ')[0]                 # 'Due in 2026-09-30 OVERDUE 7 d (...)'
+      if head.startswith('At vendor'):            # 077: no date by design
+        return ' at vendor'
       if '(no ETA' in head:
         return ' due ?'
       toks = head.split()
