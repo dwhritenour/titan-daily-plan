@@ -243,7 +243,7 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     # pre-build the straining element. Any other gate keeps the row shut.
     on_add_due_in = item.get('on_add_due_in')
     if self._only_due_in(item) and on_add_due_in:
-      lines.append(self._line('Stock is on the way - PC may add this line '
+      lines.append(self._line('Stock is on the ocean or at the vendor - PC may add this line '
                               'anyway to build the element ahead (PRE-BUILD).',
                               color='#a16207'))
       panel = ColumnPanel(spacing_above='none', spacing_below='none')

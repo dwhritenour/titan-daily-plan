@@ -374,7 +374,7 @@ class ship_plan(ship_planTemplate):
     items = [('All flags', 'ALL'),
              ('Plannable only (no gate)', 'PLANNABLE'),
              ('Gated only', 'GATED'),
-             ('Gated — due in (stock on the way)', 'GATED_DUE_IN'),   # 075
+             ('Gated — due in (on the ocean / at vendor)', 'GATED_DUE_IN'),   # 075, 078 wording
              ('Any A — urgency', 'ANY_A'),
              ('Any B — value', 'ANY_B')]
     for f in self._flag_defs:
@@ -734,7 +734,7 @@ class ship_plan(ship_planTemplate):
     lbl = line_label(item, with_sku=False)
     x06 = next((f for f in (item.get('flags') or []) if f.get('code') == 'X06'), None)
     panel = ColumnPanel(spacing_above='none', spacing_below='none')
-    panel.add_component(Label(text=(x06 or {}).get('note') or 'Stock is on the way.',
+    panel.add_component(Label(text=(x06 or {}).get('note') or 'Stock is on the ocean or at the vendor.',
                               font_size=14, spacing_above='none', spacing_below='none'))
     panel.add_component(Label(text='This line cannot ship until the body arrives. '
                               'Add it to build the element ahead?',
