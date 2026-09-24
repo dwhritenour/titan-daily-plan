@@ -973,6 +973,64 @@ def ship_plan_get_reasons():
     conn.close()
 
 
+def _set_priority_tx(cursor, plan_date, order, rel, item, tier, reason, note, actor,
+                     event_note=None):
+  """Tier / reason / note on ONE line inside the caller's transaction
+  (2026-09-24: shared by the single-line and the whole-order callable).
+  Returns (changed, error_message). Pass None for 'leave alone', '' to
+  clear. Each change gets its own event (TierChange / ReasonSet)."""
+  cursor.execute("""
+      SELECT tier, priority_reason, priority_note, line_status, nx_sku
+      FROM dbo.pc_ship_plan_line
+      WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+  """, (plan_date, order, rel, item))
+  row = cursor.fetchone()
+  if not row:
+    return False, 'Line not found.'
+  sku = row['nx_sku']
+  if row['line_status'] == 'Removed':
+    return False, 'Line is removed — revive it first (re-add the order).'
+
+  changed = False
+  if tier is not None and tier != row['tier']:
+    cursor.execute("""
+        UPDATE dbo.pc_ship_plan_line
+        SET tier = %s, updated_by = %s, updated_at = GETDATE()
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (tier, actor, plan_date, order, rel, item))
+    _log_event(cursor, plan_date, order, sku, 'TierChange',
+               old_value=row['tier'], new_value=tier, actor=actor,
+               note=event_note, rel=rel, item=item)
+    changed = True
+  if reason is not None:
+    new_reason = reason or None          # '' clears
+    if new_reason != row['priority_reason']:
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET priority_reason = %s, updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (new_reason, actor, plan_date, order, rel, item))
+      _log_event(cursor, plan_date, order, sku, 'ReasonSet',
+                 old_value=row['priority_reason'], new_value=new_reason,
+                 actor=actor, note=event_note, rel=rel, item=item)
+      changed = True
+  if note is not None:
+    new_note = (note or '').strip()[:200] or None
+    if new_note != row['priority_note']:
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (new_note, actor, plan_date, order, rel, item))
+      _log_event(cursor, plan_date, order, sku, 'ReasonSet',
+                 old_value=row['priority_note'], new_value=new_note,
+                 actor=actor, note=('note edit' if not event_note
+                                    else f'note edit; {event_note}'),
+                 rel=rel, item=item)
+      changed = True
+  return changed, None
+
+
 @anvil.server.callable
 def ship_plan_set_priority(plan_date, order, rel, item, tier=None, reason=None,
                            note=None):
@@ -987,55 +1045,11 @@ def ship_plan_set_priority(plan_date, order, rel, item, tier=None, reason=None,
   conn = get_connection()
   try:
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT tier, priority_reason, priority_note, line_status, nx_sku
-        FROM dbo.pc_ship_plan_line
-        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-    """, (plan_date, order, rel, item))
-    row = cursor.fetchone()
-    if not row:
-      return {'status': 'error', 'message': 'Line not found.'}
-    sku = row['nx_sku']
-    if row['line_status'] == 'Removed':
-      return {'status': 'error', 'message': 'Line is removed — revive it '
-              'first (re-add the order).'}
-
-    changed = False
-    if tier is not None and tier != row['tier']:
-      cursor.execute("""
-          UPDATE dbo.pc_ship_plan_line
-          SET tier = %s, updated_by = %s, updated_at = GETDATE()
-          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-      """, (tier, actor, plan_date, order, rel, item))
-      _log_event(cursor, plan_date, order, sku, 'TierChange',
-                 old_value=row['tier'], new_value=tier, actor=actor,
-                 rel=rel, item=item)
-      changed = True
-    if reason is not None:
-      new_reason = reason or None          # '' clears
-      if new_reason != row['priority_reason']:
-        cursor.execute("""
-            UPDATE dbo.pc_ship_plan_line
-            SET priority_reason = %s, updated_by = %s, updated_at = GETDATE()
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-        """, (new_reason, actor, plan_date, order, rel, item))
-        _log_event(cursor, plan_date, order, sku, 'ReasonSet',
-                   old_value=row['priority_reason'], new_value=new_reason,
-                   actor=actor, rel=rel, item=item)
-        changed = True
-    if note is not None:
-      new_note = (note or '').strip()[:200] or None
-      if new_note != row['priority_note']:
-        cursor.execute("""
-            UPDATE dbo.pc_ship_plan_line
-            SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
-            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
-        """, (new_note, actor, plan_date, order, rel, item))
-        _log_event(cursor, plan_date, order, sku, 'ReasonSet',
-                   old_value=row['priority_note'], new_value=new_note,
-                   actor=actor, note='note edit', rel=rel, item=item)
-        changed = True
-
+    changed, err = _set_priority_tx(cursor, plan_date, order, rel, item,
+                                    tier, reason, note, actor)
+    if err:
+      conn.rollback()
+      return {'status': 'error', 'message': err}
     if not changed:
       conn.rollback()
       return {'status': 'success', 'changed': False}
@@ -1050,6 +1064,68 @@ def ship_plan_set_priority(plan_date, order, rel, item, tier=None, reason=None,
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Priority failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def ship_plan_set_order_priority(plan_date, order, tier=None, reason=None,
+                                 note=None):
+  """2026-09-24 (Dave): the ★ dialog's 'ALL lines of the order' box - the
+  same tier / reason / note on EVERY active line of a sales order on this
+  day (Planned / Proposed / Confirmed; Snoozed and Removed are left alone),
+  one transaction. Per-line TierChange / ReasonSet events carry the note
+  'whole order' plus one OrderPriority summary (event type added by 086).
+  Lines already at the requested values are unchanged and not counted."""
+  plan_date = _parse_date(plan_date)
+  if tier is not None and tier not in ('Must', 'Next', 'Stretch'):
+    return {'status': 'error', 'message': f'Bad tier {tier}.'}
+  actor = _current_actor()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND line_status IN %s
+        ORDER BY nx_rel_numb, nx_item_no
+    """, (plan_date, order, _COUNTS_AGAINST_CAP))
+    items = [(r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']) for r in cursor.fetchall()]
+    if not items:
+      return {'status': 'error', 'message': f'{order} has no active lines on this plan.'}
+    changed_lines, errors = [], []
+    for rel, item, sku in items:
+      ch, err = _set_priority_tx(cursor, plan_date, order, rel, item,
+                                 tier, reason, note, actor, event_note='whole order')
+      if err:
+        errors.append(f'{_line_label(order, rel, item, sku)}: {err}')
+      elif ch:
+        changed_lines.append(_line_label(order, rel, item, sku))
+    if errors:
+      conn.rollback()
+      return {'status': 'error', 'message': 'Nothing changed: ' + ' '.join(errors)}
+    if not changed_lines:
+      conn.rollback()
+      return {'status': 'success', 'changed': False, 'n_lines': len(items),
+              'changed_lines': []}
+    what = ', '.join(x for x in (
+      f'tier {tier}' if tier is not None else None,
+      f'reason {reason or "(cleared)"}' if reason is not None else None,
+      'note' if note is not None else None) if x)
+    _log_event(cursor, plan_date, order, None, 'OrderPriority',
+               new_value=f'{len(changed_lines)} of {len(items)} lines: {what}'[:200],
+               actor=actor, note=((note or '').strip()[:200] or None))
+    _bump_revision(cursor, plan_date, actor)
+    planned = _planned_inches(cursor, plan_date)
+    cap = _capacity_for(cursor, plan_date)['capacity_inches_effective']
+    conn.commit()
+    return {'status': 'success', 'changed': True, 'n_lines': len(items),
+            'changed_lines': changed_lines,
+            'planned_inches': round(planned, 1),
+            'capacity_inches': round(cap, 1),
+            'over_capacity': planned > cap}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Order priority failed: {e}'}
   finally:
     conn.close()
 

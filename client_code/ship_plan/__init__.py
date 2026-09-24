@@ -820,7 +820,14 @@ class ship_plan(ship_planTemplate):
   def _priority_dialog(self, item):
     """Tier + reason on one line. The REASON list is sales' vocabulary
     (pc_priority_reasons); the TIER (Must / Next / Stretch) is the
-    Daily's call — sales proposes why, PC decides when."""
+    Daily's call — sales proposes why, PC decides when.
+    2026-09-24 (Dave): like Remove and Snooze, a checkbox applies the same
+    tier / reason / note to EVERY active line of the order on this plan
+    (ship_plan_set_order_priority, one transaction)."""
+    order = item['nx_order_numb']
+    siblings = [l for l in self._lines
+                if l['nx_order_numb'] == order
+                and l['line_status'] in ('Planned', 'Proposed', 'Confirmed')]
     if not hasattr(self, '_reasons'):
       r = anvil.server.call('ship_plan_get_reasons')
       ok = r.get('status') == 'success'
@@ -835,6 +842,10 @@ class ship_plan(ship_planTemplate):
     tb_note = TextBox(text=item.get('priority_note') or '',
                       placeholder='note — required for "Other"')
     pnl = ColumnPanel()
+    cb_all = None
+    if len(siblings) > 1:
+      cb_all = CheckBox(text=f'Apply to ALL {len(siblings)} lines of {order} on this plan')
+      pnl.add_component(cb_all)
     pnl.add_component(Label(text='Tier', bold=True))
     pnl.add_component(dd_tier)
     pnl.add_component(Label(text='Reason (why it matters)', bold=True))
@@ -849,12 +860,22 @@ class ship_plan(ship_planTemplate):
       alert('"Other (see note)" needs the note — that IS the reason. '
             'Nothing saved; open ★ again.')
       return
-    r = anvil.server.call('ship_plan_set_priority', self.plan_date,
-                          item['nx_order_numb'], item['nx_rel_numb'],
-                          item['nx_item_no'],
-                          tier=dd_tier.selected_value,
-                          reason=dd_reason.selected_value,
-                          note=tb_note.text or '')
+    if cb_all and cb_all.checked:
+      r = anvil.server.call('ship_plan_set_order_priority', self.plan_date, order,
+                            tier=dd_tier.selected_value,
+                            reason=dd_reason.selected_value,
+                            note=tb_note.text or '')
+      if r.get('status') == 'success':
+        n = len(r.get('changed_lines') or [])
+        Notification((f"{order}: {n} of {r.get('n_lines', n)} line(s) changed"
+                      if n else f"{order}: every line already had those values"),
+                     timeout=4).show()
+    else:
+      r = anvil.server.call('ship_plan_set_priority', self.plan_date,
+                            order, item['nx_rel_numb'], item['nx_item_no'],
+                            tier=dd_tier.selected_value,
+                            reason=dd_reason.selected_value,
+                            note=tb_note.text or '')
     if r.get('status') != 'success':
       alert(r.get('message', 'Priority change failed'))
     self.load_day()
