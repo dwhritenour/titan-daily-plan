@@ -101,6 +101,8 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     if glyphs:
       rest.append('  '.join(glyphs))
     rest_txt = ' · '.join(rest)
+    if item.get('is_rush'):              # 091: rush lane - glyph ends the flags
+      rest_txt = (rest_txt + '  ⚡') if rest_txt else '⚡'
     if gate_codes:
       gate_txt = '⛔ ' + gate_codes + self._due_in_suffix(flag_list)   # 075
       self.lbl_flags.text = (gate_txt + '\n' + rest_txt) if rest_txt else gate_txt
@@ -108,6 +110,9 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
       self.lbl_flags.text = rest_txt
     score = int(item.get('priority_score') or 0)
     tip_lines = [f'Priority score {score}']
+    if item.get('is_rush'):
+      tip_lines.append('⚡ RUSH — expedited ship method, due by the next business '
+                       'day: proposed on the plan as it appears, PC texted')
     tip_lines += [f"{f['code']} — {f['note']}" for f in flag_list]
     if item.get('n_class_defaulted'):
       tip_lines.append('DEF — classification missing at plan time; '

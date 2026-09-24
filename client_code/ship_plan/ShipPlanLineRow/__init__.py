@@ -93,6 +93,10 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
       bg, fg = TIER_COLORS.get(tier, TIER_COLORS['Next'])
       chip_text = {'Must': 'PRIORITY', 'Next': 'NEXT',
                    'Stretch': 'IF TIME'}.get(tier, tier.upper())
+    if item.get('is_rush'):              # 091: rush lane - same glyph as the flags
+      chip_text = '⚡ ' + chip_text
+      self.lbl_status.tooltip = ('RUSH — expedited ship method, due by the next '
+                                 'business day (rush lane, 2026-09-24)')
     self.lbl_status.text = chip_text
     self.lbl_status.background = bg
     self.lbl_status.foreground = fg

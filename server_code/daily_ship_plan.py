@@ -555,6 +555,18 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     elif (len(ff) == 3 and ff[0] in 'XABC' and ff[1:].isdigit()):
       where.append("',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s")
       args.append('%,' + ff + ',%')
+    # 091 rush lane: the same rule vw_pc_rush_candidates holds (expedited
+    # A05 or PC's A04, ship-by on or before the next business day, not
+    # gated), written inline so the candidate query stays one pass. The
+    # glyph on the row and the 'RUSH' dropdown entry both come from here.
+    rush_expr = ("(ISNULL(fs.is_gated, 0) = 0 "
+                 "AND (',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s "
+                 "OR ',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s) "
+                 "AND c.ship_by_date <= %s)")
+    rush_args = ['%,A05,%', '%,A04,%', _next_business_day(date.today() + timedelta(days=1))]
+    if ff == 'RUSH':
+      where.append(rush_expr)
+      args += rush_args
     # One FROM for all three queries below: the scores join is needed by
     # the filter, the count and the sort alike.
     # 2026-09-15: the customer (name / city / state) rides along from the
@@ -577,14 +589,16 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
            "fs.gate_codes, "
            "ISNULL(fs.priority_score, 0) AS priority_score, "
            "fs.flag_codes, "
-           "so.nx_cust_name, so.nx_cust_city, so.nx_cust_state "
-           % max(1, min(int(limit), 1000))) + from_sql
+           "so.nx_cust_name, so.nx_cust_city, so.nx_cust_state, "
+           % max(1, min(int(limit), 1000))
+           + "CASE WHEN " + rush_expr + " THEN 1 ELSE 0 END AS is_rush "   # 091
+           + from_sql)
     if where:
       sql += " WHERE " + " AND ".join(where)
     sql += (" ORDER BY is_gated, priority_score DESC, "
             "c.ship_by_date, c.load_inches DESC, c.nx_order_numb, "
             "c.nx_rel_numb, c.nx_item_no")
-    cursor.execute(sql, tuple(args))
+    cursor.execute(sql, tuple(rush_args + args))      # select-list params first
     rows = [serialize_row(r) for r in cursor.fetchall()]
     for r in rows:
       r['customer'] = _customer_label(r.get('nx_cust_name'), r.get('nx_cust_city'),
@@ -662,7 +676,14 @@ def ship_plan_get_plan(plan_date):
                     THEN 1 ELSE 0 END                                   AS n_non_standard,
                CAST(COALESCE(cr.class_was_defaulted, src.class_was_defaulted, 0) AS INT)
                                                                         AS n_class_defaulted,
-               ISNULL(fs.is_gated, 0) AS is_gated, fs.gate_codes, fs.flag_codes
+               ISNULL(fs.is_gated, 0) AS is_gated, fs.gate_codes, fs.flag_codes,
+               -- 091 rush lane: proposed by the rush poll, or meets the rule now
+               CASE WHEN l.priority_reason = 'RUSH'
+                      OR (ISNULL(fs.is_gated, 0) = 0
+                          AND (',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s
+                               OR ',' + ISNULL(fs.flag_codes, '') + ',' LIKE %s)
+                          AND l.ship_by_date <= %s)
+                    THEN 1 ELSE 0 END                                   AS is_rush
         FROM dbo.pc_ship_plan_line l
         OUTER APPLY (SELECT SUM(s.nx_qty_balance_due) AS live_qty,
                             SUM(ISNULL(s.nx_qty_ordered, s.nx_qty_balance_due)) AS live_ordered,
@@ -697,7 +718,8 @@ def ship_plan_get_plan(plan_date):
                  CASE l.tier WHEN 'Must' THEN 0 WHEN 'Next' THEN 1
                              ELSE 2 END,
                  l.position, l.load_inches DESC, l.nx_order_numb, l.nx_rel_numb, l.nx_item_no
-    """, (plan_date,))
+    """, ('%,A05,%', '%,A04,%', _next_business_day(date.today() + timedelta(days=1)),
+          plan_date))
     lines = []
     for r in cursor.fetchall():
       row = serialize_row(r)
