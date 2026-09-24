@@ -325,6 +325,8 @@ roles:
   name: title
 - components: [Label, Link]
   name: body
+- components: [Label, Link]
+  name: wrap-text
 - components: [DataGrid]
   name: tonal-data-grid
 - components: [TextBox, TextArea, DatePicker, DropDown]

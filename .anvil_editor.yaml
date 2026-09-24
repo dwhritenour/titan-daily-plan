@@ -8,6 +8,7 @@ unique_ids:
     retro.RetroQuestionRow: '1788879812252.9801282246177007'
     retro_review: '1788880098899.32532220551594526'
     retro_review.RetroReviewRow: '1788880106903.899846498829808'
+    retro_review.RuleCandidateRow: '1790259608677.1562882833884589'
     ship_plan: '1787664033047.88638167871735'
     ship_plan.ShipPlanCandidateRow: '1787664042168.0034883675678857307'
     ship_plan.ShipPlanLineRow: '1787664050457.9924833923128128'

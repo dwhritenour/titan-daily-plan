@@ -1046,3 +1046,10 @@ div.plot-container.plotly svg.main-svg {
 .anvil-spinner {
     --anvil-spinner-bg: %color:Surface Variant%;
 }
+
+/* Long prose in a Label (rule candidate effect / evidence) wraps
+   instead of running off the card. */
+.anvil-role-wrap-text > .label-text, .anvil-role-wrap-text .link-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

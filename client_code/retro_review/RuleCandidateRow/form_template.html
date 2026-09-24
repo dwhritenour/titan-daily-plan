@@ -1,0 +1,13 @@
+<anvil-form container="ColumnPanel" prop:role="outlined-card" prop:spacing='{"margin":["5",null,"5",null]}'>
+  <anvil-component type="Label" name="lbl_title" prop:bold="true" prop:role="wrap-text" prop:spacing='{"margin":["0",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RCTITL,RCCOL01" container:full_width_row="true"></anvil-component>
+  <anvil-component type="Label" name="lbl_meta" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["2",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RCMETA,RCCOL02" container:full_width_row="true"></anvil-component>
+  <anvil-component type="Label" name="lbl_effect" prop:italic="true" prop:role="wrap-text" prop:font_size="13" prop:spacing='{"margin":["5",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RCEFFT,RCCOL03" container:full_width_row="true"></anvil-component>
+  <anvil-component type="Link" name="lk_why" prop:text="why" prop:font_size="11" prop:bold="true" prop:spacing='{"margin":["3",null,"0",null],"padding":["0","0","0","0"]}' container:grid_position="RCWHYL,RCCOL04" container:full_width_row="true"></anvil-component>
+  <anvil-component type="Label" name="lbl_desc" prop:role="wrap-text" prop:font_size="12" prop:foreground="#595959" prop:visible="false" prop:spacing='{"margin":["2",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RCDESC,RCCOL05" container:full_width_row="true"></anvil-component>
+  <anvil-component type="TextBox" name="tb_note" prop:placeholder="decision note (what changed / why not)" prop:font_size="13" prop:role="outlined" prop:spacing='{"margin":["5",null,"5",null]}' container:grid_position="RCNOTE,RCCOL06" container:full_width_row="true"></anvil-component>
+  <anvil-component type="FlowPanel" name="flow_rule_actions" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="RCACTS,RCCOL07" container:full_width_row="true">
+    <anvil-component type="Button" name="btn_approve" prop:text="Approve" prop:role="filled-button"></anvil-component>
+    <anvil-component type="Button" name="btn_reject" prop:text="Reject" prop:role="outlined-button"></anvil-component>
+    <anvil-component type="Button" name="btn_build" prop:text="Needs build" prop:role="outlined-button" prop:tooltip="The effect is code nobody has written yet"></anvil-component>
+  </anvil-component>
+</anvil-form>
