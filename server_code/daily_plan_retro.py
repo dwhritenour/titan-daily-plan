@@ -1001,6 +1001,77 @@ def _place_material_hold(cursor, variance_id, reading):
           'created': bool(r.get('created'))}
 
 
+# ── the rules register: Dave's decision on a candidate (2026-09-24) ─────
+# The Monday scan proposes rows; until today nothing in the app could decide
+# one. rule_list feeds a "Rule candidates" section on #retrev; rule_decide
+# flips the status (PIN-gated like retro_confirm). Approving records the
+# decision - the EFFECT is a parameter or a flag change, named in the row.
+
+_RULE_DECISIONS = ('APPROVED', 'REJECTED', 'NEEDS_BUILD', 'PROPOSED')
+
+
+@anvil.server.callable
+def rule_list(status=None, limit=50):
+  """Register rows, newest first. status None = the open ones
+  (PROPOSED / NEEDS_BUILD); 'ALL' = everything."""
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    where = ("WHERE status IN ('PROPOSED','NEEDS_BUILD')" if not status
+             else "" if str(status).upper() == 'ALL'
+             else "WHERE status = %s")
+    args = () if not status or str(status).upper() == 'ALL' else (str(status).upper(),)
+    cursor.execute(f"""
+        SELECT TOP ({int(limit)}) rule_id, rule_kind, status, title, description, scope_type,
+               scope_value, effect_flag_code, score_adjustment, gate_override_code,
+               new_weight, new_threshold, effective_from, expires_on, cause_key,
+               recurrence_count, evidence_variance_ids, test_summary, proposed_by,
+               proposed_at, approved_by, approved_at, decision_note
+        FROM dbo.pc_plan_rule_register {where}
+        ORDER BY CASE status WHEN 'PROPOSED' THEN 0 WHEN 'NEEDS_BUILD' THEN 1 ELSE 2 END,
+                 proposed_at DESC
+    """, args)
+    return [serialize_row(r) for r in cursor.fetchall()]
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def rule_decide(rule_id, status, note=None, pin=None):
+  """Set a register row's status with a note. Only Dave decides (PIN).
+  APPROVED stamps approved_by/at; REJECTED keeps the row as the record of
+  why not. The effect itself (parameter, flag) is applied separately and
+  should be named in the note."""
+  ok, warn = _arbiter_ok(pin)
+  if not ok:
+    return {'status': 'error', 'message': 'Wrong PIN - only Dave decides rules.'}
+  status = str(status or '').strip().upper()
+  if status not in _RULE_DECISIONS:
+    return {'status': 'error', 'message': f'Bad status {status}.'}
+  actor = _current_actor() or 'Dave'
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE dbo.pc_plan_rule_register
+        SET status = %s,
+            decision_note = %s,
+            approved_by = CASE WHEN %s = 'APPROVED' THEN %s ELSE approved_by END,
+            approved_at = CASE WHEN %s = 'APPROVED' THEN SYSDATETIME() ELSE approved_at END
+        WHERE rule_id = %s
+    """, (status, (note or None), status, actor[:50], status, int(rule_id)))
+    if cursor.rowcount == 0:
+      conn.rollback()
+      return {'status': 'error', 'message': f'Rule {rule_id} not found.'}
+    conn.commit()
+    return {'status': 'success', 'rule_id': int(rule_id), 'new_status': status, 'warning': warn}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'{e}'}
+  finally:
+    conn.close()
+
+
 @anvil.server.callable
 def retro_ask_anyway(variance_id):
   """Promote a 'not asked today' variance to an asked question."""
