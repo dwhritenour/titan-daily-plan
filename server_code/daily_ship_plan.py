@@ -2208,7 +2208,7 @@ def ship_plan_agent_propose(plan_date=None, force=False):
   return {'status': 'started', 'task_id': task.get_id()}
 
 
-  @anvil.server.callable
+@anvil.server.callable
 def ship_plan_agent_task_status(task_id):
   try:
     t = anvil.server.get_background_task(task_id)
