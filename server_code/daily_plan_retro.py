@@ -936,8 +936,12 @@ def retro_confirm(variance_id, reading, evidence_class, cause_key,
     # 071: a CONFIRMED material_short reading places a material hold on the
     # e21 line (X05 gate) - Dave is the gatekeeper, so it happens here and
     # nowhere earlier. Silent no-op until migration 071 is applied.
+    # 2026-09-24 (rule register: component_wait x5): the cause keys that
+    # place a hold are a parameter, HOLD_CAUSE_KEYS (comma-separated;
+    # default = material_short only), so approving the candidate is a
+    # settings change, not a code change.
     hold = None
-    if cause_key == 'material_short' and resolution in ('EXPLAINED', 'EXCEPTION', 'RULE_CANDIDATE'):
+    if cause_key in _hold_cause_keys(cursor) and resolution in ('EXPLAINED', 'EXCEPTION', 'RULE_CANDIDATE'):
       hold = _place_material_hold(cursor, int(variance_id), reading)
     conn.commit()
     return {'status': 'success', 'warning': warn, 'hold': hold}
@@ -946,6 +950,15 @@ def retro_confirm(variance_id, reading, evidence_class, cause_key,
     return {'status': 'error', 'message': f'{e}'}
   finally:
     conn.close()
+
+
+def _hold_cause_keys(cursor):
+  """Cause keys whose confirmed reading places an X05 hold (HOLD_CAUSE_KEYS,
+  pc_plan_parameters). Missing or blank = material_short, the 071 behaviour."""
+  cursor.execute("SELECT param_value FROM dbo.pc_plan_parameters WHERE param_code = 'HOLD_CAUSE_KEYS'")
+  r = cursor.fetchone()
+  raw = (r['param_value'] if r else None) or 'material_short'
+  return {k.strip() for k in raw.split(',') if k.strip()}
 
 
 def _place_material_hold(cursor, variance_id, reading):
