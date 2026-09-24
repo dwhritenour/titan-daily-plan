@@ -377,7 +377,7 @@ class ship_plan(ship_planTemplate):
              ('Plannable only (no gate)', 'PLANNABLE'),
              ('Gated only', 'GATED'),
              ('Gated — due in (on the ocean / at vendor)', 'GATED_DUE_IN'),   # 075, 078 wording
-             ('⚡ Rush — expedited, due by next business day', 'RUSH'),       # 091
+             ('⚡ Rush — Expedited Ship Method', 'RUSH'),       # 091
              ('Any A — urgency', 'ANY_A'),
              ('Any B — value', 'ANY_B')]
     for f in self._flag_defs:
