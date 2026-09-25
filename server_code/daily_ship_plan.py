@@ -903,10 +903,14 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
     """, (plan_date, order, rel, item))
     existing = cursor.fetchone()
     label = _line_label(order, rel, item, existing['nx_sku'] if existing else None)
-    if existing and existing['line_status'] != 'Removed':
+    # 2026-09-25: an UNPLACED line (cap-hit / material hold) stays visible on
+    # the plan AND in the candidates by design - so + on the candidate must
+    # re-place it, not answer 'already on this plan' (599024-001-10 today).
+    if existing and existing['line_status'] not in ('Removed', 'Unplaced'):
       return {'status': 'error',
               'message': f'{label} is already on this plan '
               f"({existing['line_status']})."}
+    was_unplaced = bool(existing and existing['line_status'] == 'Unplaced')
 
     rows = _fetch_candidate_rows(cursor, order, rel, item)
     if not rows:
@@ -917,7 +921,7 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
     label = _line_label(order, rel, item, agg['sku'])
     _ensure_header(cursor, plan_date, actor)
 
-    if existing:  # was Removed — revive rather than violate the PK
+    if existing:  # was Removed / Unplaced — revive rather than violate the PK
       _delete_source_rows(cursor, plan_date, order, rel, item)
       cursor.execute("""
           UPDATE dbo.pc_ship_plan_line
@@ -939,7 +943,8 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
     _log_event(cursor, plan_date, order, agg['sku'], 'Added',
                new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in "
                f"({tier})",
-               actor=actor, rel=rel, item=item)
+               actor=actor, note=('re-placed (was Unplaced)' if was_unplaced else None),
+               rel=rel, item=item)
     if override_note is not None:
       # 075: the override is its own event (the Added event stays plain so
       # every add reads the same in the retro); the note goes on the line.
@@ -1197,7 +1202,7 @@ def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
           WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
       """, (plan_date, order, rel, item))
       existing = cursor.fetchone()
-      if existing and existing['line_status'] != 'Removed':
+      if existing and existing['line_status'] not in ('Removed', 'Unplaced'):   # 2026-09-25
         skipped.append(label)
         continue
       rows = _fetch_candidate_rows(cursor, order, rel, item)
@@ -1205,7 +1210,7 @@ def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
         skipped.append(label)
         continue
       agg = _aggregate(rows)
-      if existing:  # Removed — revive: clear then reinsert cleanly
+      if existing:  # Removed / Unplaced — revive: clear then reinsert cleanly
         _delete_source_rows(cursor, plan_date, order, rel, item)
         cursor.execute("""
             DELETE FROM dbo.pc_ship_plan_line
@@ -2284,10 +2289,15 @@ def _agent_propose_impl(plan_date=None, force=False):
         UPDATE dbo.pc_agent_proposal SET status = 'SUPERSEDED'
         WHERE plan_date = %s AND status = 'PROPOSED'
     """, (plan_date,))
+    # 2026-09-25: the rush lane (091) proposes with the same actor and can
+    # land seconds before this fill (06:30:04 vs 06:30:38 today) - its lines
+    # carry priority_reason RUSH and are PC's to keep; the fill treats them
+    # like anything already planned (they count in `used`, upsert skips them).
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
         SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
         WHERE plan_date = %s AND line_status = 'Proposed' AND proposed_by = %s
+          AND ISNULL(priority_reason, '') <> 'RUSH'
     """, (actor, plan_date, actor))
     n_cleared = cursor.rowcount
 
