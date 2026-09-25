@@ -1,5 +1,6 @@
 from ._anvil_designer import ShipPlanCandidateRowTemplate
 from anvil import *
+import re
 import anvil.server
 from datetime import date
 
@@ -89,6 +90,11 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     flag_list = item.get('flags') or []
     if any(f.get('code') == 'C05' for f in flag_list):   # 065
       glyphs.append('⚠ QTY')
+    c06 = next((f for f in flag_list if f.get('code') == 'C06'), None)
+    if c06:                                               # 092: short stock, warning
+      # note starts 'Short stock: on hand 5 of 9 needed' -> glyph 'STOCK 5/9'
+      m = re.match(r'Short stock: on hand (\d+) of (\d+)', c06.get('note') or '')
+      glyphs.append(f'⚠ STOCK {m.group(1)}/{m.group(2)}' if m else '⚠ STOCK')
     ab_codes = ' '.join(f['code'] for f in flag_list
                         if f['code'][:1] in ('A', 'B'))
     # Two lines when gated (Dave 2026-09-18, readability on the board):
