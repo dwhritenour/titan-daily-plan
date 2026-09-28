@@ -339,6 +339,38 @@ def _get_params(cursor):
   return {r['param_code']: r['param_value'] for r in cursor.fetchall()}
 
 
+def _stage_flags(cursor):
+  """2026-09-28: evaluate vw_pc_order_flags ONCE per connection into the
+  session temp tables #pcf (flags) and #pcs (the scores view's grouping,
+  same columns as vw_pc_order_flag_scores). The candidate load used to
+  evaluate the flag view three times (rows, count, notes) and the plan
+  load once more; with 093's transfer-stage join that was ~3 s each on a
+  quiet server and 12 s each on a busy one - the 08:24 timeout. Idempotent
+  on the connection; temp tables vanish with it."""
+  cursor.execute("""
+      IF OBJECT_ID('tempdb..#pcf') IS NULL
+      BEGIN
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, flag_code, category,
+               flag_name, weight, note
+        INTO #pcf FROM dbo.vw_pc_order_flags;
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku,
+               CAST(MAX(CASE WHEN category = 'X' THEN 1 ELSE 0 END) AS BIT) AS is_gated,
+               STRING_AGG(CASE WHEN category = 'X' THEN flag_code END, ',')
+                   WITHIN GROUP (ORDER BY flag_code) AS gate_codes,
+               SUM(CASE WHEN category <> 'X' THEN weight ELSE 0 END) AS priority_score,
+               STRING_AGG(flag_code, ',') WITHIN GROUP (ORDER BY flag_code) AS flag_codes
+        INTO #pcs FROM #pcf
+        GROUP BY nx_order_numb, nx_rel_numb, nx_item_no, nx_sku;
+        /* the costed feed too: the plan query's LEFT JOIN to
+           vw_pc_ship_candidate_rows was re-evaluating the view per plan
+           line (~100 ms x 40 lines = the 4 s plan load) */
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, nx_sku_desc, bucket,
+               element_class, class_was_defaulted
+        INTO #pcr FROM dbo.vw_pc_ship_candidate_rows;
+      END
+  """)
+
+
 def _get_active_weights(cursor):
   cursor.execute("""
       SELECT ws.weight_set_id, pw.factor_code, pw.factor_value
@@ -501,6 +533,7 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
   conn = get_connection()
   try:
     cursor = conn.cursor()
+    _stage_flags(cursor)                       # 2026-09-28: flag view once
     horizon_days = None
     if due_within_days == 'auto':
       cursor.execute("""
@@ -517,10 +550,13 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     where, args = [], []
     if search:
       like = f'%{search.strip()}%'
+      # 2026-09-25: the order-release-item label too ('608367-001-10'), so
+      # the box behaves like the plan grid's (which matches line_label)
       where.append("(c.nx_order_numb LIKE %s OR c.nx_sku LIKE %s "
                    "OR c.sku_desc LIKE %s OR c.shipto_code LIKE %s "
-                   "OR so.nx_cust_name LIKE %s)")          # 2026-09-15: customer
-      args += [like, like, like, like, like]
+                   "OR so.nx_cust_name LIKE %s "               # 2026-09-15: customer
+                   "OR c.nx_order_numb + '-' + c.nx_rel_numb + '-' + c.nx_item_no LIKE %s)")
+      args += [like, like, like, like, like, like]
     if bucket in ('ST', 'ZERO', 'OTHER'):
       where.append("c.bucket = %s")
       args.append(bucket)
@@ -577,7 +613,7 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
                  "AND so.nx_item_no = c.nx_item_no ")
     from_sql = ("FROM dbo.vw_pc_ship_candidates c "
                 + cust_join +
-                "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
+                "LEFT JOIN #pcs fs "                       # staged scores
                 "ON fs.nx_order_numb = c.nx_order_numb "
                 "AND fs.nx_rel_numb = c.nx_rel_numb "
                 "AND fs.nx_item_no = c.nx_item_no")
@@ -616,13 +652,13 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
     # still ONE round trip for the client.
     flags_sql = ("SELECT f.nx_order_numb, f.nx_rel_numb, f.nx_item_no, "
                  "f.flag_code, f.flag_name, f.note "
-                 "FROM dbo.vw_pc_order_flags f "
+                 "FROM #pcf f "                             # staged flags
                  "JOIN dbo.vw_pc_ship_candidates c "
                  "ON c.nx_order_numb = f.nx_order_numb "
                  "AND c.nx_rel_numb = f.nx_rel_numb "
                  "AND c.nx_item_no = f.nx_item_no "
                  + cust_join +                     # the search WHERE may name so.
-                 "LEFT JOIN dbo.vw_pc_order_flag_scores fs "
+                 "LEFT JOIN #pcs fs "
                  "ON fs.nx_order_numb = c.nx_order_numb "
                  "AND fs.nx_rel_numb = c.nx_rel_numb "
                  "AND fs.nx_item_no = c.nx_item_no")
@@ -664,6 +700,7 @@ def ship_plan_get_plan(plan_date):
   conn = get_connection()
   try:
     cursor = conn.cursor()
+    _stage_flags(cursor)                       # 2026-09-28: flag view once
     cursor.execute("SELECT * FROM dbo.pc_ship_plan WHERE plan_date = %s",
                    (plan_date,))
     header = cursor.fetchone()
@@ -703,11 +740,11 @@ def ship_plan_get_plan(plan_date):
               AND src.nx_order_numb = l.nx_order_numb
               AND src.nx_rel_numb = l.nx_rel_numb
               AND src.nx_item_no = l.nx_item_no
-        LEFT JOIN dbo.vw_pc_ship_candidate_rows cr
+        LEFT JOIN #pcr cr                                  -- staged feed (2026-09-28)
                ON cr.nx_order_numb = l.nx_order_numb
               AND cr.nx_rel_numb = l.nx_rel_numb
               AND cr.nx_item_no = l.nx_item_no
-        LEFT JOIN dbo.vw_pc_order_flag_scores fs
+        LEFT JOIN #pcs fs
                ON fs.nx_order_numb = l.nx_order_numb
               AND fs.nx_rel_numb = l.nx_rel_numb
               AND fs.nx_item_no = l.nx_item_no
