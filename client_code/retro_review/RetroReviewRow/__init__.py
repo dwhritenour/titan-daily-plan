@@ -40,13 +40,17 @@ class RetroReviewRow(RetroReviewRowTemplate):
                                    if pending else 'Reading')
     self.dd_evidence.items = self._EVIDENCE
     self.dd_evidence.selected_value = q.get('proposed_evidence_class') or 'Probable'
-    causes = []
-    try:
-      causes = get_open_form().causes()
-    except Exception:
-      pass
+    causes = q.get('causes') or []          # 10-04: carried on the item (see retro_review.load)
+    if not causes:
+      try:
+        causes = get_open_form().causes()  # Refresh path, or an older parent
+      except Exception:
+        pass
     self.dd_cause.items = [(f"{c['cause_key']} — {c['label']}", c['cause_key']) for c in causes]
-    self.dd_cause.selected_value = q.get('proposed_cause_key') or (causes[0]['cause_key'] if causes else None)
+    keys = [c['cause_key'] for c in causes]
+    proposed = q.get('proposed_cause_key')
+    # the agent's proposed key when it is a known key; else the first key
+    self.dd_cause.selected_value = proposed if proposed in keys else (keys[0] if keys else None)
     self.dd_resolution.items = self._RESOLUTION
     self.dd_resolution.selected_value = 'EXPLAINED'
     self.btn_confirm.text = 'Confirm reading'

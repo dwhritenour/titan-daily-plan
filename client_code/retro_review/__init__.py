@@ -56,8 +56,14 @@ class retro_review(retro_reviewTemplate):
       return
     self.data = r
     queue = r.get('queue') or []
+    causes = r.get('causes') or []
     for q in queue:
       q['case_text'] = self._CASE_TXT.get(q.get('variance_case'), q.get('variance_case'))
+      # 10-04: the rows paint while this form is still being constructed
+      # (load() runs in __init__), so get_open_form() is the PREVIOUS form
+      # and the row could not reach causes() - dd_cause came up empty and
+      # showed "<Invalid value>" until Refresh. Carry the list on the item.
+      q['causes'] = causes
     self.lbl_title.text = 'Retro review'
     self.lbl_summary.text = (f"{len(queue)} answer(s) awaiting your reading"
                              if queue else 'Nothing awaiting you.')
