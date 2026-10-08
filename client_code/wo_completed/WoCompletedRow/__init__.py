@@ -30,6 +30,9 @@ class WoCompletedRow(WoCompletedRowTemplate):
     q = it.get('qty')
     if q is not None:
       sub += f"  · qty {float(q):g}"
+      qo = it.get('qty_ordered')                 # ship-1.1.2: shipped rows carry ordered too
+      if qo is not None and float(qo) != float(q):
+        sub += f" of {float(qo):g}"
     if it.get('work_order_number'):
       sub += f"  · {it['work_order_number']}"
     who = it.get('assigned_assembler') or ''

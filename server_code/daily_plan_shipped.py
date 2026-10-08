@@ -5,7 +5,7 @@ from .daily_ship_plan import (get_connection, _parse_date, serialize_row,
 make_serializable, _line_label, _customer_label)
 
 # =============================================================================
-# ORDERS SHIPPED BY DAY  (ship-1.1.1, 2026-09-16)
+# ORDERS SHIPPED BY DAY  (ship-1.1.2, 2026-10-08)
 #
 # Twin of daily_plan_completed / the wo_completed form, but the SOURCE is
 # e21: dbo.sales_orders_ship, Dave's extract of sales-order lines with an
@@ -25,6 +25,13 @@ make_serializable, _line_label, _customer_label)
 # order + SKU), else the day's plan line, else '-'. Zero-touch shown as Z, not
 # totalled. Comparison is against the PUBLISHED plan. Payload keys match the
 # wo_completed row template so the same row form renders both grids.
+# ship-1.1.2 (2026-10-08): sales_orders_ship was rebuilt - the extract had
+# joined shiphead on consol_numb (a LOAD number) and duplicated lines; it now
+# resolves per line through shipitem and carries nx_qty_shipped =
+# SUM(shipitem.ship_qty). 'qty' on a shipped row is now the quantity that
+# SHIPPED (qty_ordered rides along for the 'x of y' sub-line); the pre-066
+# pro-rate uses it too. No schema change here; the column was added to
+# sales_orders_ship by Dave on 2026-10-08.
 # Nothing here writes. No migration.
 # =============================================================================
 
@@ -34,7 +41,8 @@ _ROWS_SQL = """
 SELECT RTRIM(s.nx_order_numb) AS nx_order_numb, RTRIM(s.nx_rel_numb) AS nx_rel_numb,
        LTRIM(RTRIM(CAST(s.nx_item_no AS VARCHAR(10)))) AS nx_item_no,
        RTRIM(s.nx_sku) AS nx_sku, RTRIM(s.nx_sku_desc) AS sku_desc, RTRIM(s.nx_part_type) AS part_type,
-       s.nx_qty_ordered AS qty, s.nx_qty_balance_due AS qty_balance,
+       s.nx_qty_shipped AS qty, s.nx_qty_ordered AS qty_ordered,          -- ship-1.1.2: qty = what SHIPPED
+       s.nx_qty_balance_due AS qty_balance,
        RTRIM(s.nx_item_status_desc) AS status, RTRIM(s.nx_carrier) AS carrier, RTRIM(s.nx_mos) AS mos,
        RTRIM(s.nx_cust_name) AS nx_cust_name, RTRIM(s.nx_cust_city) AS nx_cust_city,
        RTRIM(s.nx_cust_state) AS nx_cust_state, RTRIM(s.nx_shipto_code) AS shipto_code,
@@ -46,10 +54,10 @@ SELECT RTRIM(s.nx_order_numb) AS nx_order_numb, RTRIM(s.nx_rel_numb) AS nx_rel_n
        w.work_order_number, w.status AS wo_status, w.assigned_assembler, w.completed_at,
        fc.event_at AS floor_complete_at, sh.detected_at AS shipped_detected_at,
        snap.load_inches AS snap_load, snap.was_planned, snap.flag_codes,
-       -- pre-066 snapshot rows aggregate an order's same-SKU lines: pro-rate by qty
+       -- pre-066 snapshot rows aggregate an order's same-SKU lines: pro-rate by qty SHIPPED
        CASE WHEN snap2.load_inches IS NULL THEN NULL
             WHEN ISNULL(snap2.qty_open, 0) > 0
-            THEN snap2.load_inches * s.nx_qty_ordered / snap2.qty_open
+            THEN snap2.load_inches * ISNULL(s.nx_qty_shipped, s.nx_qty_ordered) / snap2.qty_open
             ELSE snap2.load_inches END                  AS snap2_load,
        snap2.was_planned AS was_planned2, snap2.flag_codes AS flag_codes2,
        pl.load_inches AS plan_load, pl.line_status, pl.tier AS plan_tier
