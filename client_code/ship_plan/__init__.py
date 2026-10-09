@@ -68,6 +68,9 @@ class ship_plan(ship_planTemplate):
     if _hash == 'shipped':                  # ship-1.0.0: e21 shipments by day
       open_form('orders_shipped')
       return
+    if _hash == 'gates':                    # 2026-10-09: what gets gated (handout)
+      open_form('gates')
+      return
 
     # --- role gate (Wk-2: Sales = read-only) -------------------------
     # TODO(Dave/Chuck): wire to the app's real role source, same pattern
@@ -139,6 +142,9 @@ class ship_plan(ship_planTemplate):
     if hasattr(self, 'lk_shipped'):          # ship-1.0.0 (2026-09-16)
       self.lk_shipped.text = 'WO Shipped'
       self.lk_shipped.set_event_handler('click', lambda **e: open_form('orders_shipped'))
+    if hasattr(self, 'lk_gates'):            # 2026-10-09: the gate rules page
+      self.lk_gates.text = 'Gates'
+      self.lk_gates.set_event_handler('click', lambda **e: open_form('gates'))
 
     # Horizon lives SERVER-side now: 'auto' tells get_candidates to
     # read PLAN_HORIZON_DAYS itself, so a saved change applies on the
@@ -703,6 +709,13 @@ class ship_plan(ship_planTemplate):
     result = anvil.server.call('ship_plan_add_line', self.plan_date,
                                item['nx_order_numb'], item['nx_rel_numb'],
                                item['nx_item_no'])
+    if result.get('status') == 'needs_split':        # 2026-10-08 split guard
+      qty = self._split_dialog(result)
+      if qty is None:
+        return
+      result = anvil.server.call('ship_plan_add_line', self.plan_date,
+                                 item['nx_order_numb'], item['nx_rel_numb'],
+                                 item['nx_item_no'], qty=qty)
     if result.get('status') != 'success':
       alert(result.get('message', 'Add failed'))
       return
@@ -784,6 +797,42 @@ class ship_plan(ship_planTemplate):
               and l['line_status'] in ('Planned', 'Proposed', 'Confirmed')]
       self._cap_hit_dialog(order, keys, result)
     self.load_day()
+
+  def _split_dialog(self, r):
+    """2026-10-08 (Dave): a single line bigger than half the day's capacity
+    is a multi-day job. Ask for today's quantity; the rest stays in the
+    candidates and comes back tomorrow. Returns a number, 'all', or None."""
+    pct = (100.0 * r['line_inches'] / r['capacity_inches']) if r.get('capacity_inches') else 0
+    room = max(0.0, (r.get('capacity_inches') or 0) - (r.get('planned_inches') or 0))
+    tb = TextBox(text=str(r.get('suggested_qty') or 1), placeholder='pieces today')
+    msg = (f"{r['label']} is {r['qty']:g} pcs / {r['line_inches']:,.0f} in — "
+           f"{pct:.0f}% of today's capacity ({r['capacity_inches']:,.0f} in; "
+           f"{room:,.0f} in still open).\n\n"
+           f"That is a multi-day job. Plan a quantity for today "
+           f"({r['per_piece_inches']:g} in per piece); the rest stays in the "
+           f"candidates and is proposed again tomorrow.")
+    panel = ColumnPanel()
+    panel.add_component(Label(text=msg))
+    panel.add_component(tb)
+    choice = alert(content=panel, title='Big line — plan a quantity?',
+                   buttons=[('Plan this many today', 'qty'),
+                            (f"Add all {r['qty']:g}", 'all'), ('Cancel', None)],
+                   large=True)
+    if choice == 'all':
+      return 'all'
+    if choice != 'qty':
+      return None
+    try:
+      q = float((tb.text or '').strip())
+    except Exception:
+      alert('Enter a number of pieces.')
+      return None
+    if q <= 0:
+      alert('Quantity must be above zero.')
+      return None
+    if q >= r['qty']:
+      return 'all'
+    return int(q) if q == int(q) else q
 
   def _cap_hit_dialog(self, order, keys, result):
     """DECISION §4: snooze / Mark Stretch / explicit Unplaced / keep —

@@ -1,0 +1,14 @@
+<anvil-form container="HtmlTemplate" prop:html="@theme:standard-page.html">
+  <anvil-component type="ColumnPanel" name="content_panel" container:slot="default">
+    <anvil-component type="ColumnPanel" name="oc_header" prop:role="outlined-card" container:grid_position="GAHDRA,GAHDRB">
+      <anvil-component type="FlowPanel" name="flow_header" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"5",null]}' container:grid_position="GAHDRC,GAHDRD">
+        <anvil-component type="Link" name="lk_plan" prop:text="← Daily Plan" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+        <anvil-component type="Label" name="lbl_title" prop:text="What gets gated" prop:bold="true" prop:font_size="22" prop:spacing='{"margin":["2",null,"0",null],"padding":["0","10","0","10"]}'></anvil-component>
+      </anvil-component>
+    </anvil-component>
+    <anvil-component type="ColumnPanel" name="oc_body" prop:role="outlined-card" container:grid_position="GABODA,GABODB">
+      <anvil-component type="RichText" name="rt_body" prop:format="markdown" prop:spacing='{"margin":["5",null,"10",null],"padding":["0","10","0","10"]}' container:grid_position="GABODC,GABODD"></anvil-component>
+    </anvil-component>
+  </anvil-component>
+  <anvil-component type="Label" name="lbl_app_title" prop:text="Titan Daily Plan — Gates" prop:bold="true" prop:font_size="26" prop:icon="fa:ban" container:slot="title"></anvil-component>
+</anvil-form>
