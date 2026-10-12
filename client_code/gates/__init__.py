@@ -31,24 +31,28 @@ So the question for today is not whether the plan is worth doing. It is which co
 
 ### What keeps an order off today's plan (the gates)
 
-A gated order still shows in the candidate list with a stop sign, but the plan will not propose it and PC has to add it on purpose. There are eight gates (two added 10/12, from the 10/10 decisions).
+A gated order still shows in the candidate list with a stop sign, but the plan will not propose it and PC has to add it on purpose. There are eight gates (two added 10/12, from the 10/10 decisions). "On the shelf" always means the physical count at Starlite; what e21 has allocated to an order counts for nothing either way (allocation is bookkeeping that PC moves around, so since 10/12 the gates and the plan ignore it).
 
-| Gate | What it means in plain words | How it clears |
-|---|---|---|
-| **Order on hold** | The order is on hold in e21 (credit, quality, customer request). It cannot ship as things stand. | The hold is released in e21. |
-| **No stock, nothing coming** | Zero on the shelf for this item and no purchase order on the way. For strainers and foot valves the element can still be built; the body cannot. | Stock arrives, or a PO is placed (then it becomes "due in"). |
-| **No stock, due in** | Zero on the shelf, but a PO is on the ocean (with a date) or released to a vendor (no trusted date yet). PC can still add it on purpose to pre-build the element while the body is on the water. | The PO is received. |
-| **Stock promised to another order** (valves only) | Units are on the shelf, but e21 has already committed them to other orders and not enough are left for this one. A reallocation decision, not a dead end. | Someone decides which order gets the stock. |
-| **Material hold** | PC answered a retro question saying the material for this line is not on hand. The line stays off the plan until PC releases the hold or it expires. | PC releases it from the flag popup, or it times out. |
-| **No work order on file** | The order has no work order in our system. Almost always a data glitch, not a real condition. | The work-order feed catches up (usually within 15 minutes). |
-| **Short stock** (since 10/12) | The shelf count is below what the line needs: "on hand 1 of 89". PC can still add it on purpose for the quantity on the shelf (a deliberate partial), and the plan carries that quantity. | Stock arrives, or PC adds a partial. |
-| **Stalled** (since 10/12) | The line sat on the plan three days in a row with no activity. It leaves the plan and PC gets one question: what is it waiting on, and when? | PC answers with a date (it comes back that day), or releases it from the flag popup, or five business days pass. |
+| Gate | What it means in plain words | How it clears | Rule last changed |
+|---|---|---|---|
+| **Order on hold** | The order is on hold in e21 (credit, quality, customer request). It cannot ship as things stand. | The hold is released in e21. | 8/31 (since the start) |
+| **No stock, nothing coming** | Zero on the shelf for this item and no purchase order on the way (stock at the Hub is named in the note as a transfer candidate). Since 10/12 it looks at the line's full quantity, whatever e21 shows allocated. For strainers and foot valves the element can still be built; the body cannot. | Stock arrives, or a PO is placed (then it becomes "due in"). | 10/12 |
+| **No stock, due in** | Zero on the shelf, but a PO is on the ocean (with a date) or released to a vendor (no trusted date yet). PC can still add it on purpose to pre-build the element while the body is on the water. Same full-quantity test as "nothing coming" since 10/12. | The PO is received. | 10/12 |
+| **Stock promised to another order** (valves only) | Units are on the shelf, but e21 has committed them to other orders and not enough are left for what this line still needs. A reallocation decision, not a dead end. Strainers do not get this gate (decided 10/10); for them the plan itself settles who gets the shelf (see "two orders, one shelf" below). | PC reallocates in e21, or the other orders ship. | 10/12 |
+| **Material hold** | PC's answer to a retro question says the material for this line is not here ("waiting for castings", "on PO 785022"). Since 10/12 the hold goes on the moment the answer is read that way, with the expiry taken from the date in the answer; Dave reviews after the fact and can undo it. Dave can also place one by hand from the review page. | PC releases it from the flag popup, the date in the answer arrives, it times out, or Dave's review reads the answer differently. | 10/12 |
+| **No work order on file** | The order has no work order in our system. Almost always a data glitch, not a real condition. | The work-order feed catches up (usually within 15 minutes). | 8/31 (since the start) |
+| **Short stock** (since 10/12) | The shelf count is above zero but below the line's quantity: "on hand 1 of 89". Strainers and the other non-valve items (valves carry "promised to another order" instead). PC can still add it on purpose for the quantity on the shelf (a deliberate partial), and the plan carries that quantity. | Stock arrives, or PC adds a partial. | 10/12 |
+| **Stalled** (since 10/12) | The line sat on the plan three plan days in a row with no shipment and no work-order activity. It leaves the plan and PC gets one question for the order: what is it waiting on, and when? | PC answers with a date (the whole order comes back that day), or releases it from the flag popup, or five business days pass. | 10/12 |
 
 Everything else on an order is a priority signal, not a gate: already late, due today or tomorrow, expedited ship method, high-dollar order. Those decide how high an order ranks; they never stop it.
 
-### What warns but does not stop: the gap
+Two things that look like gates but are not. A line too big for the day is not gated; PC is asked for a quantity when adding it, and the plan carries "SPLIT 20 of 89". And two orders wanting the same shelf stock is not a gate either: both go on the plan, the second at zero with a "⚖ shelf decision" note, for PC and Sales to settle before publish (item 7 below).
 
-The stock gate fires on exactly one condition: zero on the shelf. One unit on hand and it stays quiet. "Out of stock" in PC's words usually means "not enough" or "no castings", and the orders that have been sitting show the gap.
+### What warned but did not stop: the gap (as presented 10/10)
+
+*Kept as presented. The short-stock warning described here became a gate on 10/12 (Recommendation 1 and item 1 below); the table shows why.*
+
+The stock gate fired on exactly one condition: zero on the shelf. One unit on hand and it stayed quiet. "Out of stock" in PC's words usually means "not enough" or "no castings", and the orders that had been sitting showed the gap.
 
 | Order / item | On the shelf | Needed (all open orders) | What PC said |
 |---|---|---|---|
@@ -58,9 +62,9 @@ The stock gate fires on exactly one condition: zero on the shelf. One unit on ha
 | 600450 / YS61C0400 | 19 (all promised elsewhere) | 304, with 654 on a PO | Out of stock |
 | 609614 / YS62S0200 | 4 | 19 | (no answer yet) |
 
-Since 9/25 these show a **short stock** warning on the candidate row: a triangle that says "on hand 1 of 89". We made it a warning rather than a gate on purpose, to see how it would go. The plan still proposes the line because it is late and valuable, and the warning is easy to miss at 6:30 in the morning.
+From 9/25 to 10/12 these showed a **short stock** warning on the candidate row: a triangle that said "on hand 1 of 89". We made it a warning rather than a gate on purpose, to see how it would go. The plan still proposed the line because it was late and valuable, and the warning was easy to miss at 6:30 in the morning.
 
-When PC says "not enough casting", that is the finished unit itself (everything we receive is finished product; we modify it, for example with special straining elements). The short-stock warning already sees exactly that: 1 on hand of 89. One thing the rules see only for valves is the "promised to another order" gate; a strainer whose shelf stock is already committed to other orders slides through.
+When PC says "not enough casting", that is the finished unit itself (everything we receive is finished product; we modify it, for example with special straining elements). The short-stock warning already saw exactly that: 1 on hand of 89. One thing the rules saw only for valves was the "promised to another order" gate; a strainer whose shelf stock was wanted by other orders slid through (settled by item 7: the plan now allocates the shelf by priority).
 
 Not every sitting line is a stock problem. 598129 and 600386 / YS80TS0075 have 1,598 on hand; that is a 1,400-piece job queued behind another, and a line that size needs to be planned a day's worth at a time (that change is already built). And 610126 / YS58UDG0200, a two-inch expedited line with stock for it, has been untouched for thirteen days and deserves a direct question.
 
@@ -103,7 +107,7 @@ Struck through = decided and in place.
 7. ~~**Two orders, one shelf** (new): two Must lines for the same item on the same day, where the shelf covers either but not both. Today both are proposed and one sits.~~
    *Decided yes, 10/10; Production's version 10/12: both orders go on the plan. The higher-priority order is planned for the stock; the other line shows on the board at 0 in with a "⚖ SHELF DECISION" note naming it. Before publish, PC and Sales decide: remove it (ship the other complete) or plan a quantity on each (item 5). Undecided at publish, it leaves the plan and the priority pick stands. When the shelf covers part of the second line it is proposed for that part ("SPLIT 20 of 89 - stock: the rest is planned on order N").*
 
-*Prepared for the PC + Sales meeting, Friday 10/10/2026. Numbers as of 10/8.*
+*Prepared for the PC + Sales meeting, Friday 10/10/2026. Numbers as of 10/8. Gate table and decisions updated 10/12 (evening).*
 """
 
 
