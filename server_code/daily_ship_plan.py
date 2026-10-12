@@ -2219,7 +2219,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.3'   # v1.3: two orders, one shelf (stock allocation by priority); v1.2: planned-short rule
+_AGENT_VERSION = 'v1.3.1' # v1.3: two orders, one shelf (stock allocation by priority); v1.3.1: honours e21 allocation; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2350,6 +2350,88 @@ def _upsert_proposed_line(cursor, plan_date, order, rel, item, rows, agg, tier,
   return True
 
 
+@anvil.server.callable
+def ship_plan_agent_dry_run(plan_date=None):
+  """What the engine WOULD propose for plan_date, treating the day as empty.
+  Writes nothing. 2026-10-12."""
+  return _agent_propose_impl(plan_date, force=True, dry_run=True)
+
+
+@anvil.server.callable
+def ship_plan_agent_compare(plan_date=None):
+  """Text diff: the latest REAL proposal for the day vs a dry run of the
+  current engine (X08 gate, stalled holds, two-orders-one-shelf). For the
+  server console: print(ship_plan_agent_compare('2026-10-12')). 2026-10-12."""
+  pd = _parse_date(plan_date) if plan_date else _next_business_day()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT TOP 1 proposal_id, agent_version, generated_at, proposed_inches, capacity_inches
+        FROM dbo.pc_agent_proposal WHERE plan_date = %s ORDER BY generated_at DESC
+    """, (pd,))
+    p = cursor.fetchone()
+    old = {}
+    if p:
+      cursor.execute("""
+          SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no, proposed_tier,
+                 load_inches, reason
+          FROM dbo.pc_agent_proposal_line WHERE proposal_id = %s AND rank_no > 0
+      """, (p['proposal_id'],))
+      for r in cursor.fetchall():
+        old[(r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))] = r
+  finally:
+    conn.close()
+  new = ship_plan_agent_dry_run(pd)
+  if new.get('status') != 'success':
+    return f"dry run failed: {new.get('message')}"
+  newl = {(l['order'], l['rel'], str(l['item'])): l for l in new['lines']}
+  out = [f"PLAN {pd}  -  morning proposal {('#%s %s at %s' % (p['proposal_id'], p['agent_version'], str(p['generated_at'])[:16])) if p else '(none)'}"
+         f"  vs  dry run {_AGENT_VERSION} now (day treated as empty)",
+         f"  morning: {len(old)} lines, {float(p['proposed_inches'] or 0) if p else 0:,.0f} in"
+         f"   |   now: {len(newl)} lines, {new['proposed_inches']:,.0f} in of {new['target_inches']:,.0f} target; "
+         f"gated {new['n_gated']}, short {new['n_short']} (stock {new.get('n_stock_short', 0)}), "
+         f"partials {new.get('n_stock_partial', 0)}, split-needed {new['n_split_needed']}, blocked {new['n_blocked']}"]
+  dropped = [k for k in old if k not in newl]
+  added = [k for k in newl if k not in old]
+  kept = [k for k in old if k in newl]
+  short_by = {(s['order'], str(s['item'])): s for s in new.get('short', [])}
+  gated_by = {(g['order'], str(g['item'])): g for g in new.get('gated', [])}
+  def _why(k):
+    s = short_by.get((k[0], k[2]))
+    if s:
+      return f"short: {s.get('note') or ''}".strip()
+    g = gated_by.get((k[0], k[2]))
+    if g:
+      return f"gated {g.get('gates') or ''}: {(g.get('notes') or [''])[0][:70]}"
+    return 'not reached / blocked / split-needed'
+  out.append(f"\nDROPPED since this morning ({len(dropped)}):")
+  for k in sorted(dropped, key=lambda k: old[k]['rank_no']):
+    r = old[k]
+    out.append(f"  #{r['rank_no']:<3} {k[0]}-{k[1]}-{k[2]} / {r['nx_sku']:<14} {r['proposed_tier']:<7} "
+               f"{float(r['load_inches'] or 0):7,.1f} in  -> {_why(k)}")
+  out.append(f"\nADDED by the dry run ({len(added)}):")
+  for k in sorted(added, key=lambda k: newl[k]['rank']):
+    l = newl[k]
+    out.append(f"  #{l['rank']:<3} {l['line']} / {l['sku']:<14} {l['tier']:<7} {l['load_inches']:7,.1f} in  "
+               f"{('(partial %g of %g)' % (l['qty_planned'], l['qty_full'])) if l.get('qty_planned') else ''}")
+  changed = [k for k in kept if (newl[k].get('qty_planned') or old[k]['proposed_tier'] != newl[k]['tier'])]
+  out.append(f"\nKEPT ({len(kept)}), of which changed ({len(changed)}):")
+  for k in sorted(changed, key=lambda k: newl[k]['rank']):
+    l, r = newl[k], old[k]
+    bits = []
+    if r['proposed_tier'] != l['tier']:
+      bits.append(f"tier {r['proposed_tier']} -> {l['tier']}")
+    if l.get('qty_planned'):
+      bits.append(f"partial {l['qty_planned']:g} of {l['qty_full']:g} ({float(r['load_inches'] or 0):,.1f} -> {l['load_inches']:,.1f} in)")
+    out.append(f"  {l['line']} / {l['sku']:<14} " + '; '.join(bits))
+  if new.get('short'):
+    out.append(f"\nSHORT lines named by the dry run ({len(new['short'])}):")
+    for s in new['short']:
+      out.append(f"  {s['line']} / {s['sku']:<14} of order {s.get('short_of')}: {s.get('note') or ''}")
+  return '\n'.join(out)
+
+
 @anvil.server.background_task
 def agent_propose_task(plan_date=None, force=False):
   """Background task wrapper: the fill can take longer than Anvil's 30 s
@@ -2377,7 +2459,34 @@ def ship_plan_agent_task_status(task_id):
     return {'status': 'error', 'message': f'{e}'}
 
 
-def _agent_propose_impl(plan_date=None, force=False):
+# dry run only: the body of dbo.vw_pc_ship_candidates (item grain, 066) with
+# ONE change - lines on the plan_date being dry-run are not suppressed. Keep
+# in step with the view if its column list changes. Params: plan_date, end.
+_DRY_CANDIDATES_SQL = """
+    SELECT  r.nx_order_numb, r.nx_rel_numb, r.nx_item_no, r.nx_sku,
+            r.nx_sku_desc AS sku_desc, r.nx_part_line AS part_line, r.bucket,
+            r.nx_qty_ordered AS qty_open, r.nx_qty_balance_due AS qty_balance,
+            CAST(COALESCE(r.nx_dship_by_date, r.nx_hship_by_date) AS DATE) AS ship_by_date,
+            r.nx_shipto_code AS shipto_code, r.nx_carrier AS carrier,
+            1 AS n_source_rows,
+            CASE WHEN r.element_class = 'Non-Standard' THEN 1 ELSE 0 END AS n_non_standard,
+            CAST(r.class_was_defaulted AS INT) AS n_class_defaulted,
+            r.minutes_charged AS load_minutes, r.surcharge_minutes AS surcharge_minutes,
+            r.work_inches AS load_inches, r.weight_set_id AS weight_set_id,
+            r.nx_last_updated AS feed_last_updated
+    FROM dbo.vw_pc_ship_candidate_rows r
+    WHERE NOT EXISTS (
+            SELECT 1 FROM dbo.pc_ship_plan_line pl
+            WHERE pl.nx_order_numb = r.nx_order_numb
+              AND pl.nx_rel_numb   = r.nx_rel_numb
+              AND pl.nx_item_no    = r.nx_item_no
+              AND pl.line_status IN ('Planned','Snoozed','Proposed','Confirmed')
+              AND pl.plan_date >= CAST(GETDATE() AS DATE)
+              AND pl.plan_date <> %s)
+"""
+
+
+def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
   """Build the agent's proposal for a day (default: next business day).
   Deterministic: ungated candidates within the horizon, in priority order
   (score, oldest ship-by, biggest load); fill Must/Next up to
@@ -2399,7 +2508,7 @@ def _agent_propose_impl(plan_date=None, force=False):
     cursor.execute("SELECT plan_status, weight_set_id FROM dbo.pc_ship_plan "
                    "WHERE plan_date = %s", (plan_date,))
     hdr = cursor.fetchone()
-    if hdr and hdr['plan_status'] == 'Published' and not force:
+    if hdr and hdr['plan_status'] == 'Published' and not force and not dry_run:
       return {'status': 'skipped',
               'message': f'{plan_date} is already published.'}
     # 2026-09-07 (Labor Day): no roster -> 0 capacity -> a 0-line proposal
@@ -2410,58 +2519,67 @@ def _agent_propose_impl(plan_date=None, force=False):
       return {'status': 'skipped', 'plan_date': plan_date.isoformat(),
               'message': (f'{plan_date}: no capacity (holiday or nobody on the '
                           f'roster) - nothing proposed. {cap_probe.get("capacity_detail", "")}')}
-    _ensure_header(cursor, plan_date, actor)
+    if not dry_run:
+      _ensure_header(cursor, plan_date, actor)
     cursor.execute("SELECT weight_set_id FROM dbo.pc_ship_plan "
                    "WHERE plan_date = %s", (plan_date,))
     weight_set_id = (cursor.fetchone() or {}).get('weight_set_id')
 
     # --- supersede an earlier run: its untouched Proposed lines go ----
-    cursor.execute("""
-        UPDATE dbo.pc_agent_proposal SET status = 'SUPERSEDED'
-        WHERE plan_date = %s AND status = 'PROPOSED'
-    """, (plan_date,))
-    # 2026-09-25: the rush lane (091) proposes with the same actor and can
-    # land seconds before this fill (06:30:04 vs 06:30:38 today) - its lines
-    # carry priority_reason RUSH and are PC's to keep; the fill treats them
-    # like anything already planned (they count in `used`, upsert skips them).
-    cursor.execute("""
-        UPDATE dbo.pc_ship_plan_line
-        SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
-        WHERE plan_date = %s AND line_status = 'Proposed' AND proposed_by = %s
-          AND ISNULL(priority_reason, '') <> 'RUSH'
-    """, (actor, plan_date, actor))
-    n_cleared = cursor.rowcount
+    n_cleared = 0
+    if not dry_run:                       # a dry run supersedes nothing
+      cursor.execute("""
+          UPDATE dbo.pc_agent_proposal SET status = 'SUPERSEDED'
+          WHERE plan_date = %s AND status = 'PROPOSED'
+      """, (plan_date,))
+      # 2026-09-25: the rush lane (091) proposes with the same actor and can
+      # land seconds before this fill (06:30:04 vs 06:30:38 today) - its lines
+      # carry priority_reason RUSH and are PC's to keep; the fill treats them
+      # like anything already planned (they count in `used`, upsert skips them).
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND line_status = 'Proposed' AND proposed_by = %s
+            AND ISNULL(priority_reason, '') <> 'RUSH'
+      """, (actor, plan_date, actor))
+      n_cleared = cursor.rowcount
 
     # --- capacity + what PC already planned --------------------------
     cap = _capacity_for(cursor, plan_date, prefer_estimate=True)
     cap_in = float(cap.get('capacity_inches_effective') or 0)
     target = cap_in * ap['fill_pct']
-    used = float(_planned_inches(cursor, plan_date) or 0)
+    used = 0.0 if dry_run else float(_planned_inches(cursor, plan_date) or 0)
     already_in = used
 
     # --- candidates in the horizon, ranked exactly like the pane -----
     end = _horizon_end(ap['horizon_days'])
+    # dry run: vw_pc_ship_candidates hides every line already on a plan from
+    # today on - including the day being dry-run. The day is treated as
+    # EMPTY, so its own lines must be candidates again: same view body, the
+    # plan_date exempt from the already-planned guard (_DRY_CANDIDATES_SQL).
+    cand_src = ('(' + _DRY_CANDIDATES_SQL + ')') if dry_run else 'dbo.vw_pc_ship_candidates'
+    cand_args = ((plan_date, end) if dry_run else (end,))
     cursor.execute("""
         SELECT c.*, ISNULL(fs.is_gated, 0) AS is_gated, fs.gate_codes,
                ISNULL(fs.priority_score, 0) AS priority_score, fs.flag_codes
-        FROM dbo.vw_pc_ship_candidates c
+        FROM """ + cand_src + """ c
         LEFT JOIN dbo.vw_pc_order_flag_scores fs
                ON fs.nx_order_numb = c.nx_order_numb AND fs.nx_rel_numb = c.nx_rel_numb
               AND fs.nx_item_no = c.nx_item_no
         WHERE c.ship_by_date <= %s
         ORDER BY ISNULL(fs.is_gated, 0), ISNULL(fs.priority_score, 0) DESC,
                  c.ship_by_date, c.load_inches DESC, c.nx_order_numb, c.nx_rel_numb, c.nx_item_no
-    """, (end,))
+    """, cand_args)
     cands = [serialize_row(r) for r in cursor.fetchall()]
     cursor.execute("""
         SELECT f.nx_order_numb, f.nx_rel_numb, f.nx_item_no, f.flag_code, f.note
         FROM dbo.vw_pc_order_flags f
-        JOIN dbo.vw_pc_ship_candidates c
+        JOIN """ + cand_src + """ c
           ON c.nx_order_numb = f.nx_order_numb AND c.nx_rel_numb = f.nx_rel_numb
          AND c.nx_item_no = f.nx_item_no
         WHERE c.ship_by_date <= %s
         ORDER BY f.flag_code
-    """, (end,))
+    """, cand_args)
     notes = {}
     for r in cursor.fetchall():
       notes.setdefault((r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']), []).append(r)
@@ -2531,39 +2649,52 @@ def _agent_propose_impl(plan_date=None, force=False):
     # line goes SHORT like a gated sibling. Stock items only (e21 item
     # type other than N); an item with no inventory row is left alone.
     # Lines PC already has on this day count first - they were decided.
+    # v1.3.1: e21 allocation counts like the gates count it (X02/X08 test
+    # ordered - allocated). A line's own allocation is its stock already -
+    # picked pieces leave on-hand before the order ships (599099-001-10:
+    # allocated 3, on hand 0, went 'no stock' on 10-12). The reserved part
+    # of on-hand (inventory_current.allocated) is booked before the fill.
     cursor.execute("""
         SELECT d.nx_order_numb, d.nx_rel_numb, d.nx_item_no,
                LTRIM(RTRIM(ISNULL(d.nx_item_type, ''))) AS item_type,
-               LTRIM(RTRIM(d.nx_sku)) AS sku, i.on_hand
+               LTRIM(RTRIM(d.nx_sku)) AS sku, i.on_hand,
+               ISNULL(d.nx_qty_allocated, 0) AS alloc, ISNULL(i.allocated, 0) AS inv_alloc
         FROM dbo.sales_orders_due d
         LEFT JOIN dbo.inventory_current i
                ON i.sku = d.nx_sku AND i.cost_center = 'Starlite'
         WHERE CAST(COALESCE(d.nx_dship_by_date, d.nx_hship_by_date) AS DATE) <= %s
+        ORDER BY d.nx_order_numb, d.nx_rel_numb, d.nx_item_no
     """, (end,))
-    shelf, line_stock = {}, {}
+    shelf, line_stock, stock_used, stock_taker = {}, {}, {}, {}
     for r in cursor.fetchall():
+      alloc = float(r['alloc'] or 0)
       line_stock[(r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))] = \
-          (r['item_type'], r['sku'], r['on_hand'])
+          (r['item_type'], r['sku'], r['on_hand'], alloc)
       if r['on_hand'] is not None:
         shelf[r['sku']] = float(r['on_hand'])
-    stock_used, stock_taker = {}, {}
+        stock_used[r['sku']] = float(r['inv_alloc'] or 0)     # reserved in e21
+        if alloc > 0:
+          stock_taker.setdefault(r['sku'], r['nx_order_numb'])
     cursor.execute("""
-        SELECT LTRIM(RTRIM(nx_sku)) AS sku, nx_order_numb, SUM(qty_planned) AS q
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, LTRIM(RTRIM(nx_sku)) AS sku, qty_planned
         FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND line_status IN %s
-        GROUP BY LTRIM(RTRIM(nx_sku)), nx_order_numb
     """, (plan_date, _COUNTS_AGAINST_CAP))
-    for r in cursor.fetchall():
-      stock_used[r['sku']] = stock_used.get(r['sku'], 0.0) + float(r['q'] or 0)
+    for r in ([] if dry_run else cursor.fetchall()):
+      ls = line_stock.get((r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no'])))
+      own = ls[3] if ls else 0.0                     # its allocation is booked already
+      stock_used[r['sku']] = stock_used.get(r['sku'], 0.0) + max(float(r['qty_planned'] or 0) - own, 0.0)
       stock_taker.setdefault(r['sku'], r['nx_order_numb'])
 
     def _shelf_check(m):
-      """None = no rule for this line; (avail, taker) otherwise."""
+      """None = no rule for this line; (avail, taker, sku, own_alloc) otherwise.
+      avail = what is on the shelf and not yet spoken for; own_alloc = the
+      part of this line e21 already reserved (counts as its own)."""
       key = (m['nx_order_numb'], m['nx_rel_numb'], str(m['nx_item_no']))
-      item_type, sku, on_hand = line_stock.get(key, ('', None, None))
+      item_type, sku, on_hand, alloc = line_stock.get(key, ('', None, None, 0.0))
       if item_type == 'N' or on_hand is None or not sku:
         return None
-      return (shelf.get(sku, 0.0) - stock_used.get(sku, 0.0), stock_taker.get(sku), sku)
+      return (shelf.get(sku, 0.0) - stock_used.get(sku, 0.0), stock_taker.get(sku), sku, alloc)
 
     def _gkey(c):
       return (c['nx_order_numb'], str(c.get('ship_by_date') or '')[:10])
@@ -2631,32 +2762,31 @@ def _agent_propose_impl(plan_date=None, force=False):
       keep = []
       for m in riders:
         chk = _shelf_check(m)
-        need = float(m.get('qty_open') or 0)
-        if chk is None or need <= 0:
+        full = float(m.get('qty_open') or 0)
+        if chk is None or full <= 0:
           keep.append(m)
           continue
-        avail, taker, sku = chk
-        if avail >= need - 1e-9:
+        avail, taker, sku, own = chk
+        need = full - own                       # v1.3.1: unreserved part only
+        if need <= 1e-9 or avail >= need - 1e-9:
           keep.append(m)
           continue
-        if avail <= 0:
-          m['short_note'] = (f"stock planned on order {taker}" if taker
-                             else 'no stock left on the shelf')
-          m['short_of'] = order
-          m['stock_short'] = True
-          short.append(m)
-          continue
-        # a partial: what the shelf still covers
-        m['stock_qty'] = float(int(avail))
+        def _short_txt():
+          if taker and taker != order:
+            return f"stock planned on order {taker}"
+          return ('stock reserved in e21 for another order'
+                  if stock_used.get(sku, 0.0) > 0 else 'no stock left on the shelf')
+        # a partial: own allocation + what the shelf still covers
+        m['stock_qty'] = own + float(int(max(avail, 0.0)))
         if m['stock_qty'] < 1:
-          m['short_note'] = f"stock planned on order {taker}" if taker else 'no stock left on the shelf'
+          m['short_note'] = _short_txt()
           m['short_of'] = order
           m['stock_short'] = True
           short.append(m)
           continue
-        f = m['stock_qty'] / need
-        m['stock_full_qty'] = need
-        m['stock_taker'] = taker
+        f = m['stock_qty'] / full
+        m['stock_full_qty'] = full
+        m['stock_taker'] = taker if (taker and taker != order) else None
         m['load_inches'] = round(float(m.get('load_inches') or 0) * f, 2)
         keep.append(m)
       if short and not any(m is d for d in drivers for m in keep):
@@ -2713,8 +2843,9 @@ def _agent_propose_impl(plan_date=None, force=False):
         for m in members:                       # v1.3: book the shelf
           chk = _shelf_check(m)
           if chk is not None:
-            sku = chk[2]
-            stock_used[sku] = stock_used.get(sku, 0.0) + float(m.get('stock_qty') or m.get('qty_open') or 0)
+            sku, own = chk[2], chk[3]            # v1.3.1: the allocated part is booked already
+            take = float(m.get('stock_qty') or m.get('qty_open') or 0) - own
+            stock_used[sku] = stock_used.get(sku, 0.0) + max(take, 0.0)
             stock_taker.setdefault(sku, order)
       else:
         deferred.append(members)
@@ -2730,13 +2861,15 @@ def _agent_propose_impl(plan_date=None, force=False):
     oversize = split_needed          # name kept for the response below
 
     # --- record the proposal ----------------------------------------
-    cursor.execute("""
-        INSERT INTO dbo.pc_agent_proposal
-            (plan_date, agent_version, capacity_inches, proposed_inches, status)
-        OUTPUT INSERTED.proposal_id
-        VALUES (%s, %s, %s, %s, 'PROPOSED')
-    """, (plan_date, _AGENT_VERSION, round(cap_in, 1), round(used, 1)))
-    proposal_id = cursor.fetchone()['proposal_id']
+    proposal_id = None
+    if not dry_run:
+      cursor.execute("""
+          INSERT INTO dbo.pc_agent_proposal
+              (plan_date, agent_version, capacity_inches, proposed_inches, status)
+          OUTPUT INSERTED.proposal_id
+          VALUES (%s, %s, %s, %s, 'PROPOSED')
+      """, (plan_date, _AGENT_VERSION, round(cap_in, 1), round(used, 1)))
+      proposal_id = cursor.fetchone()['proposal_id']
 
     out_lines, rank, n_added = [], 0, 0
     for c, tier in picks + stretch:
@@ -2762,21 +2895,23 @@ def _agent_propose_impl(plan_date=None, force=False):
         # v1.3: the board note must START with 'SPLIT n of N' (drift rule,
         # Refresh); the rest of the shelf is on another order of this plan
         reason = (f"SPLIT {c['stock_qty']:g} of {c['stock_full_qty']:g} - stock: the rest is "
-                  f"planned on order {c.get('stock_taker') or '?'} · " + reason)[:500]
-      cursor.execute("""
-          INSERT INTO dbo.pc_agent_proposal_line
-              (proposal_id, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no,
-               proposed_tier, load_inches, priority_score, gate_codes, flag_codes, reason)
-          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-      """, (proposal_id, order, rel, item, sku, rank, tier,
-            float(c.get('load_inches') or 0), int(c.get('priority_score') or 0),
-            c.get('gate_codes'), c.get('flag_codes'), reason))
+                  + (f"planned on order {c['stock_taker']}" if c.get('stock_taker')
+                     else 'reserved in e21 or not on the shelf') + ' · ' + reason)[:500]
+      if not dry_run:
+        cursor.execute("""
+            INSERT INTO dbo.pc_agent_proposal_line
+                (proposal_id, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no,
+                 proposed_tier, load_inches, priority_score, gate_codes, flag_codes, reason)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (proposal_id, order, rel, item, sku, rank, tier,
+              float(c.get('load_inches') or 0), int(c.get('priority_score') or 0),
+              c.get('gate_codes'), c.get('flag_codes'), reason))
       rows = rows_by_key.get(key) or []
       agg_p = _aggregate(rows) if rows else None
       if agg_p and c.get('stock_qty'):
         agg_p = _scale_agg(agg_p, c['stock_qty'])        # v1.3 partial
-      if rows and _upsert_proposed_line(cursor, plan_date, order, rel, item, rows,
-                                        agg_p, tier, reason, actor):
+      if not dry_run and rows and _upsert_proposed_line(cursor, plan_date, order, rel, item, rows,
+                                                        agg_p, tier, reason, actor):
         n_added += 1
         _log_event(cursor, plan_date, order, sku, 'Proposed',
                    new_value=tier, actor=actor, note=reason, rel=rel, item=item)
@@ -2790,13 +2925,14 @@ def _agent_propose_impl(plan_date=None, force=False):
                         'qty_planned': (c.get('stock_qty') or None),     # v1.3
                         'qty_full': (c.get('stock_full_qty') or None)})
 
+    _cap = None if dry_run else 25      # the compare needs every gated/short line
     gated_out = [{'order': g['nx_order_numb'], 'sku': g['nx_sku'],
                   'item': g['nx_item_no'], 'line': _line_label(g['nx_order_numb'], g['nx_rel_numb'], g['nx_item_no']),
                   'gates': g.get('gate_codes'), 'score': int(g.get('priority_score') or 0),
                   'ship_by': g.get('ship_by_date'),
                   'notes': [n['note'] for n in notes.get((g['nx_order_numb'], g['nx_rel_numb'], g['nx_item_no']), [])
                             if (n['flag_code'] or '')[:1] == 'X']}
-                 for g in gated[:25]]
+                 for g in gated[:_cap]]
 
     oversize_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
                      'item': o['nx_item_no'], 'line': _line_label(o['nx_order_numb'], o['nx_rel_numb'], o['nx_item_no']),
@@ -2813,7 +2949,7 @@ def _agent_propose_impl(plan_date=None, force=False):
                   'gates': s.get('gate_codes'), 'score': int(s.get('priority_score') or 0),
                   'ship_by': s.get('ship_by_date'), 'note': s.get('short_note'),
                   'short_of': s.get('short_of')}
-                 for s in short_lines[:25]]
+                 for s in short_lines[:_cap]]
     blocked_out = [{'order': o['nx_order_numb'], 'sku': o['nx_sku'],
                     'item': o['nx_item_no'], 'line': _line_label(o['nx_order_numb'], o['nx_rel_numb'], o['nx_item_no']),
                     'load_inches': float(o.get('load_inches') or 0),
@@ -2822,12 +2958,15 @@ def _agent_propose_impl(plan_date=None, force=False):
                     'ship_by': o.get('ship_by_date'), 'why': o.get('block_reason')}
                    for o in blocked[:15]]
     snapshot_warning = None
-    try:
-      _snapshot_flags(cursor, plan_date, -1, weight_set_id)
-    except Exception as e:      # history must never block the proposal
-      snapshot_warning = str(e)
-    conn.commit()
-    return {'status': 'success', 'proposal_id': proposal_id,
+    if dry_run:
+      conn.rollback()           # belt and braces: nothing was written
+    else:
+      try:
+        _snapshot_flags(cursor, plan_date, -1, weight_set_id)
+      except Exception as e:      # history must never block the proposal
+        snapshot_warning = str(e)
+      conn.commit()
+    return {'status': 'success', 'proposal_id': proposal_id, 'dry_run': bool(dry_run),
             'plan_date': plan_date.isoformat(),
             'capacity': cap, 'capacity_inches': round(cap_in, 1),
             'fill_pct': ap['fill_pct'], 'target_inches': round(target, 1),

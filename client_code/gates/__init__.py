@@ -100,8 +100,8 @@ Struck through = decided and in place.
    *Decided yes, 10/10. In progress: the short-stock override already carries the quantity; the rest (any line can be planned at a quantity, and Sales can see the partials in one place) is being built.*
 6. ~~**610126 / YS58UDG0200**: why has a two-inch expedited line with stock sat for thirteen days?~~
    *Taken care of 10/12.*
-7. **Two orders, one shelf** (new): two Must lines for the same item on the same day, where the shelf covers either but not both. Today both are proposed and one sits.
-   *Recommendation: yes, add it. The proposal keeps a running count per item and stops at on-hand, marking the second line "short, stock planned on order N". That gives strainers the allocation decision by priority instead of by e21's commit order.*
+7. ~~**Two orders, one shelf** (new): two Must lines for the same item on the same day, where the shelf covers either but not both. Today both are proposed and one sits.~~
+   *Decided yes, 10/10. In place 10/12: the proposal keeps a running count per item in priority order; the second line is proposed for what the shelf still covers ("SPLIT 20 of 89 - stock: the rest is planned on order N") or goes short when nothing is left.*
 
 *Prepared for the PC + Sales meeting, Friday 10/10/2026. Numbers as of 10/8.*
 """
