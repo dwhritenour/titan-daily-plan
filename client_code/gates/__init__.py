@@ -96,10 +96,10 @@ Struck through = decided and in place.
    *Decided yes, 10/10. In place 10/12: a material answer read as Probable or better places the hold at once; Dave's review can undo it.*
 4. ~~**Should "stock promised to another order" apply to strainers too**, or stay valves only?~~
    *Decided no, 10/10: valves only. On-hand is the right number for strainers; the short-stock gate covers the real shortage.*
-5. ~~**When a gated line is added on purpose for a partial**, should the plan carry the quantity PC intends to ship, so Sales can tell the customer?~~
-   *Decided yes, 10/10. In place 10/12 with the short-stock override: the plan carries the quantity ("SPLIT 20 of 89 - PARTIAL").*
-6. **610126 / YS58UDG0200**: why has a two-inch expedited line with stock sat for thirteen days?
-   *Recommendation: ask Tara and Kim; no rule change until we know.*
+5. **When a gated line is added on purpose for a partial**, should the plan carry the quantity PC intends to ship, so Sales can tell the customer?
+   *Decided yes, 10/10. In progress: the short-stock override already carries the quantity; the rest (any line can be planned at a quantity, and Sales can see the partials in one place) is being built.*
+6. ~~**610126 / YS58UDG0200**: why has a two-inch expedited line with stock sat for thirteen days?~~
+   *Taken care of 10/12.*
 7. **Two orders, one shelf** (new): two Must lines for the same item on the same day, where the shelf covers either but not both. Today both are proposed and one sits.
    *Recommendation: yes, add it. The proposal keeps a running count per item and stops at on-hand, marking the second line "short, stock planned on order N". That gives strainers the allocation decision by priority instead of by e21's commit order.*
 

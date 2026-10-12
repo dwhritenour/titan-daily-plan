@@ -2219,7 +2219,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.2'   # 066: item-level lines, ordered qty; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.3'   # v1.3: two orders, one shelf (stock allocation by priority); v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2521,6 +2521,50 @@ def _agent_propose_impl(plan_date=None, force=False):
     """)
     ship_complete = {r['nx_order_numb'] for r in cursor.fetchall()}
 
+    # --- v1.3 TWO ORDERS, ONE SHELF (decision 7, 2026-10-10) ----------
+    # Every gate looks at ONE line against the shelf. Two Must lines of
+    # the same item that each fit on their own can still outrun the shelf
+    # together (10-07: YS80TS0075 400 + 1,400 planned, 1,598 on hand).
+    # The fill below keeps a running count per item, in priority order:
+    # what the shelf still covers is proposed (a partial carries SPLIT n
+    # of N and names the order that has the rest); nothing left = the
+    # line goes SHORT like a gated sibling. Stock items only (e21 item
+    # type other than N); an item with no inventory row is left alone.
+    # Lines PC already has on this day count first - they were decided.
+    cursor.execute("""
+        SELECT d.nx_order_numb, d.nx_rel_numb, d.nx_item_no,
+               LTRIM(RTRIM(ISNULL(d.nx_item_type, ''))) AS item_type,
+               LTRIM(RTRIM(d.nx_sku)) AS sku, i.on_hand
+        FROM dbo.sales_orders_due d
+        LEFT JOIN dbo.inventory_current i
+               ON i.sku = d.nx_sku AND i.cost_center = 'Starlite'
+        WHERE CAST(COALESCE(d.nx_dship_by_date, d.nx_hship_by_date) AS DATE) <= %s
+    """, (end,))
+    shelf, line_stock = {}, {}
+    for r in cursor.fetchall():
+      line_stock[(r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))] = \
+          (r['item_type'], r['sku'], r['on_hand'])
+      if r['on_hand'] is not None:
+        shelf[r['sku']] = float(r['on_hand'])
+    stock_used, stock_taker = {}, {}
+    cursor.execute("""
+        SELECT LTRIM(RTRIM(nx_sku)) AS sku, nx_order_numb, SUM(qty_planned) AS q
+        FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND line_status IN %s
+        GROUP BY LTRIM(RTRIM(nx_sku)), nx_order_numb
+    """, (plan_date, _COUNTS_AGAINST_CAP))
+    for r in cursor.fetchall():
+      stock_used[r['sku']] = stock_used.get(r['sku'], 0.0) + float(r['q'] or 0)
+      stock_taker.setdefault(r['sku'], r['nx_order_numb'])
+
+    def _shelf_check(m):
+      """None = no rule for this line; (avail, taker) otherwise."""
+      key = (m['nx_order_numb'], m['nx_rel_numb'], str(m['nx_item_no']))
+      item_type, sku, on_hand = line_stock.get(key, ('', None, None))
+      if item_type == 'N' or on_hand is None or not sku:
+        return None
+      return (shelf.get(sku, 0.0) - stock_used.get(sku, 0.0), stock_taker.get(sku), sku)
+
     def _gkey(c):
       return (c['nx_order_numb'], str(c.get('ship_by_date') or '')[:10])
     groups, group_order = {}, []
@@ -2582,7 +2626,60 @@ def _agent_propose_impl(plan_date=None, force=False):
         for m in short:
           m['short_of'] = order
         short_lines.extend(short)
-      members = riders
+      # v1.3: the shelf. Riders whose item is already spoken for on this
+      # plan go SHORT (stock planned on order X) or get a partial quantity.
+      keep = []
+      for m in riders:
+        chk = _shelf_check(m)
+        need = float(m.get('qty_open') or 0)
+        if chk is None or need <= 0:
+          keep.append(m)
+          continue
+        avail, taker, sku = chk
+        if avail >= need - 1e-9:
+          keep.append(m)
+          continue
+        if avail <= 0:
+          m['short_note'] = (f"stock planned on order {taker}" if taker
+                             else 'no stock left on the shelf')
+          m['short_of'] = order
+          m['stock_short'] = True
+          short.append(m)
+          continue
+        # a partial: what the shelf still covers
+        m['stock_qty'] = float(int(avail))
+        if m['stock_qty'] < 1:
+          m['short_note'] = f"stock planned on order {taker}" if taker else 'no stock left on the shelf'
+          m['short_of'] = order
+          m['stock_short'] = True
+          short.append(m)
+          continue
+        f = m['stock_qty'] / need
+        m['stock_full_qty'] = need
+        m['stock_taker'] = taker
+        m['load_inches'] = round(float(m.get('load_inches') or 0) * f, 2)
+        keep.append(m)
+      if short and not any(m is d for d in drivers for m in keep):
+        # the driver itself lost the shelf: the group is not proposed today
+        for m in short:
+          if m.get('stock_short'):
+            short_lines.append(m)
+        continue
+      if order in ship_complete and any(m.get('stock_short') for m in short):
+        s0 = next(m for m in short if m.get('stock_short'))
+        why = (f"ship-complete order; {_line_label(order, s0['nx_rel_numb'], s0['nx_item_no'], s0['nx_sku'])} "
+               f"{s0.get('short_note') or 'short on the shelf'}")
+        for m in members:
+          m['block_reason'] = why
+        blocked.extend(members)
+        continue
+      if any(m.get('stock_short') for m in short):
+        short_txt = ('SHORT ' + str(len(short)) + (' line' if len(short) == 1 else ' lines')
+                     + ' off the plan: ' + '; '.join(_short_clause(m) for m in short))[:200]
+        for m in short:
+          if m.get('stock_short'):
+            short_lines.append(m)
+      members = keep
       load = sum(float(m.get('load_inches') or 0) for m in members)
       for m in members:
         m['group_inches'] = load
@@ -2613,6 +2710,12 @@ def _agent_propose_impl(plan_date=None, force=False):
         picks.extend((m, tier) for m in members)
         used += load
         n_groups += 1
+        for m in members:                       # v1.3: book the shelf
+          chk = _shelf_check(m)
+          if chk is not None:
+            sku = chk[2]
+            stock_used[sku] = stock_used.get(sku, 0.0) + float(m.get('stock_qty') or m.get('qty_open') or 0)
+            stock_taker.setdefault(sku, order)
       else:
         deferred.append(members)
     slack = cap_in - used
@@ -2655,6 +2758,11 @@ def _agent_propose_impl(plan_date=None, force=False):
                     f"{float(c.get('group_inches') or 0):,.0f} in together")[:500]
       if c.get('group_short'):
         reason = (reason + ' · ' + c['group_short'])[:500]
+      if c.get('stock_qty'):
+        # v1.3: the board note must START with 'SPLIT n of N' (drift rule,
+        # Refresh); the rest of the shelf is on another order of this plan
+        reason = (f"SPLIT {c['stock_qty']:g} of {c['stock_full_qty']:g} - stock: the rest is "
+                  f"planned on order {c.get('stock_taker') or '?'} · " + reason)[:500]
       cursor.execute("""
           INSERT INTO dbo.pc_agent_proposal_line
               (proposal_id, nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, rank_no,
@@ -2664,8 +2772,11 @@ def _agent_propose_impl(plan_date=None, force=False):
             float(c.get('load_inches') or 0), int(c.get('priority_score') or 0),
             c.get('gate_codes'), c.get('flag_codes'), reason))
       rows = rows_by_key.get(key) or []
+      agg_p = _aggregate(rows) if rows else None
+      if agg_p and c.get('stock_qty'):
+        agg_p = _scale_agg(agg_p, c['stock_qty'])        # v1.3 partial
       if rows and _upsert_proposed_line(cursor, plan_date, order, rel, item, rows,
-                                        _aggregate(rows), tier, reason, actor):
+                                        agg_p, tier, reason, actor):
         n_added += 1
         _log_event(cursor, plan_date, order, sku, 'Proposed',
                    new_value=tier, actor=actor, note=reason, rel=rel, item=item)
@@ -2675,7 +2786,9 @@ def _agent_propose_impl(plan_date=None, force=False):
                         'tier': tier, 'load_inches': float(c.get('load_inches') or 0),
                         'ship_by': c.get('ship_by_date'),
                         'score': int(c.get('priority_score') or 0),
-                        'flags': c.get('flag_codes'), 'reason': reason})
+                        'flags': c.get('flag_codes'), 'reason': reason,
+                        'qty_planned': (c.get('stock_qty') or None),     # v1.3
+                        'qty_full': (c.get('stock_full_qty') or None)})
 
     gated_out = [{'order': g['nx_order_numb'], 'sku': g['nx_sku'],
                   'item': g['nx_item_no'], 'line': _line_label(g['nx_order_numb'], g['nx_rel_numb'], g['nx_item_no']),
@@ -2731,6 +2844,8 @@ def _agent_propose_impl(plan_date=None, force=False):
             'n_stretch_groups': n_stretch_groups,
             'n_blocked': len(blocked), 'blocked': blocked_out,
             'n_short': len(short_lines), 'short': short_out,
+            'n_stock_short': sum(1 for s in short_lines if s.get('stock_short')),      # v1.3
+            'n_stock_partial': sum(1 for c, _ in picks + stretch if c.get('stock_qty')),
             'lines': out_lines, 'gated': gated_out, 'oversize': oversize_out,
             'snapshot_warning': snapshot_warning}
   except Exception as e:
