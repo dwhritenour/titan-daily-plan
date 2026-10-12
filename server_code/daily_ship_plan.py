@@ -2219,7 +2219,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.3.1' # v1.3: two orders, one shelf (stock allocation by priority); v1.3.1: honours e21 allocation; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.3.2' # v1.3: two orders, one shelf (the shelf by plan priority); v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2649,52 +2649,46 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
     # line goes SHORT like a gated sibling. Stock items only (e21 item
     # type other than N); an item with no inventory row is left alone.
     # Lines PC already has on this day count first - they were decided.
-    # v1.3.1: e21 allocation counts like the gates count it (X02/X08 test
-    # ordered - allocated). A line's own allocation is its stock already -
-    # picked pieces leave on-hand before the order ships (599099-001-10:
-    # allocated 3, on hand 0, went 'no stock' on 10-12). The reserved part
-    # of on-hand (inventory_current.allocated) is booked before the fill.
+    # v1.3.2 (2026-10-12 pm): e21 ALLOCATION IS IGNORED on purpose. Item
+    # status 14 = Allocated is bookkeeping (e21 hands all of on-hand to
+    # whichever lines got there first - 160 YS61S0400 to an order due
+    # 10-30 while a late one waited); PC re-allocates as the plan needs,
+    # and allocation moves to the shipping step in the production app
+    # (Dave). A v1.3.1 that honoured it went live for one dry run only:
+    # 36 lines short behind later-due orders. On-hand is the shelf.
     cursor.execute("""
         SELECT d.nx_order_numb, d.nx_rel_numb, d.nx_item_no,
                LTRIM(RTRIM(ISNULL(d.nx_item_type, ''))) AS item_type,
-               LTRIM(RTRIM(d.nx_sku)) AS sku, i.on_hand,
-               ISNULL(d.nx_qty_allocated, 0) AS alloc, ISNULL(i.allocated, 0) AS inv_alloc
+               LTRIM(RTRIM(d.nx_sku)) AS sku, i.on_hand
         FROM dbo.sales_orders_due d
         LEFT JOIN dbo.inventory_current i
                ON i.sku = d.nx_sku AND i.cost_center = 'Starlite'
         WHERE CAST(COALESCE(d.nx_dship_by_date, d.nx_hship_by_date) AS DATE) <= %s
-        ORDER BY d.nx_order_numb, d.nx_rel_numb, d.nx_item_no
     """, (end,))
-    shelf, line_stock, stock_used, stock_taker = {}, {}, {}, {}
+    shelf, line_stock = {}, {}
     for r in cursor.fetchall():
-      alloc = float(r['alloc'] or 0)
       line_stock[(r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))] = \
-          (r['item_type'], r['sku'], r['on_hand'], alloc)
+          (r['item_type'], r['sku'], r['on_hand'])
       if r['on_hand'] is not None:
         shelf[r['sku']] = float(r['on_hand'])
-        stock_used[r['sku']] = float(r['inv_alloc'] or 0)     # reserved in e21
-        if alloc > 0:
-          stock_taker.setdefault(r['sku'], r['nx_order_numb'])
+    stock_used, stock_taker = {}, {}
     cursor.execute("""
-        SELECT nx_order_numb, nx_rel_numb, nx_item_no, LTRIM(RTRIM(nx_sku)) AS sku, qty_planned
+        SELECT LTRIM(RTRIM(nx_sku)) AS sku, nx_order_numb, SUM(qty_planned) AS q
         FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND line_status IN %s
+        GROUP BY LTRIM(RTRIM(nx_sku)), nx_order_numb
     """, (plan_date, _COUNTS_AGAINST_CAP))
     for r in ([] if dry_run else cursor.fetchall()):
-      ls = line_stock.get((r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no'])))
-      own = ls[3] if ls else 0.0                     # its allocation is booked already
-      stock_used[r['sku']] = stock_used.get(r['sku'], 0.0) + max(float(r['qty_planned'] or 0) - own, 0.0)
+      stock_used[r['sku']] = stock_used.get(r['sku'], 0.0) + float(r['q'] or 0)
       stock_taker.setdefault(r['sku'], r['nx_order_numb'])
 
     def _shelf_check(m):
-      """None = no rule for this line; (avail, taker, sku, own_alloc) otherwise.
-      avail = what is on the shelf and not yet spoken for; own_alloc = the
-      part of this line e21 already reserved (counts as its own)."""
+      """None = no rule for this line; (avail, taker) otherwise."""
       key = (m['nx_order_numb'], m['nx_rel_numb'], str(m['nx_item_no']))
-      item_type, sku, on_hand, alloc = line_stock.get(key, ('', None, None, 0.0))
+      item_type, sku, on_hand = line_stock.get(key, ('', None, None))
       if item_type == 'N' or on_hand is None or not sku:
         return None
-      return (shelf.get(sku, 0.0) - stock_used.get(sku, 0.0), stock_taker.get(sku), sku, alloc)
+      return (shelf.get(sku, 0.0) - stock_used.get(sku, 0.0), stock_taker.get(sku), sku)
 
     def _gkey(c):
       return (c['nx_order_numb'], str(c.get('ship_by_date') or '')[:10])
@@ -2762,31 +2756,32 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
       keep = []
       for m in riders:
         chk = _shelf_check(m)
-        full = float(m.get('qty_open') or 0)
-        if chk is None or full <= 0:
+        need = float(m.get('qty_open') or 0)
+        if chk is None or need <= 0:
           keep.append(m)
           continue
-        avail, taker, sku, own = chk
-        need = full - own                       # v1.3.1: unreserved part only
-        if need <= 1e-9 or avail >= need - 1e-9:
+        avail, taker, sku = chk
+        if avail >= need - 1e-9:
           keep.append(m)
           continue
-        def _short_txt():
-          if taker and taker != order:
-            return f"stock planned on order {taker}"
-          return ('stock reserved in e21 for another order'
-                  if stock_used.get(sku, 0.0) > 0 else 'no stock left on the shelf')
-        # a partial: own allocation + what the shelf still covers
-        m['stock_qty'] = own + float(int(max(avail, 0.0)))
-        if m['stock_qty'] < 1:
-          m['short_note'] = _short_txt()
+        if avail <= 0:
+          m['short_note'] = (f"stock planned on order {taker}" if taker
+                             else 'no stock left on the shelf')
           m['short_of'] = order
           m['stock_short'] = True
           short.append(m)
           continue
-        f = m['stock_qty'] / full
-        m['stock_full_qty'] = full
-        m['stock_taker'] = taker if (taker and taker != order) else None
+        # a partial: what the shelf still covers
+        m['stock_qty'] = float(int(avail))
+        if m['stock_qty'] < 1:
+          m['short_note'] = f"stock planned on order {taker}" if taker else 'no stock left on the shelf'
+          m['short_of'] = order
+          m['stock_short'] = True
+          short.append(m)
+          continue
+        f = m['stock_qty'] / need
+        m['stock_full_qty'] = need
+        m['stock_taker'] = taker
         m['load_inches'] = round(float(m.get('load_inches') or 0) * f, 2)
         keep.append(m)
       if short and not any(m is d for d in drivers for m in keep):
@@ -2843,9 +2838,8 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         for m in members:                       # v1.3: book the shelf
           chk = _shelf_check(m)
           if chk is not None:
-            sku, own = chk[2], chk[3]            # v1.3.1: the allocated part is booked already
-            take = float(m.get('stock_qty') or m.get('qty_open') or 0) - own
-            stock_used[sku] = stock_used.get(sku, 0.0) + max(take, 0.0)
+            sku = chk[2]
+            stock_used[sku] = stock_used.get(sku, 0.0) + float(m.get('stock_qty') or m.get('qty_open') or 0)
             stock_taker.setdefault(sku, order)
       else:
         deferred.append(members)
@@ -2895,8 +2889,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         # v1.3: the board note must START with 'SPLIT n of N' (drift rule,
         # Refresh); the rest of the shelf is on another order of this plan
         reason = (f"SPLIT {c['stock_qty']:g} of {c['stock_full_qty']:g} - stock: the rest is "
-                  + (f"planned on order {c['stock_taker']}" if c.get('stock_taker')
-                     else 'reserved in e21 or not on the shelf') + ' · ' + reason)[:500]
+                  f"planned on order {c.get('stock_taker') or '?'} · " + reason)[:500]
       if not dry_run:
         cursor.execute("""
             INSERT INTO dbo.pc_agent_proposal_line
