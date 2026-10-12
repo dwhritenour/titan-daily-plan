@@ -64,7 +64,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.6.0'   # 1.6 (096): stall rule; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.6.1'   # 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -225,6 +225,27 @@ def _stall_scan(cursor, plan_date, rows, rp):
                      "releases the hold.")
     r['explanation'] = (r.get('explanation') or '') + f"; STALLED after {len(days)} days - off the plan"
     stalled.append(r)
+  # one question per ORDER, not per line (605989 has nine lines): the first
+  # line of the order carries the question and names the others; the rest
+  # still stall (hold + ledger row) but are not asked separately.
+  by_order = {}
+  for r in stalled:
+    by_order.setdefault(r['order'], []).append(r)
+  for order, group in by_order.items():
+    if len(group) < 2:
+      continue
+    group.sort(key=lambda x: (x.get('rel') or '', int(x.get('item') or 0) if str(x.get('item') or '').isdigit() else 0))
+    lead, rest = group[0], group[1:]
+    others = ', '.join(str(x.get('item') or '?') for x in rest)
+    lead['question'] = (f"Order {order}: {len(group)} lines (items {lead.get('item') or '?'}, {others}) "
+                        f"have been on the plan {lead['stall_days']} days in a row with no shipment or "
+                        "work-order activity, and have been taken off the plan. What is the order waiting "
+                        "on, and on what date can it be built? The lines come back on that date, or "
+                        "sooner if PC releases the holds.")
+    for x in rest:
+      x['question'] = None            # stalls (hold), not asked separately
+      x['asked_to'] = None
+      x['stall_lead'] = lead          # its hold is tied to the lead's answer
   return stalled
 
 
@@ -235,11 +256,12 @@ def _place_stall_holds(cursor, plan_date, stalled, rp):
   placed = []
   for r in stalled:
     try:
+      src = r.get('stall_lead') or r       # sibling holds answer with the order's lead line
       cursor.execute("""
           SELECT TOP 1 variance_id FROM dbo.pc_plan_variance
           WHERE plan_date = %s AND nx_order_numb = %s AND ISNULL(nx_rel_numb, '') = %s
             AND ISNULL(nx_item_no, '') = %s AND expected = 'WORKED_ON'
-      """, (plan_date, r['order'], r.get('rel') or '', r.get('item') or ''))
+      """, (plan_date, src['order'], src.get('rel') or '', src.get('item') or ''))
       v = cursor.fetchone()
       reason = (f"Stalled: {r['stall_days']} plan days with no activity "
                 f"({r['stall_first']:%m/%d} to {plan_date:%m/%d}); off the plan until PC gives a date")
@@ -667,6 +689,10 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     # 096: stalled lines are ALWAYS asked (one each), on top of max_q
     stalled = _stall_scan(cursor, plan_date, rows, rp)
     for r in stalled:
+      if not r.get('question'):
+        if r in chosen:                 # a sibling carries the order's question
+          chosen.remove(r)
+        continue
       if r not in chosen:
         chosen.append(r)
       if r.get('rank') is None:
