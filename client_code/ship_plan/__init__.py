@@ -1,6 +1,7 @@
 from ._anvil_designer import ship_planTemplate
 from anvil import *
 import anvil.server
+import re
 from datetime import date, datetime, timedelta
 
 from .ShipPlanParamsPanel import ShipPlanParamsPanel
@@ -748,23 +749,54 @@ class ship_plan(ship_planTemplate):
     server records a GateOverride event and puts PRE-BUILD on the line.
     Offered from the flag popup, never as a bare Add button."""
     lbl = line_label(item, with_sku=False)
-    x06 = next((f for f in (item.get('flags') or []) if f.get('code') == 'X06'), None)
+    flags = item.get('flags') or []
+    x06 = next((f for f in flags if f.get('code') == 'X06'), None)
+    x08 = next((f for f in flags if f.get('code') == 'X08'), None)   # 099: short stock
+    full = float(item.get('nx_qty_ordered') or item.get('nx_qty_balance_due') or 0)
+    on_hand = None
+    if x08:
+      m = re.match(r'Short stock: on hand (\d+) of (\d+)', x08.get('note') or '')
+      on_hand = float(m.group(1)) if m else None
     panel = ColumnPanel(spacing_above='none', spacing_below='none')
-    panel.add_component(Label(text=(x06 or {}).get('note') or 'Stock is on the ocean or at the vendor.',
-                              font_size=14, spacing_above='none', spacing_below='none'))
-    panel.add_component(Label(text='This line cannot ship until the body arrives. '
-                              'Add it to build the element ahead?',
-                              font_size=14, bold=True,
+    if x06:
+      panel.add_component(Label(text=x06.get('note') or 'Stock is on the ocean or at the vendor.',
+                                font_size=14, spacing_above='none', spacing_below='none'))
+      panel.add_component(Label(text='This line cannot ship until the body arrives. '
+                                'Add it to build the element ahead?',
+                                font_size=14, bold=True,
+                                spacing_above='small', spacing_below='none'))
+      title, verb = f'Add {lbl} anyway (pre-build)?', 'why (optional) - e.g. build element for Friday container'
+    else:
+      panel.add_component(Label(text=(x08 or {}).get('note') or 'Short stock.',
+                                font_size=14, spacing_above='none', spacing_below='none'))
+      panel.add_component(Label(text='Not enough on the shelf for the whole line. '
+                                'Add it anyway for the quantity below (a deliberate partial)?',
+                                font_size=14, bold=True,
+                                spacing_above='small', spacing_below='none'))
+      title, verb = f'Add {lbl} anyway (partial)?', 'why (optional) - e.g. customer accepts a partial'
+    default_qty = on_hand if (on_hand and 0 < on_hand < full) else full
+    tb_qty = TextBox(text=(f'{default_qty:g}' if default_qty else ''), placeholder='pieces today')
+    panel.add_component(Label(text=f'Quantity to plan (of {full:g} ordered):', font_size=13,
                               spacing_above='small', spacing_below='none'))
-    tb = TextBox(placeholder='why (optional) - e.g. build element for Friday container')
+    panel.add_component(tb_qty)
+    tb = TextBox(placeholder=verb)
     panel.add_component(tb)
-    ok = alert(content=panel, title=f'Add {lbl} anyway (pre-build)?',
+    ok = alert(content=panel, title=title,
                buttons=[('Add anyway', True), ('Cancel', False)], large=False)
     if not ok:
       return
+    try:
+      qty = float((tb_qty.text or '').strip() or full)
+    except Exception:
+      alert('Enter a number of pieces.')
+      return
+    if qty <= 0:
+      alert('Quantity must be above zero.')
+      return
     result = anvil.server.call('ship_plan_add_line', self.plan_date,
                                item['nx_order_numb'], item['nx_rel_numb'],
-                               item['nx_item_no'], override_note=(tb.text or ''))
+                               item['nx_item_no'], override_note=(tb.text or ''),
+                               qty=('all' if qty >= full else qty))
     if result.get('status') != 'success':
       alert(result.get('message', 'Add failed'))
       return

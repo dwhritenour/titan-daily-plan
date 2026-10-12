@@ -31,7 +31,7 @@ So the question for today is not whether the plan is worth doing. It is which co
 
 ### What keeps an order off today's plan (the gates)
 
-A gated order still shows in the candidate list with a stop sign, but the plan will not propose it and PC has to add it on purpose. Today there are six gates.
+A gated order still shows in the candidate list with a stop sign, but the plan will not propose it and PC has to add it on purpose. There are eight gates (two added 10/12, from the 10/10 decisions).
 
 | Gate | What it means in plain words | How it clears |
 |---|---|---|
@@ -41,6 +41,8 @@ A gated order still shows in the candidate list with a stop sign, but the plan w
 | **Stock promised to another order** (valves only) | Units are on the shelf, but e21 has already committed them to other orders and not enough are left for this one. A reallocation decision, not a dead end. | Someone decides which order gets the stock. |
 | **Material hold** | PC answered a retro question saying the material for this line is not on hand. The line stays off the plan until PC releases the hold or it expires. | PC releases it from the flag popup, or it times out. |
 | **No work order on file** | The order has no work order in our system. Almost always a data glitch, not a real condition. | The work-order feed catches up (usually within 15 minutes). |
+| **Short stock** (since 10/12) | The shelf count is below what the line needs: "on hand 1 of 89". PC can still add it on purpose for the quantity on the shelf (a deliberate partial), and the plan carries that quantity. | Stock arrives, or PC adds a partial. |
+| **Stalled** (since 10/12) | The line sat on the plan three days in a row with no activity. It leaves the plan and PC gets one question: what is it waiting on, and when? | PC answers with a date (it comes back that day), or releases it from the flag popup, or five business days pass. |
 
 Everything else on an order is a priority signal, not a gate: already late, due today or tomorrow, expedited ship method, high-dollar order. Those decide how high an order ranks; they never stop it.
 
@@ -62,7 +64,7 @@ When PC says "not enough casting", that is the finished unit itself (everything 
 
 Not every sitting line is a stock problem. 598129 and 600386 / YS80TS0075 have 1,598 on hand; that is a 1,400-piece job queued behind another, and a line that size needs to be planned a day's worth at a time (that change is already built). And 610126 / YS58UDG0200, a two-inch expedited line with stock for it, has been untouched for thirteen days and deserves a direct question.
 
-### Recommendation 1: make short stock a gate
+### Recommendation 1: make short stock a gate — *decided yes 10/10, in place 10/12*
 
 Turn the short-stock warning into a gate: if the shelf count is below what the line needs, the plan does not propose it. The row would read "short stock, on hand 1 of 89" with the stop sign instead of the triangle.
 
@@ -72,7 +74,7 @@ What stays in PC's hands: the same override the "due in" gate has. PC can still 
 
 What it does not fix: stock that is on the shelf but already promised to another order. That gate applies to valves only today (decision 4 below).
 
-### Recommendation 2: stop re-proposing lines that are stuck
+### Recommendation 2: stop re-proposing lines that are stuck — *decided yes 10/10, in place 10/12 (first part)*
 
 Two changes that work together.
 

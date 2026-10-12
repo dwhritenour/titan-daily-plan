@@ -90,8 +90,8 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     flag_list = item.get('flags') or []
     if any(f.get('code') == 'C05' for f in flag_list):   # 065
       glyphs.append('⚠ QTY')
-    c06 = next((f for f in flag_list if f.get('code') == 'C06'), None)
-    if c06:                                               # 092: short stock, warning
+    c06 = next((f for f in flag_list if f.get('code') in ('C06', 'X08')), None)
+    if c06:                                               # 092: short stock; 099: a gate (X08)
       # note starts 'Short stock: on hand 5 of 9 needed' -> glyph 'STOCK 5/9'
       m = re.match(r'Short stock: on hand (\d+) of (\d+)', c06.get('note') or '')
       glyphs.append(f'⚠ STOCK {m.group(1)}/{m.group(2)}' if m else '⚠ STOCK')
@@ -170,8 +170,11 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
   # ---------------------------------------------------------------
   @staticmethod
   def _only_due_in(item):
+    """The gates PC may override from the popup: X06 (stock on the way,
+    pre-build the element) and, since 099, X08 (short stock: ship what is
+    on the shelf). Any other gate keeps the row shut. Name kept from 075."""
     codes = [c for c in (item.get('gate_codes') or '').split(',') if c]
-    return codes == ['X06']
+    return bool(codes) and set(codes) <= {'X06', 'X08'}
 
   @staticmethod
   def _due_in_suffix(flag_list):
@@ -255,9 +258,15 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     # pre-build the straining element. Any other gate keeps the row shut.
     on_add_due_in = item.get('on_add_due_in')
     if self._only_due_in(item) and on_add_due_in:
-      lines.append(self._line('Stock is on the ocean or at the vendor - PC may add this line '
-                              'anyway to build the element ahead (PRE-BUILD).',
-                              color='#a16207'))
+      codes = set((item.get('gate_codes') or '').split(','))
+      if 'X06' in codes:
+        lines.append(self._line('Stock is on the ocean or at the vendor - PC may add this line '
+                                'anyway to build the element ahead (PRE-BUILD).',
+                                color='#a16207'))
+      else:                                               # 099: X08 only
+        lines.append(self._line('Short stock - PC may add this line anyway for the quantity '
+                                'on the shelf (PARTIAL); the rest stays in the candidates.',
+                                color='#a16207'))
       panel = ColumnPanel(spacing_above='none', spacing_below='none')
       for l in lines:
         panel.add_component(l)

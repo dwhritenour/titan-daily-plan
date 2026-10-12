@@ -763,9 +763,12 @@ def ship_plan_get_plan(plan_date):
       live = row.get('live_qty')                  # e21 balance due (display)
       ordered = row.get('live_ordered')           # e21 orditem.qty (planning qty, 066)
       planned = float(row['qty_planned'])
+      is_split = (row.get('priority_note') or '').startswith('SPLIT ')   # 10-08
       if row['line_status'] in _ACTIVE_STATUSES:
         if ordered is None:
           row['drift'] = 'gone'          # nothing open — likely shipped
+        elif is_split and planned < float(ordered) - 0.005:
+          row['drift'] = None            # a planned quantity, by design
         elif abs(float(ordered) - planned) > 0.005:
           row['drift'] = f"{planned:g} → {float(ordered):g}"
         else:
@@ -902,9 +905,34 @@ def _ensure_header(cursor, plan_date, actor):
     """, (plan_date, weights['weight_set_id'], actor))
 
 
+# 2026-10-08 split guard: a line bigger than this share of the day's
+# capacity is a multi-day job and gets a quantity, not the whole order.
+_SPLIT_GUARD_FRACTION = 0.5
+
+
+def _scale_agg(agg, qty):
+  """A partial quantity of a line: load scales per piece (the per-line
+  minutes are size x qty, so this is exact for the element work; the
+  surcharge is scaled the same way and documented as such)."""
+  full = float(agg['qty'] or 0)
+  if full <= 0 or qty >= full:
+    return dict(agg)
+  f = float(qty) / full
+  out = dict(agg)
+  out['qty'] = float(qty)
+  out['inches'] = round(float(agg['inches']) * f, 2)
+  out['minutes'] = round(float(agg['minutes']) * f, 2)
+  out['surcharge'] = round(float(agg['surcharge']) * f, 2)
+  return out
+
+
+def _split_note(qty, full):
+  return f'SPLIT {qty:g} of {full:g}'
+
+
 @anvil.server.callable
 def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
-                       override_note=None):
+                       override_note=None, qty=None):
   """Add one e21 line (order, release, item) to a day. The line is ALWAYS
   added — over-cap is reported back so the client runs the cap-hit dialog
   (snooze / unplaced / stretch / keep). Never a silent drop.
@@ -914,10 +942,26 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
   codes are recorded in a GateOverride event (new_value) and the note is
   written to priority_note so the board shows PRE-BUILD on the line. The
   retro judges lines on WORKED_ON, so a pre-build SE starts closes as
-  WORKED and one nobody touched earns the normal PC question."""
+  WORKED and one nobody touched earns the normal PC question.
+  qty (2026-10-08, split guard): None = the whole ordered quantity, but a
+  line bigger than _SPLIT_GUARD_FRACTION of the day's capacity is NOT
+  added - the call returns status 'needs_split' with the numbers and the
+  client asks PC for today's quantity. qty = a number plans that many
+  pieces (load scaled per piece, 'SPLIT n of N' on the line); qty = 'all'
+  adds the whole line regardless (PC's call, the cap-hit dialog follows)."""
   plan_date = _parse_date(plan_date)
   if tier not in ('Must', 'Next', 'Stretch'):
     return {'status': 'error', 'message': f'Bad tier {tier}.'}
+  force_all = (qty == 'all')
+  if force_all:
+    qty = None
+  if qty is not None:
+    try:
+      qty = float(qty)
+    except Exception:
+      return {'status': 'error', 'message': f'Bad quantity {qty!r}.'}
+    if qty <= 0:
+      return {'status': 'error', 'message': 'Quantity must be above zero.'}
   actor = _current_actor()
   conn = get_connection()
   try:
@@ -956,6 +1000,30 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
               '(shipped, or already planned on another day).'}
     agg = _aggregate(rows)
     label = _line_label(order, rel, item, agg['sku'])
+    full_qty = float(agg['qty'] or 0)
+    split_note = None
+    if qty is not None and qty < full_qty:
+      split_note = _split_note(qty, full_qty)
+      agg = _scale_agg(agg, qty)
+    elif qty is None and not force_all and full_qty > 1:
+      # ---- split guard (2026-10-08): stop and ask before adding -------
+      cap_now = _capacity_for(cursor, plan_date)['capacity_inches_effective']
+      if cap_now > 0 and float(agg['inches']) > _SPLIT_GUARD_FRACTION * cap_now:
+        planned_now = _planned_inches(cursor, plan_date)
+        per_piece = float(agg['inches']) / full_qty
+        room = max(0.0, cap_now - planned_now)
+        fits = int(room / per_piece) if per_piece > 0 else 0
+        if fits < 1:                      # day already full: offer half a day
+          fits = int((cap_now * _SPLIT_GUARD_FRACTION) / per_piece) if per_piece > 0 else 1
+        step = 25 if full_qty >= 200 else (10 if full_qty >= 40 else 1)
+        suggested = max(step if step < full_qty else 1, (fits // step) * step)
+        suggested = min(suggested, int(full_qty) - 1) if full_qty > 1 else 1
+        return {'status': 'needs_split', 'label': label, 'sku': agg['sku'],
+                'qty': full_qty, 'line_inches': round(float(agg['inches']), 1),
+                'per_piece_inches': round(per_piece, 2),
+                'capacity_inches': round(cap_now, 1),
+                'planned_inches': round(planned_now, 1),
+                'suggested_qty': int(suggested)}
     _ensure_header(cursor, plan_date, actor)
 
     if existing:  # was Removed / Unplaced — revive rather than violate the PK
@@ -977,16 +1045,29 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
       _insert_line_and_source(cursor, plan_date, order, rel, item, rows, agg,
                               actor=actor, tier=tier, reason=reason)
 
+    if split_note:
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (split_note, actor, plan_date, order, rel, item))
     _log_event(cursor, plan_date, order, agg['sku'], 'Added',
                new_value=f"{agg['qty']:g} pcs / {agg['inches']:.1f} in "
-               f"({tier})",
+               f"({tier})" + (f" {split_note}" if split_note else ""),
                actor=actor, note=('re-placed (was Unplaced)' if was_unplaced else None),
                rel=rel, item=item)
     if override_note is not None:
       # 075: the override is its own event (the Added event stays plain so
       # every add reads the same in the retro); the note goes on the line.
       why = (override_note or '').strip()
-      board_note = 'PRE-BUILD (gate ' + gate_codes.replace(',', ' ') + ' overridden)'
+      # 099: X08 short stock overridden = a deliberate PARTIAL (what is on
+      # the shelf); X06 = PRE-BUILD (element ahead of the body). A split
+      # quantity keeps its 'SPLIT n of N' in front so the drift rule and
+      # Refresh still recognise it.
+      gset = set(gate_codes.split(','))
+      kind = 'PARTIAL' if ('X08' in gset and 'X06' not in gset) else 'PRE-BUILD'
+      board_note = ((split_note + ' - ') if split_note else '') \
+      + kind + ' (gate ' + gate_codes.replace(',', ' ') + ' overridden)'
       if why:
         board_note += ': ' + why
       cursor.execute("""
@@ -996,7 +1077,8 @@ def ship_plan_add_line(plan_date, order, rel, item, tier='Next', reason=None,
       """, (board_note[:200], actor, plan_date, order, rel, item))
       _log_event(cursor, plan_date, order, agg['sku'], 'GateOverride',
                  new_value=gate_codes, actor=actor,
-                 note=(why or 'pre-build straining element'), rel=rel, item=item)
+                 note=(why or ('partial - ship what is on the shelf' if kind == 'PARTIAL'
+                               else 'pre-build straining element')), rel=rel, item=item)
     _bump_revision(cursor, plan_date, actor)
 
     planned = _planned_inches(cursor, plan_date)
@@ -1644,7 +1726,7 @@ def ship_plan_recalc_line(plan_date, order, rel, item):
   try:
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT qty_planned, load_inches FROM dbo.pc_ship_plan_line
+        SELECT qty_planned, load_inches, priority_note FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
           AND line_status IN %s
     """, (plan_date, order, rel, item, _ACTIVE_STATUSES))
@@ -1658,6 +1740,18 @@ def ship_plan_recalc_line(plan_date, order, rel, item):
               'message': 'No open quantity in the feed — this line likely '
               'shipped. Remove it rather than refreshing.'}
     agg = _aggregate(rows)
+    # 10-08: a split line keeps its planned quantity; only the per-piece
+    # load is refreshed (the note is restated against the live ordered qty)
+    if (old.get('priority_note') or '').startswith('SPLIT '):
+      keep = float(old['qty_planned'])
+      if keep < float(agg['qty'] or 0):
+        agg = _scale_agg(agg, keep)
+        cursor.execute("""
+            UPDATE dbo.pc_ship_plan_line SET priority_note = %s
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+        """, (_split_note(keep, float(sum(float(r['nx_qty_ordered'] if r.get('nx_qty_ordered') is not None
+                                                else r['nx_qty_balance_due']) for r in rows))),
+              plan_date, order, rel, item))
 
     _delete_source_rows(cursor, plan_date, order, rel, item)
     _insert_source_rows(cursor, plan_date, order, rel, item, rows)
