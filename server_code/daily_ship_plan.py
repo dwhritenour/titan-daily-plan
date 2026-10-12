@@ -754,7 +754,14 @@ def ship_plan_get_plan(plan_date):
         ORDER BY CASE l.line_status WHEN 'Unplaced' THEN 0 ELSE 1 END,
                  CASE l.tier WHEN 'Must' THEN 0 WHEN 'Next' THEN 1
                              ELSE 2 END,
-                 l.position, l.load_inches DESC, l.nx_order_numb, l.nx_rel_numb, l.nx_item_no
+                 l.position,
+                 -- 104 (Sales, 2026-10-12): an order's lines sit together -
+                 -- the order with the biggest single live line first, then
+                 -- release and line (the line number as a NUMBER: nx_item_no is
+                 -- text, so 110 would sort before 20). Same rule as sp_stamp_plan_work_orders.
+                 MAX(CASE WHEN l.line_status IN ('Planned', 'Proposed', 'Confirmed', 'Unplaced')
+                          THEN ISNULL(l.load_inches, 0) END) OVER (PARTITION BY l.nx_order_numb) DESC,
+                 l.nx_order_numb, l.nx_rel_numb, TRY_CAST(LTRIM(RTRIM(l.nx_item_no)) AS INT), l.nx_item_no
     """, ('%,A05,%', '%,A04,%', _next_business_day(date.today() + timedelta(days=1)),
           plan_date))
     lines = []
