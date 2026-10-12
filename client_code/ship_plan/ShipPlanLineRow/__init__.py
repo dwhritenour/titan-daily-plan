@@ -70,8 +70,17 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     # line has left the feed (drift 'gone').
     ordered = item.get('live_ordered')
     balance = item.get('live_qty')
+    note0 = item.get('priority_note') or ''
+    planned = float(item['qty_planned'])
     if ordered is None:
-      self.lbl_qty.text = f"{float(item['qty_planned']):g}"
+      self.lbl_qty.text = f"{planned:g}"
+    elif note0.startswith('SPLIT ') and planned < float(ordered) - 0.005:
+      # decision 5 (10-12): a deliberate partial reads 'n of N'
+      self.lbl_qty.text = f"{planned:g} of {float(ordered):g}"
+      self.lbl_qty.foreground = '#a16207'
+      self.lbl_qty.bold = True
+      self.lbl_qty.tooltip = ('PARTIAL - the plan carries the quantity PC intends to ship today; '
+                              'the rest stays open on the order. Change it with the star.')
     elif item.get('qty_warn'):
       self.lbl_qty.text = f"{float(ordered):g} ({float(balance):g})"
       self.lbl_qty.foreground = '#C62828'
@@ -93,6 +102,12 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
       bg, fg = TIER_COLORS.get(tier, TIER_COLORS['Next'])
       chip_text = {'Must': 'PRIORITY', 'Next': 'NEXT',
                    'Stretch': 'IF TIME'}.get(tier, tier.upper())
+    if note0.startswith('SHELF DECISION:'):   # v1.4: two orders, one shelf - decide before publish
+      chip_text = '⚖ ' + chip_text
+      self.lbl_status.tooltip = ('SHELF DECISION - another order on this plan is planned for the '
+                                 'stock this line needs. On the board at 0 in. Before publish: '
+                                 'Remove it (ship the other complete) or plan a quantity on each '
+                                 '(star). Undecided at publish = it leaves the plan.')
     if item.get('is_rush'):              # 091: rush lane - same glyph as the flags
       chip_text = '⚡ ' + chip_text
       self.lbl_status.tooltip = ('RUSH — expedited ship method, due by the next '

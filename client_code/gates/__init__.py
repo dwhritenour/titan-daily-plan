@@ -96,12 +96,12 @@ Struck through = decided and in place.
    *Decided yes, 10/10. In place 10/12: a material answer read as Probable or better places the hold at once; Dave's review can undo it.*
 4. ~~**Should "stock promised to another order" apply to strainers too**, or stay valves only?~~
    *Decided no, 10/10: valves only. On-hand is the right number for strainers; the short-stock gate covers the real shortage.*
-5. **When a gated line is added on purpose for a partial**, should the plan carry the quantity PC intends to ship, so Sales can tell the customer?
-   *Decided yes, 10/10. In progress: the short-stock override already carries the quantity; the rest (any line can be planned at a quantity, and Sales can see the partials in one place) is being built.*
+5. ~~**When a gated line is added on purpose for a partial**, should the plan carry the quantity PC intends to ship, so Sales can tell the customer?~~
+   *Decided yes, 10/10. In place 10/12 (evening): any plan line can be planned at a quantity from the star dialog; the Qty column reads "20 of 89"; the Flag filter has "Partial quantity" so Sales sees every partial in one place.*
 6. ~~**610126 / YS58UDG0200**: why has a two-inch expedited line with stock sat for thirteen days?~~
    *Taken care of 10/12.*
 7. ~~**Two orders, one shelf** (new): two Must lines for the same item on the same day, where the shelf covers either but not both. Today both are proposed and one sits.~~
-   *Decided yes, 10/10. In place 10/12: the proposal keeps a running count per item in priority order; the second line is proposed for what the shelf still covers ("SPLIT 20 of 89 - stock: the rest is planned on order N") or goes short when nothing is left.*
+   *Decided yes, 10/10; Production's version 10/12: both orders go on the plan. The higher-priority order is planned for the stock; the other line shows on the board at 0 in with a "⚖ SHELF DECISION" note naming it. Before publish, PC and Sales decide: remove it (ship the other complete) or plan a quantity on each (item 5). Undecided at publish, it leaves the plan and the priority pick stands. When the shelf covers part of the second line it is proposed for that part ("SPLIT 20 of 89 - stock: the rest is planned on order N").*
 
 *Prepared for the PC + Sales meeting, Friday 10/10/2026. Numbers as of 10/8.*
 """

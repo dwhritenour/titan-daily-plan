@@ -351,6 +351,10 @@ class ship_plan(ship_planTemplate):
         return False
       if ff == 'RUSH' and not l.get('is_rush'):             # 091
         return False
+      if ff == 'PARTIAL' and not (l.get('priority_note') or '').startswith('SPLIT '):   # decision 5
+        return False
+      if ff == 'SHELF' and not (l.get('priority_note') or '').startswith('SHELF DECISION:'):   # decision 7
+        return False
       if ff in ('ANY_A', 'ANY_B') and not any(c.startswith(ff[-1]) for c in codes):
         return False
       if len(ff) == 3 and ff[0] in 'XABC' and ff[1:].isdigit() and ff not in codes:
@@ -386,7 +390,9 @@ class ship_plan(ship_planTemplate):
              ('Gated — due in (on the ocean / at vendor)', 'GATED_DUE_IN'),   # 075, 078 wording
              ('⚡ Rush — Expedited Ship Method', 'RUSH'),       # 091
              ('Any A — urgency', 'ANY_A'),
-             ('Any B — value', 'ANY_B')]
+             ('Any B — value', 'ANY_B'),
+             ('Partial quantity — planned n of N (plan grid)', 'PARTIAL'),      # decision 5, 10-12
+             ('⚖ Shelf decision — two orders, one shelf (plan grid)', 'SHELF')]  # decision 7, 10-12
     for f in self._flag_defs:
       if f.get('active') and f.get('category') in ('X', 'A', 'B'):
         items.append((f"{f['flag_code']}  {f['flag_name']}", f['flag_code']))
@@ -925,10 +931,15 @@ class ship_plan(ship_planTemplate):
       selected_value=item.get('priority_reason') or '')
     tb_note = TextBox(text=item.get('priority_note') or '',
                       placeholder='note — required for "Other"')
+    # decision 5 (10-12): plan ANY line at a quantity from the same dialog
+    full = item.get('live_ordered')
+    full = float(full) if full is not None else float(item.get('qty_planned') or 0)
+    cur_qty = float(item.get('qty_planned') or 0)
+    tb_qty = TextBox(text=f'{cur_qty:g}', placeholder='pieces today')
     pnl = ColumnPanel()
     cb_all = None
     if len(siblings) > 1:
-      cb_all = CheckBox(text=f'Apply to ALL {len(siblings)} lines of {order} on this plan')
+      cb_all = CheckBox(text=f'Apply tier / reason / note to ALL {len(siblings)} lines of {order} on this plan')
       pnl.add_component(cb_all)
     pnl.add_component(Label(text='Tier', bold=True))
     pnl.add_component(dd_tier)
@@ -936,6 +947,8 @@ class ship_plan(ship_planTemplate):
     pnl.add_component(dd_reason)
     pnl.add_component(Label(text='Note', bold=True))
     pnl.add_component(tb_note)
+    pnl.add_component(Label(text=f'Quantity to plan today (of {full:g} ordered) — this line only', bold=True))
+    pnl.add_component(tb_qty)
     if not confirm(f"Priority — {line_label(item)}",
                    content=pnl):
       return
@@ -944,11 +957,32 @@ class ship_plan(ship_planTemplate):
       alert('"Other (see note)" needs the note — that IS the reason. '
             'Nothing saved; open ★ again.')
       return
+    try:
+      new_qty = float((tb_qty.text or '').strip() or cur_qty)
+    except Exception:
+      alert('Quantity must be a number. Nothing saved; open ★ again.')
+      return
+    if new_qty <= 0:
+      alert('Quantity must be above zero. Nothing saved; open ★ again.')
+      return
+    if abs(new_qty - cur_qty) > 0.005:
+      rq = anvil.server.call('ship_plan_set_qty', self.plan_date,
+                             order, item['nx_rel_numb'], item['nx_item_no'],
+                             min(new_qty, full) if full else new_qty,
+                             why=(tb_note.text or '').strip())
+      if rq.get('status') != 'success':
+        alert(rq.get('message', 'Quantity change failed'))
+        self.load_day()
+        return
+      Notification(f"Quantity: {rq['old']} → {rq['new']}", timeout=4).show()
+      note_arg = None                # the quantity call wrote the note (with the typed text); leave it
+    else:
+      note_arg = tb_note.text or ''
     if cb_all and cb_all.checked:
       r = anvil.server.call('ship_plan_set_order_priority', self.plan_date, order,
                             tier=dd_tier.selected_value,
                             reason=dd_reason.selected_value,
-                            note=tb_note.text or '')
+                            note=note_arg)
       if r.get('status') == 'success':
         n = len(r.get('changed_lines') or [])
         Notification((f"{order}: {n} of {r.get('n_lines', n)} line(s) changed"
@@ -959,7 +993,7 @@ class ship_plan(ship_planTemplate):
                             order, item['nx_rel_numb'], item['nx_item_no'],
                             tier=dd_tier.selected_value,
                             reason=dd_reason.selected_value,
-                            note=tb_note.text or '')
+                            note=note_arg)
     if r.get('status') != 'success':
       alert(r.get('message', 'Priority change failed'))
     self.load_day()

@@ -1162,6 +1162,9 @@ def _set_priority_tx(cursor, plan_date, order, rel, item, tier, reason, note, ac
       changed = True
   if note is not None:
     new_note = (note or '').strip()[:200] or None
+    pfx = _system_prefix(row['priority_note'])      # v1.4: 'SPLIT n of N' / 'SHELF DECISION' survive a hand edit
+    if pfx and not (new_note or '').startswith(pfx[:5]):
+      new_note = (pfx + ((' - ' + new_note) if new_note else ''))[:200]
     if new_note != row['priority_note']:
       cursor.execute("""
           UPDATE dbo.pc_ship_plan_line
@@ -1877,6 +1880,7 @@ def ship_plan_publish(plan_date, partial_ack=None):
           actor, plan_date))
     if cursor.rowcount == 0:
       return {'status': 'error', 'message': 'No plan exists for that day yet.'}
+    shelf_undecided = _drop_undecided_shelf_lines(cursor, plan_date, actor)   # v1.4
     proposal_outcome = _settle_proposal_outcomes(cursor, plan_date, actor)
     _log_event(cursor, plan_date, None, None, 'Published',
                new_value=f"capacity {cap['capacity_inches_effective']:.0f} in",
@@ -1898,7 +1902,7 @@ def ship_plan_publish(plan_date, partial_ack=None):
                         row.get('weight_set_id'))
     conn.commit()
     result = {'status': 'success', 'capacity': cap, 'snapshot_rows': n,
-              'proposal_outcome': proposal_outcome}
+              'proposal_outcome': proposal_outcome, 'shelf_undecided': shelf_undecided}
   except Exception as e:
     conn.rollback()
     result = {'status': 'success', 'capacity': cap,
@@ -2219,7 +2223,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.3.2' # v1.3: two orders, one shelf (the shelf by plan priority); v1.2: planned-short rule
+_AGENT_VERSION = 'v1.4'   # v1.4: shelf decisions ride at zero (Production, 10-12); v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2308,6 +2312,126 @@ def _agent_reason(c, tier, notes):
   return txt[:500]
 
 
+_SHELF_DECISION_PREFIX = 'SHELF DECISION:'
+
+
+def _shelf_decision_note(c):
+  """v1.4 board note for a line that lost the shelf (<= 200 chars, starts
+  with the prefix the client, the filter and the publish cleanup look for)."""
+  taker = c.get('decision_taker')
+  need = float(c.get('qty_open') or 0)
+  who = f"order {taker} is planned for it" if taker else 'it is spoken for on this plan'
+  return (f"{_SHELF_DECISION_PREFIX} needs {need:g}, the shelf covers one order - {who}. "
+          f"Decide with Sales before publish: Remove this line (ship {taker or 'the other'} complete) "
+          f"or plan a quantity on each (star)")[:200]
+
+
+def _drop_undecided_shelf_lines(cursor, plan_date, actor):
+  """v1.4: at publish an undecided SHELF DECISION line leaves the plan -
+  the priority pick stands. Returns the labels removed."""
+  cursor.execute("""
+      SELECT nx_order_numb, nx_rel_numb, nx_item_no, nx_sku, priority_note
+      FROM dbo.pc_ship_plan_line
+      WHERE plan_date = %s AND line_status IN ('Planned', 'Proposed', 'Confirmed')
+        AND priority_note LIKE %s
+  """, (plan_date, _SHELF_DECISION_PREFIX + '%'))
+  gone = []
+  for r in cursor.fetchall():
+    cursor.execute("""
+        UPDATE dbo.pc_ship_plan_line
+        SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (actor, plan_date, r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']))
+    _log_event(cursor, plan_date, r['nx_order_numb'], r['nx_sku'], 'Removed',
+               old_value='shelf decision', new_value='undecided at publish',
+               actor=actor, note='the shelf stays with the order planned first: ' + (r['priority_note'] or '')[:400],
+               rel=r['nx_rel_numb'], item=r['nx_item_no'])
+    gone.append(_line_label(r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']))
+  return gone
+
+
+def _system_prefix(note):
+  """The system clause at the front of a board note ('SPLIT n of N',
+  'SHELF DECISION: ...') that a hand edit must not lose; '' when none."""
+  n = (note or '')
+  if n.startswith('SPLIT '):
+    m = re.match(r'SPLIT \S+ of \S+', n)
+    return m.group(0) if m else ''
+  if n.startswith(_SHELF_DECISION_PREFIX):
+    return n.split(' · ')[0]
+  return ''
+
+
+@anvil.server.callable
+def ship_plan_set_qty(plan_date, order, rel, item, qty, why=None):
+  """Decision 5 (2026-10-10, built 10-12): plan ANY line at a quantity.
+  qty below the ordered quantity = a deliberate partial: load scales per
+  piece, the board note starts 'SPLIT n of N - PARTIAL' (drift rule,
+  Refresh, the Partial filter); qty at or above it = the whole line again
+  (note cleared of the SPLIT / SHELF DECISION clause). Logged as Recalc
+  (the only re-total event type) with a PARTIAL note."""
+  plan_date = _parse_date(plan_date)
+  try:
+    qty = float(qty)
+  except Exception:
+    return {'status': 'error', 'message': 'Quantity must be a number.'}
+  if qty <= 0:
+    return {'status': 'error', 'message': 'Quantity must be above zero.'}
+  actor = _current_actor()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT qty_planned, load_inches, priority_note, line_status FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+          AND line_status IN %s
+    """, (plan_date, order, rel, item, _ACTIVE_STATUSES))
+    old = cursor.fetchone()
+    if not old:
+      return {'status': 'error', 'message': 'Line not found or not active.'}
+    rows = _fetch_candidate_rows(cursor, order, rel, item)
+    if not rows:
+      return {'status': 'error', 'message': 'No open quantity in the feed - this line likely shipped.'}
+    agg = _aggregate(rows)
+    full = float(agg['qty'] or 0)
+    old_note = old.get('priority_note') or ''
+    tail = old_note[len(_system_prefix(old_note)):].lstrip(' -·:') if _system_prefix(old_note) else old_note
+    tail = re.sub(r'^PARTIAL(\s*\(gate [^)]*\))?:?\s*', '', tail).strip()
+    why = (why or '').strip()
+    if qty >= full:                      # the whole line again
+      qty = full
+      note = (tail or None)
+    else:
+      agg = _scale_agg(agg, qty)
+      note = _split_note(qty, full) + ' - PARTIAL' + (': ' + (why or tail) if (why or tail) else '')
+      note = note[:200]
+    cursor.execute("""
+        UPDATE dbo.pc_ship_plan_line
+        SET qty_planned = %s, load_inches = %s, load_minutes = %s, surcharge_minutes = %s,
+            priority_note = %s, updated_by = %s, updated_at = GETDATE()
+        WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+    """, (agg['qty'], agg['inches'], agg['minutes'], agg['surcharge'], note, actor,
+          plan_date, order, rel, item))
+    old_txt = f"{float(old['qty_planned']):g} pcs / {float(old['load_inches']):.1f} in"
+    new_txt = f"{agg['qty']:g} pcs / {agg['inches']:.1f} in"
+    _log_event(cursor, plan_date, order, agg['sku'], 'Recalc',
+               old_value=old_txt, new_value=new_txt, actor=actor,
+               note=(('PARTIAL: ' + (why or 'quantity set by PC')) if qty < full
+                     else 'whole line again' + (': ' + why if why else '')), rel=rel, item=item)
+    _bump_revision(cursor, plan_date, actor)
+    planned = _planned_inches(cursor, plan_date)
+    cap = _capacity_for(cursor, plan_date)['capacity_inches_effective']
+    conn.commit()
+    return {'status': 'success', 'old': old_txt, 'new': new_txt, 'qty': agg['qty'],
+            'full': full, 'planned_inches': round(planned, 1),
+            'capacity_inches': round(cap, 1), 'over_capacity': planned > cap}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Quantity failed: {e}'}
+  finally:
+    conn.close()
+
+
 def _upsert_proposed_line(cursor, plan_date, order, rel, item, rows, agg, tier,
                           reason, actor):
   """Insert (or revive a Removed) line as Proposed by the agent. Returns
@@ -2391,7 +2515,8 @@ def ship_plan_agent_compare(plan_date=None):
          f"  morning: {len(old)} lines, {float(p['proposed_inches'] or 0) if p else 0:,.0f} in"
          f"   |   now: {len(newl)} lines, {new['proposed_inches']:,.0f} in of {new['target_inches']:,.0f} target; "
          f"gated {new['n_gated']}, short {new['n_short']} (stock {new.get('n_stock_short', 0)}), "
-         f"partials {new.get('n_stock_partial', 0)}, split-needed {new['n_split_needed']}, blocked {new['n_blocked']}"]
+         f"partials {new.get('n_stock_partial', 0)}, shelf decisions {new.get('n_shelf_decision', 0)}, "
+         f"split-needed {new['n_split_needed']}, blocked {new['n_blocked']}"]
   dropped = [k for k in old if k not in newl]
   added = [k for k in newl if k not in old]
   kept = [k for k in old if k in newl]
@@ -2414,8 +2539,10 @@ def ship_plan_agent_compare(plan_date=None):
   for k in sorted(added, key=lambda k: newl[k]['rank']):
     l = newl[k]
     out.append(f"  #{l['rank']:<3} {l['line']} / {l['sku']:<14} {l['tier']:<7} {l['load_inches']:7,.1f} in  "
-               f"{('(partial %g of %g)' % (l['qty_planned'], l['qty_full'])) if l.get('qty_planned') else ''}")
-  changed = [k for k in kept if (newl[k].get('qty_planned') or old[k]['proposed_tier'] != newl[k]['tier'])]
+               f"{('(partial %g of %g)' % (l['qty_planned'], l['qty_full'])) if l.get('qty_planned') else ''}"
+               f"{('(SHELF DECISION - %s has the stock)' % l.get('decision_taker')) if l.get('shelf_decision') else ''}")
+  changed = [k for k in kept if (newl[k].get('qty_planned') or newl[k].get('shelf_decision')
+                                 or old[k]['proposed_tier'] != newl[k]['tier'])]
   out.append(f"\nKEPT ({len(kept)}), of which changed ({len(changed)}):")
   for k in sorted(changed, key=lambda k: newl[k]['rank']):
     l, r = newl[k], old[k]
@@ -2424,6 +2551,8 @@ def ship_plan_agent_compare(plan_date=None):
       bits.append(f"tier {r['proposed_tier']} -> {l['tier']}")
     if l.get('qty_planned'):
       bits.append(f"partial {l['qty_planned']:g} of {l['qty_full']:g} ({float(r['load_inches'] or 0):,.1f} -> {l['load_inches']:,.1f} in)")
+    if l.get('shelf_decision'):
+      bits.append(f"SHELF DECISION at 0 in - {l.get('decision_taker')} has the stock")
     out.append(f"  {l['line']} / {l['sku']:<14} " + '; '.join(bits))
   if new.get('short'):
     out.append(f"\nSHORT lines named by the dry run ({len(new['short'])}):")
@@ -2753,32 +2882,40 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         short_lines.extend(short)
       # v1.3: the shelf. Riders whose item is already spoken for on this
       # plan go SHORT (stock planned on order X) or get a partial quantity.
+      # v1.4 (Production, 10-12): a line whose shelf is already spoken for
+      # on this plan is NOT dropped - it rides at ZERO inches with a SHELF
+      # DECISION note (visible, not counted). PC + Sales decide before
+      # publish: Remove it (ship the other order complete) or plan a
+      # quantity on each (decision 5). Undecided at publish = the priority
+      # pick stands (ship_plan_publish removes it, logged). A ship-complete
+      # order cannot go partial, so it stays BLOCKED as before.
       keep = []
       for m in riders:
         chk = _shelf_check(m)
         need = float(m.get('qty_open') or 0)
-        if chk is None or need <= 0:
-          keep.append(m)
+        if chk is None or need <= 0 or m.get('is_gated'):
+          keep.append(m)            # gated riders (X06 due in) are the planned-short rule's, not the shelf's
           continue
         avail, taker, sku = chk
         if avail >= need - 1e-9:
           keep.append(m)
           continue
-        if avail <= 0:
-          m['short_note'] = (f"stock planned on order {taker}" if taker
-                             else 'no stock left on the shelf')
-          m['short_of'] = order
-          m['stock_short'] = True
-          short.append(m)
+        stock_qty = float(int(avail)) if avail > 0 else 0.0
+        if stock_qty < 1:
+          if order in ship_complete:
+            m['short_note'] = (f"stock planned on order {taker}" if taker else 'no stock left on the shelf')
+            m['short_of'] = order
+            m['stock_short'] = True
+            short.append(m)
+            continue
+          m['shelf_decision'] = True
+          m['decision_taker'] = taker
+          m['decision_load'] = float(m.get('load_inches') or 0)
+          m['load_inches'] = 0.0
+          keep.append(m)
           continue
         # a partial: what the shelf still covers
-        m['stock_qty'] = float(int(avail))
-        if m['stock_qty'] < 1:
-          m['short_note'] = f"stock planned on order {taker}" if taker else 'no stock left on the shelf'
-          m['short_of'] = order
-          m['stock_short'] = True
-          short.append(m)
-          continue
+        m['stock_qty'] = stock_qty
         f = m['stock_qty'] / need
         m['stock_full_qty'] = need
         m['stock_taker'] = taker
@@ -2837,7 +2974,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         n_groups += 1
         for m in members:                       # v1.3: book the shelf
           chk = _shelf_check(m)
-          if chk is not None:
+          if chk is not None and not m.get('shelf_decision'):   # v1.4: a decision line takes nothing
             sku = chk[2]
             stock_used[sku] = stock_used.get(sku, 0.0) + float(m.get('stock_qty') or m.get('qty_open') or 0)
             stock_taker.setdefault(sku, order)
@@ -2885,6 +3022,10 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
                     f"{float(c.get('group_inches') or 0):,.0f} in together")[:500]
       if c.get('group_short'):
         reason = (reason + ' · ' + c['group_short'])[:500]
+      if c.get('shelf_decision'):
+        # v1.4: the board note must START with 'SHELF DECISION:' (publish
+        # cleanup, filter, chip glyph); the full reason follows on the proposal
+        reason = (_shelf_decision_note(c) + ' · ' + reason)[:500]
       if c.get('stock_qty'):
         # v1.3: the board note must START with 'SPLIT n of N' (drift rule,
         # Refresh); the rest of the shelf is on another order of this plan
@@ -2903,6 +3044,8 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
       agg_p = _aggregate(rows) if rows else None
       if agg_p and c.get('stock_qty'):
         agg_p = _scale_agg(agg_p, c['stock_qty'])        # v1.3 partial
+      if agg_p and c.get('shelf_decision'):              # v1.4: on the board, not in the load
+        agg_p = dict(agg_p, inches=0.0, minutes=0.0, surcharge=0.0)
       if not dry_run and rows and _upsert_proposed_line(cursor, plan_date, order, rel, item, rows,
                                                         agg_p, tier, reason, actor):
         n_added += 1
@@ -2916,7 +3059,10 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
                         'score': int(c.get('priority_score') or 0),
                         'flags': c.get('flag_codes'), 'reason': reason,
                         'qty_planned': (c.get('stock_qty') or None),     # v1.3
-                        'qty_full': (c.get('stock_full_qty') or None)})
+                        'qty_full': (c.get('stock_full_qty') or None),
+                        'shelf_decision': bool(c.get('shelf_decision')),  # v1.4
+                        'decision_taker': c.get('decision_taker'),
+                        'decision_load': float(c.get('decision_load') or 0)})
 
     _cap = None if dry_run else 25      # the compare needs every gated/short line
     gated_out = [{'order': g['nx_order_numb'], 'sku': g['nx_sku'],
@@ -2978,6 +3124,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
             'n_short': len(short_lines), 'short': short_out,
             'n_stock_short': sum(1 for s in short_lines if s.get('stock_short')),      # v1.3
             'n_stock_partial': sum(1 for c, _ in picks + stretch if c.get('stock_qty')),
+            'n_shelf_decision': sum(1 for c, _ in picks + stretch if c.get('shelf_decision')),  # v1.4
             'lines': out_lines, 'gated': gated_out, 'oversize': oversize_out,
             'snapshot_warning': snapshot_warning}
   except Exception as e:
