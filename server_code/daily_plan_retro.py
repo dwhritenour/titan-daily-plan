@@ -64,7 +64,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.5.0'   # 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain; 1.3: PARTIAL_ORDER
+_RETRO_VERSION = 'retro-1.6.0'   # 1.6 (096): stall rule; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -114,6 +114,12 @@ def _retro_params(cursor):
           'min_sales': max(0, _i('RETRO_MIN_SALES_QUESTIONS', 1)),
           'unplanned_min': float(p.get('RETRO_UNPLANNED_MIN_INCHES', 50) or 50),
           'unknown_days': max(1, _i('RETRO_UNKNOWN_AFTER_DAYS', 5)),
+          # 096 stall rule: untouched this many published plan days in a row
+          # -> off the plan (STALLED hold, X07) + one forced PC question.
+          # 0 = rule off. STALL_HOLD_DAYS = how long the hold lasts with no
+          # dated answer (business days).
+          'stall_days': max(0, _i('STALL_DAYS', 3)),
+          'stall_hold_days': max(1, _i('STALL_HOLD_DAYS', 5)),
           'pc_owners': _names('RETRO_PC_OWNERS'),
           'sales_owners': _names('RETRO_SALES_OWNERS'),
           'fill_pct': max(0.0, min(float(p.get('AGENT_FILL_PCT', 80) or 80), 100.0)) / 100.0}
@@ -145,6 +151,111 @@ def _role_of(actor, rp):
 def _owners(role, rp):
   names = rp['sales_owners'] if role == 'SALES' else rp['pc_owners']
   return ', '.join(names) if names else ('Sales' if role == 'SALES' else 'Production Control')
+
+
+# =============================================================================
+# 096 - the stall rule (decision 2, 2026-10-12)
+# =============================================================================
+
+def _stall_streaks(cursor, plan_date, max_days=12):
+  """For every line UNTOUCHED on plan_date (in-memory rows, not yet
+  written), how many published plan days IN A ROW ending on plan_date it
+  has been untouched. Walks the prior retro days (pc_plan_retro = the days
+  that were published and reviewed) and the variance ledger. Returns
+  {(order, rel, item): [plan_dates...]} for the prior days only; the caller
+  adds today."""
+  cursor.execute("""
+      SELECT TOP (%s) plan_date FROM dbo.pc_plan_retro
+      WHERE plan_date < %s ORDER BY plan_date DESC
+  """, (max_days, plan_date))
+  prior_days = [r['plan_date'] for r in cursor.fetchall()]
+  if not prior_days:
+    return {}, []
+  cursor.execute("""
+      SELECT plan_date, nx_order_numb, nx_rel_numb, nx_item_no
+      FROM dbo.pc_plan_variance
+      WHERE plan_date >= %s AND plan_date < %s
+        AND variance_case = 'UNTOUCHED' AND expected = 'WORKED_ON'
+  """, (prior_days[-1], plan_date))
+  untouched = {}
+  for r in cursor.fetchall():
+    untouched.setdefault((r['nx_order_numb'], r['nx_rel_numb'] or '', r['nx_item_no'] or ''),
+                         set()).add(r['plan_date'])
+  return untouched, prior_days
+
+
+def _stall_scan(cursor, plan_date, rows, rp):
+  """Mark the rows that stall today. A row stalls when it is UNTOUCHED
+  (routed to PC - a Sales date move is not a stall), its streak reaches
+  STALL_DAYS, and the line has no live hold already. The forced question
+  replaces the usual 'was it started?' and is ALWAYS sent, on top of
+  RETRO_MAX_QUESTIONS. Returns the stalled rows (hold placed later, once
+  the variance row exists and has an id)."""
+  n = rp.get('stall_days') or 0
+  if n <= 0:
+    return []
+  untouched, prior_days = _stall_streaks(cursor, plan_date)
+  stalled = []
+  for r in rows:
+    if r.get('case') != 'UNTOUCHED' or r.get('routed_to') != 'PC' or r.get('expected') != 'WORKED_ON':
+      continue
+    key = (r['order'], r.get('rel') or '', r.get('item') or '')
+    days = [plan_date]
+    for d in prior_days:                      # newest first: consecutive only
+      if d in untouched.get(key, ()):
+        days.append(d)
+      else:
+        break
+    if len(days) < n:
+      continue
+    cursor.execute("""
+        SELECT TOP 1 hold_id, hold_kind, expires_on FROM dbo.pc_plan_line_hold
+        WHERE nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+          AND released_at IS NULL AND expires_on >= CAST(GETDATE() AS DATE)
+    """, (r['order'], r.get('rel'), r.get('item')))
+    if cursor.fetchone():
+      continue                                # already held (material or stalled)
+    first, last = min(days), max(days)
+    r['stall_days'] = len(days)
+    r['stall_first'] = first
+    r['question'] = (f"Order {r.get('line') or r['order']} has been on the plan {len(days)} days "
+                     f"in a row ({first:%m/%d} to {last:%m/%d}) with no shipment or work-order "
+                     "activity, and has been taken off the plan. What is it waiting on, and on "
+                     "what date can it be built? It comes back on that date, or sooner if PC "
+                     "releases the hold.")
+    r['explanation'] = (r.get('explanation') or '') + f"; STALLED after {len(days)} days - off the plan"
+    stalled.append(r)
+  return stalled
+
+
+def _place_stall_holds(cursor, plan_date, stalled, rp):
+  """After the ledger write: one STALLED hold per stalled line (X07 gate,
+  sp_pc_place_line_hold with @hold_kind = 'STALLED'), tied to the day's
+  variance row so the PC answer can set its expiry. Never raises."""
+  placed = []
+  for r in stalled:
+    try:
+      cursor.execute("""
+          SELECT TOP 1 variance_id FROM dbo.pc_plan_variance
+          WHERE plan_date = %s AND nx_order_numb = %s AND ISNULL(nx_rel_numb, '') = %s
+            AND ISNULL(nx_item_no, '') = %s AND expected = 'WORKED_ON'
+      """, (plan_date, r['order'], r.get('rel') or '', r.get('item') or ''))
+      v = cursor.fetchone()
+      reason = (f"Stalled: {r['stall_days']} plan days with no activity "
+                f"({r['stall_first']:%m/%d} to {plan_date:%m/%d}); off the plan until PC gives a date")
+      cursor.execute("""
+          EXEC dbo.sp_pc_place_line_hold @order = %s, @rel = %s, @item = %s,
+               @reason = %s, @placed_by = %s, @source_variance_id = %s,
+               @days = %s, @hold_kind = 'STALLED'
+      """, (r['order'], r.get('rel'), r.get('item'), reason[:500], 'agent (stall rule)',
+            (v['variance_id'] if v else None), rp['stall_hold_days']))
+      h = cursor.fetchone() or {}
+      placed.append({'line': r.get('line') or r['order'], 'days': r['stall_days'],
+                     'expires_on': h.get('expires_on'), 'n_unplaced': int(h.get('n_unplaced') or 0)})
+    except Exception as e:
+      placed.append({'line': r.get('line') or r['order'], 'days': r['stall_days'],
+                     'error': str(e)[:200]})
+  return placed
 
 
 # =============================================================================
@@ -553,6 +664,13 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         chosen.append(r)
     for i, r in enumerate(askable, start=1):
       r['rank'] = i
+    # 096: stalled lines are ALWAYS asked (one each), on top of max_q
+    stalled = _stall_scan(cursor, plan_date, rows, rp)
+    for r in stalled:
+      if r not in chosen:
+        chosen.append(r)
+      if r.get('rank') is None:
+        r['rank'] = 0
     for r in chosen:
       r['asked'] = True
       r['asked_to'] = _owners(r['routed_to'], rp)
@@ -595,6 +713,9 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
             r['case'], r['tier'], round(r['load'], 2), r.get('rank'), r['removed_by_role'],
             ('Probable' if r['resolution'] == 'EXPLAINED' else None)))
       n_ins += 1
+
+    # --- 096: the stalled lines leave the plan (holds) -----------------
+    stall_holds = _place_stall_holds(cursor, plan_date, stalled, rp)
 
     # --- header ---------------------------------------------------------
     n_planned = len([s for s in planned if (s['tier'] or 'Next') != 'Stretch'])
@@ -675,6 +796,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       'unplanned_inches': round(unplanned_in, 1), 'reserve_inches': reserve_in,
       'reserve_used_pct': reserve_used,
       'n_questions': len(chosen), 'n_askable': len(askable), 'rows_written': n_ins,
+      'n_stalled': len(stall_holds), 'stalled': stall_holds,          # 096
       'questions': [{'order': r['order'], 'sku': r['sku'], 'item': r.get('item'),
                      'line': r.get('line'), 'case': r['case'],
                      'to': r['routed_to'], 'owners': r['asked_to'], 'rank': r['rank'],

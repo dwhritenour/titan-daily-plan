@@ -238,8 +238,9 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     if len(lines) == 2 and not item.get('flags'):
       lines.append(self._line('No flags on this line.'))
     # 071: a material hold (X05) can be released by PC right here
+    # 096: a stalled hold (X07) the same way
     on_release = item.get('on_release_hold')
-    held = any(f['code'] == 'X05' for f in (item.get('flags') or []))
+    held = any(f['code'] in ('X05', 'X07') for f in (item.get('flags') or []))
     if held and on_release:
       panel = ColumnPanel(spacing_above='none', spacing_below='none')
       for l in lines:
