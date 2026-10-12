@@ -64,7 +64,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.6.1'   # 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.6.2'   # 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 
@@ -1091,6 +1091,13 @@ def retro_confirm(variance_id, reading, evidence_class, cause_key,
     hold = None
     if cause_key in _hold_cause_keys(cursor) and resolution in ('EXPLAINED', 'EXCEPTION', 'RULE_CANDIDATE'):
       hold = _place_material_hold(cursor, int(variance_id), reading)
+    else:
+      # 100 (decision 3): the agent may already have placed a hold from the
+      # PC answer (placed_by 'agent (PC answer)'). Dave reading it as
+      # anything else is the undo - release it, note why.
+      released = _release_agent_hold(cursor, int(variance_id), cause_key, resolution)
+      if released:
+        hold = {'released': True, 'line': released}
     conn.commit()
     return {'status': 'success', 'warning': warn, 'hold': hold}
   except Exception as e:
@@ -1098,6 +1105,29 @@ def retro_confirm(variance_id, reading, evidence_class, cause_key,
     return {'status': 'error', 'message': f'{e}'}
   finally:
     conn.close()
+
+
+def _release_agent_hold(cursor, variance_id, cause_key, resolution):
+  """100: release a live MATERIAL hold the agent placed from this variance's
+  answer when Dave's reading is not a hold cause. Returns the line label
+  or None. Holds Dave placed himself (071) are never touched here."""
+  cursor.execute("""
+      SELECT TOP 1 h.nx_order_numb, h.nx_rel_numb, h.nx_item_no, h.nx_sku
+      FROM dbo.pc_plan_line_hold h
+      WHERE h.source_variance_id = %s AND h.hold_kind = 'MATERIAL'
+        AND h.placed_by = 'agent (PC answer)' AND h.released_at IS NULL
+  """, (variance_id,))
+  h = cursor.fetchone()
+  if not h:
+    return None
+  cursor.execute("""
+      EXEC dbo.sp_pc_release_line_hold @order = %s, @rel = %s, @item = %s,
+           @released_by = %s, @note = %s
+  """, (h['nx_order_numb'], h['nx_rel_numb'], h['nx_item_no'], 'Dave (review)',
+        f"read as {cause_key} / {resolution} - agent hold undone"[:200]))
+  cursor.fetchone()
+  return _line_txt({'nx_order_numb': h['nx_order_numb'], 'nx_rel_numb': h['nx_rel_numb'],
+                    'nx_item_no': h['nx_item_no'], 'nx_sku': h['nx_sku']})
 
 
 def _hold_cause_keys(cursor):

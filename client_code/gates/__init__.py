@@ -74,7 +74,7 @@ What stays in PC's hands: the same override the "due in" gate has. PC can still 
 
 What it does not fix: stock that is on the shelf but already promised to another order. That gate applies to valves only today (decision 4 below).
 
-### Recommendation 2: stop re-proposing lines that are stuck — *decided yes 10/10, in place 10/12 (first part)*
+### Recommendation 2: stop re-proposing lines that are stuck — *decided yes 10/10, both parts in place 10/12*
 
 Two changes that work together.
 
@@ -86,18 +86,20 @@ Together with Recommendation 1, this takes most of the repeat list out of the mo
 
 ### For the room to decide
 
-1. **Short stock becomes a gate** (yes / no). If yes: gate when the shelf count is below the line's quantity, or only when it is below some share of it?
-   *Recommendation: yes, and gate whenever the shelf count is below the line's quantity. No percentage; a partial is a deliberate PC override, not a rule.*
-2. **A line untouched three plan days in a row leaves the plan** until PC answers with a date (yes / no; three days, or a different number?)
-   *Recommendation: yes, three days. Two is too twitchy for a Monday; five is a week of asking the same question.*
-3. **A material answer places the hold immediately**, with Dave reviewing after the fact (yes / no)
-   *Recommendation: yes. The hold is reversible and the review page stays; waiting on the confirm step is what let the same lines come back for a week.*
-4. **Should "stock promised to another order" apply to strainers too**, or stay valves only?
-   *Recommendation: no, valves only. e21 commits every open order's quantity on strainers, so the test would have gated about 493 lines that had stock on the shelf (9/25 count). On-hand is the right number for strainers; the short-stock gate covers the real shortage.*
-5. **When a gated line is added on purpose for a partial**, should the plan carry the quantity PC intends to ship, so Sales can tell the customer?
-   *Recommendation: yes. The plan already carries a planned quantity for big lines that are split across days; the override add uses the same field.*
+Struck through = decided and in place.
+
+1. ~~**Short stock becomes a gate** (yes / no). If yes: gate when the shelf count is below the line's quantity, or only when it is below some share of it?~~
+   *Decided yes, 10/10. In place 10/12: the shelf count below the line's quantity gates (X08), no percentage; PC overrides from the flag popup with a quantity.*
+2. ~~**A line untouched three plan days in a row leaves the plan** until PC answers with a date (yes / no; three days, or a different number?)~~
+   *Decided yes, three days, 10/10. In place 10/12: the retro places the hold, one question per order, the answer's date brings it back.*
+3. ~~**A material answer places the hold immediately**, with Dave reviewing after the fact (yes / no)~~
+   *Decided yes, 10/10. In place 10/12: a material answer read as Probable or better places the hold at once; Dave's review can undo it.*
+4. ~~**Should "stock promised to another order" apply to strainers too**, or stay valves only?~~
+   *Decided no, 10/10: valves only. On-hand is the right number for strainers; the short-stock gate covers the real shortage.*
+5. ~~**When a gated line is added on purpose for a partial**, should the plan carry the quantity PC intends to ship, so Sales can tell the customer?~~
+   *Decided yes, 10/10. In place 10/12 with the short-stock override: the plan carries the quantity ("SPLIT 20 of 89 - PARTIAL").*
 6. **610126 / YS58UDG0200**: why has a two-inch expedited line with stock sat for thirteen days?
-   *Recommendation: ask Tara and Kim in the room; no rule change until we know.*
+   *Recommendation: ask Tara and Kim; no rule change until we know.*
 7. **Two orders, one shelf** (new): two Must lines for the same item on the same day, where the shelf covers either but not both. Today both are proposed and one sits.
    *Recommendation: yes, add it. The proposal keeps a running count per item and stops at on-hand, marking the second line "short, stock planned on order N". That gives strainers the allocation decision by priority instead of by e21's commit order.*
 
