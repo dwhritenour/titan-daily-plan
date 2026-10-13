@@ -2230,7 +2230,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.4'   # v1.4: shelf decisions ride at zero (Production, 10-12); v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.4.1' # v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2627,7 +2627,10 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
   Deterministic: ungated candidates within the horizon, in priority order
   (score, oldest ship-by, biggest load); fill Must/Next up to
   AGENT_FILL_PCT of capacity ON TOP of whatever PC already planned; then
-  AGENT_STRETCH_LINES more as Stretch (outside the cap by definition).
+  up to AGENT_STRETCH_LINES more groups as Stretch - v1.4.1 (2026-10-13):
+  the Stretch tier as a WHOLE must fit the buffer the fill left (each
+  group used to be tested alone, so five groups of 200-400 in rode on a
+  496 in buffer - '+1,385 if time' on 10-13).
   Tier rule: Must = late (A01) or due today/tomorrow (A02); else Next.
   Re-running supersedes the earlier proposal and clears ONLY its
   still-Proposed lines — anything PC confirmed stays and counts.
@@ -2988,13 +2991,15 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
       else:
         deferred.append(members)
     slack = cap_in - used
-    stretch, n_stretch_groups = [], 0
+    stretch, n_stretch_groups, stretch_in = [], 0, 0.0
     for members in deferred:
       if n_stretch_groups >= ap['stretch_lines']:
         break
-      if float(members[0].get('group_inches') or 0) <= slack + 1e-9:
+      g = float(members[0].get('group_inches') or 0)
+      if g <= slack - stretch_in + 1e-9:      # v1.4.1: the tier fits the buffer TOGETHER
         stretch.extend((m, 'Stretch') for m in members)
         n_stretch_groups += 1
+        stretch_in += g
     skipped = sum(len(g) for g in deferred) - len(stretch)
     oversize = split_needed          # name kept for the response below
 
@@ -3119,6 +3124,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
             'already_planned_inches': round(already_in, 1),
             'proposed_inches': round(used, 1),
             'n_proposed': len(picks), 'n_stretch': len(stretch),
+            'stretch_inches': round(stretch_in, 1),                    # v1.4.1
             'n_added_to_plan': n_added, 'n_cleared': n_cleared,
             'n_gated': len(gated), 'n_skipped': skipped,
             'n_oversize': len(oversize), 'n_split_needed': len(oversize),
