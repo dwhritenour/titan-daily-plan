@@ -816,7 +816,33 @@ class ship_plan(ship_planTemplate):
     """Whole sales order onto the day — every open SKU, ONE server
     transaction, one cap dialog for the lot (not one per line)."""
     order = item['nx_order_numb']
-    result = anvil.server.call('ship_plan_add_order', self.plan_date, order)
+    # 2026-10-13 (Dave): +SO adds every line as before, but PC sees what it
+    # walks past first - gated lines (with the gate wording) and any SKU
+    # the order over-commits on the shelf - and says 'Add anyway' once.
+    pv = anvil.server.call('ship_plan_add_order_preview', self.plan_date, order)
+    ack = False
+    if pv.get('status') == 'success' and (pv.get('gated') or pv.get('shelf')):
+      panel = ColumnPanel(spacing_above='none', spacing_below='none')
+      panel.add_component(Label(text=f"Adding all {pv.get('n_lines', 0)} open line(s) of {order}. "
+                                "The plan would normally keep these off:",
+                                font_size=14, bold=True, spacing_below='small'))
+      for g in pv.get('gated') or []:
+        panel.add_component(Label(text=f"⛔ {g['line']}  ({g['gates']}): {g['note']}",
+                                  font_size=13, spacing_above='none', spacing_below='none'))
+      for s in pv.get('shelf') or []:
+        extra = f" ({s['planned_today']:g} already planned today)" if s.get('planned_today') else ''
+        panel.add_component(Label(text=f"⚖ {s['sku']}: this order needs {s['needed']:g} on "
+                                  f"{s['n_lines']} line(s), {s['on_hand']:g} on hand{extra} "
+                                  "- some of it cannot be built today.",
+                                  font_size=13, spacing_above='none', spacing_below='none'))
+      panel.add_component(Label(text='Add anyway? The lines go on at full quantity with the override '
+                                'noted on the board; use the star to set a quantity after.',
+                                font_size=13, spacing_above='small'))
+      if not alert(content=panel, title=f'+SO {order}: gates in the way',
+                   buttons=[('Add anyway', True), ('Cancel', False)], large=True):
+        return
+      ack = True
+    result = anvil.server.call('ship_plan_add_order', self.plan_date, order, acknowledged=ack)
     if result.get('status') != 'success':
       alert(result.get('message', 'Add order failed'))
       return

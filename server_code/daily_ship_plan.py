@@ -1286,9 +1286,99 @@ def ship_plan_set_order_priority(plan_date, order, tier=None, reason=None,
     conn.close()
 
 
+def _order_lines_for_add(cursor, order, due_date=None):
+  """The open e21 lines +SO would add (066: rel, item)."""
+  if due_date:
+    cursor.execute("""
+        SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.vw_pc_ship_candidate_rows
+        WHERE nx_order_numb = %s AND CAST(nx_dship_by_date AS DATE) = %s
+        ORDER BY nx_rel_numb, nx_item_no
+    """, (order, _parse_date(due_date)))
+  else:
+    cursor.execute("""
+        SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.vw_pc_ship_candidate_rows
+        WHERE nx_order_numb = %s ORDER BY nx_rel_numb, nx_item_no
+    """, (order,))
+  return [(r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']) for r in cursor.fetchall()]
+
+
+def _order_add_checks(cursor, plan_date, order, items):
+  """2026-10-13: what +SO is about to walk past. Gated lines (with the gate
+  wording) and SKUs the order over-commits on the shelf, counting what is
+  already on this day. Informational - the add goes ahead on PC's say-so."""
+  gated, by_sku = [], {}
+  for rel, item, sku in items:
+    cursor.execute("""
+        SELECT fs.gate_codes, c.nx_qty_ordered
+        FROM dbo.vw_pc_ship_candidate_rows c
+        LEFT JOIN dbo.vw_pc_order_flag_scores fs
+               ON fs.nx_order_numb = c.nx_order_numb AND fs.nx_rel_numb = c.nx_rel_numb
+              AND fs.nx_item_no = c.nx_item_no AND fs.is_gated = 1
+        WHERE c.nx_order_numb = %s AND c.nx_rel_numb = %s AND c.nx_item_no = %s
+    """, (order, rel, item))
+    r = cursor.fetchone() or {}
+    qty = float(r.get('nx_qty_ordered') or 0)
+    key = (sku or '').strip()
+    if key:
+      by_sku.setdefault(key, {'sku': key, 'needed': 0.0, 'n_lines': 0})
+      by_sku[key]['needed'] += qty
+      by_sku[key]['n_lines'] += 1
+    if r.get('gate_codes'):
+      cursor.execute("""
+          SELECT flag_code, note FROM dbo.vw_pc_order_flags
+          WHERE nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s AND flag_code LIKE 'X%%'
+          ORDER BY flag_code
+      """, (order, rel, item))
+      notes = cursor.fetchall()
+      gated.append({'rel': rel, 'item': item, 'sku': sku,
+                    'line': _line_label(order, rel, item, sku),
+                    'gates': r['gate_codes'],
+                    'note': '; '.join((n['note'] or '') for n in notes)[:300]})
+  shelf = []
+  for key, s in by_sku.items():
+    cursor.execute("""
+        SELECT i.on_hand, LTRIM(RTRIM(ISNULL(d.nx_item_type, ''))) AS item_type
+        FROM dbo.sales_orders_due d
+        LEFT JOIN dbo.inventory_current i ON i.sku = d.nx_sku AND i.cost_center = 'Starlite'
+        WHERE d.nx_order_numb = %s AND LTRIM(RTRIM(d.nx_sku)) = %s
+    """, (order, key))
+    inv = cursor.fetchone() or {}
+    if inv.get('on_hand') is None or inv.get('item_type') == 'N':
+      continue
+    cursor.execute("""
+        SELECT COALESCE(SUM(qty_planned), 0) AS q FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND LTRIM(RTRIM(nx_sku)) = %s AND nx_order_numb <> %s
+          AND line_status IN %s
+    """, (plan_date, key, order, _COUNTS_AGAINST_CAP))
+    planned = float((cursor.fetchone() or {}).get('q') or 0)
+    on_hand = float(inv['on_hand'] or 0)
+    if s['needed'] + planned > on_hand + 1e-9:
+      shelf.append({'sku': key, 'needed': s['needed'], 'n_lines': s['n_lines'],
+                    'on_hand': on_hand, 'planned_today': planned})
+  return gated, shelf
+
+
+@anvil.server.callable
+def ship_plan_add_order_preview(plan_date, order, due_date=None):
+  """What +SO is about to do (2026-10-13): the lines, the gated ones with
+  their gate wording, and any SKU the order over-commits on the shelf.
+  The client shows ONE confirm when either list is non-empty."""
+  plan_date = _parse_date(plan_date)
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    items = _order_lines_for_add(cursor, order, due_date)
+    gated, shelf = _order_add_checks(cursor, plan_date, order, items)
+    return {'status': 'success', 'n_lines': len(items), 'gated': gated, 'shelf': shelf}
+  except Exception as e:
+    return {'status': 'error', 'message': f'Preview failed: {e}'}
+  finally:
+    conn.close()
+
+
 @anvil.server.callable
 def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
-                        due_date=None):
+                        due_date=None, acknowledged=False):
   """Add EVERY open e21 line of a sales order to the day — one transaction.
   Per-line Added events plus one OrderAdded summary; a single cap check
   at the end (the client runs one dialog for the whole order, not one
@@ -1303,26 +1393,20 @@ def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
   conn = get_connection()
   try:
     cursor = conn.cursor()
-    if due_date:
-      cursor.execute("""
-          SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.vw_pc_ship_candidate_rows
-          WHERE nx_order_numb = %s
-            AND CAST(nx_dship_by_date AS DATE) = %s
-          ORDER BY nx_rel_numb, nx_item_no
-      """, (order, _parse_date(due_date)))
-    else:
-      cursor.execute("""
-          SELECT nx_rel_numb, nx_item_no, nx_sku FROM dbo.vw_pc_ship_candidate_rows
-          WHERE nx_order_numb = %s
-          ORDER BY nx_rel_numb, nx_item_no
-      """, (order,))
-    items = [(r['nx_rel_numb'], r['nx_item_no'], r['nx_sku']) for r in cursor.fetchall()]
+    items = _order_lines_for_add(cursor, order, due_date)
     if not items:
       return {'status': 'error',
               'message': f'{order} has no open quantity in the feed '
               '(shipped, or already planned on another day).'}
 
     _ensure_header(cursor, plan_date, actor)
+    # 2026-10-13: +SO still adds every line (PC's decision) - but a gated
+    # line and an over-committed shelf are RECORDED on the line and in the
+    # events, like a single-line 'Add anyway', so the retro knows it was
+    # deliberate (611796-001-10 X08 came in silently at 08:45 today).
+    gated_now, shelf_now = _order_add_checks(cursor, plan_date, order, items)
+    gated_by_key = {(g['rel'], g['item']): g for g in gated_now}
+    shelf_by_sku = {s['sku']: s for s in shelf_now}
     added, skipped, order_inches = [], [], 0.0
     for rel, item, sku in items:
       label = _line_label(order, rel, item, sku)
@@ -1353,6 +1437,30 @@ def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
                  actor=actor, note='whole order', rel=rel, item=item)
       added.append(label)
       order_inches += agg['inches']
+      # the override / shelf record (board note <= 200, event note <= 500)
+      g = gated_by_key.get((rel, item))
+      s = shelf_by_sku.get((agg['sku'] or '').strip())
+      bits = []
+      if g:
+        gset = set((g['gates'] or '').split(','))
+        kind = 'PARTIAL' if (gset == {'X08'}) else ('PRE-BUILD' if gset == {'X06'} else 'OVERRIDE')
+        bits.append(f"{kind} (gate {(g['gates'] or '').replace(',', ' ')} overridden via +SO)")
+        _log_event(cursor, plan_date, order, agg['sku'], 'GateOverride',
+                   new_value=g['gates'], actor=actor,
+                   note=('added with the whole order (+SO)'
+                         + ('; PC acknowledged the gates' if acknowledged else '')
+                         + ': ' + (g['note'] or ''))[:500], rel=rel, item=item)
+      if s:
+        bits.append(f"SHELF: order needs {s['needed']:g} of {s['sku']} on {s['n_lines']} lines, "
+                    f"{s['on_hand']:g} on hand"
+                    + (f" ({s['planned_today']:g} already planned today)" if s['planned_today'] else '')
+                    + " (+SO)")
+      if bits:
+        cursor.execute("""
+            UPDATE dbo.pc_ship_plan_line
+            SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+        """, (' - '.join(bits)[:200], actor, plan_date, order, rel, item))
 
     if not added:
       conn.rollback()
@@ -1376,7 +1484,8 @@ def ship_plan_add_order(plan_date, order, tier='Next', reason=None,
             'planned_inches': round(planned, 1),
             'capacity_inches': round(cap, 1), 'over_capacity': over,
             'line_inches': round(order_inches, 1),
-            'suggested_day': suggested}
+            'suggested_day': suggested,
+            'n_gated': len(gated_now), 'n_shelf': len(shelf_now)}
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Add order failed: {e}'}
