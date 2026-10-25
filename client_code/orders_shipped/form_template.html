@@ -18,7 +18,7 @@
     </anvil-component>
     <!-- Order lines e21 reports shipped, one row per line, with running work-inch total -->
     <anvil-component type="DataGrid" name="dg_done" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="200" prop:show_page_controls="true" prop:columns='[{"id":"time","title":"Time","data_key":"","width":"70"},{"id":"line","title":"Order-Rel-Item","data_key":"","width":"150"},{"id":"item","title":"Item","data_key":""},{"id":"status","title":"e21 status","data_key":"","width":"140"},{"id":"plan","title":"Plan","data_key":"","width":"110"},{"id":"load","title":"Load","data_key":"","width":"90"},{"id":"running","title":"Running","data_key":"","width":"90"}]' container:grid_position="WCDGRW,WCDGCL" container:full_width_row="false">
-      <anvil-component type="RepeatingPanel" name="rp_rows" prop:item_template="Titan_Daily_Plan.wo_completed.WoCompletedRow"></anvil-component>
+      <anvil-component type="RepeatingPanel" name="rp_rows" prop:item_template="Titan_Daily_Plan_v1_0.wo_completed.WoCompletedRow"></anvil-component>
     </anvil-component>
     <anvil-component type="Label" name="lbl_footer" prop:text="On plan 87 in · unplanned 1,361 in · 4 zero-touch (Z, not totalled) · 21 with no load estimate" prop:font_size="13" prop:foreground="#595959" prop:spacing='{"margin":["5",null,"5",null],"padding":["0",null,"0",null]}' container:grid_position="WCFTRW,WCFTCL" container:full_width_row="false"></anvil-component>
   </anvil-component>

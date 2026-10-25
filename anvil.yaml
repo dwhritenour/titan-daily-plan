@@ -1,7 +1,7 @@
 allow_embedding: false
 dependencies: []
-name: Titan Daily Plan
-package_name: Titan_Daily_Plan
+name: Titan Daily Plan v1.0
+package_name: Titan_Daily_Plan_v1_0
 renamed: true
 runtime_options:
   client_version: '3'

@@ -16,11 +16,11 @@
     </anvil-component>
     <!-- Summary line -->
     <!-- One card per answered question awaiting review -->
-    <anvil-component type="RepeatingPanel" name="rp_queue" prop:item_template="Titan_Daily_Plan.retro_review.RetroReviewRow" prop:spacing='{"margin":["0",null,"5",null]}' container:grid_position="RPQROW,RPQCOL" container:full_width_row="false"></anvil-component>
+    <anvil-component type="RepeatingPanel" name="rp_queue" prop:item_template="Titan_Daily_Plan_v1_0.retro_review.RetroReviewRow" prop:spacing='{"margin":["0",null,"5",null]}' container:grid_position="RPQROW,RPQCOL" container:full_width_row="false"></anvil-component>
     <!-- Rule candidates: the Monday scan's PROPOSED rows, decided here -->
     <anvil-component type="ColumnPanel" name="cp_rules" prop:role="outlined-card" container:grid_position="RULECD,RULEC1">
       <anvil-component type="Label" name="lbl_rules_title" prop:text="Rule candidates" prop:bold="true" prop:font_size="13" prop:spacing='{"margin":["10",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RULETL,RULEC2" container:full_width_row="true"></anvil-component>
-      <anvil-component type="RepeatingPanel" name="rp_rules" prop:item_template="Titan_Daily_Plan.retro_review.RuleCandidateRow" prop:spacing='{"margin":["3",null,"10",null]}' container:grid_position="RULERP,RULEC3" container:full_width_row="false"></anvil-component>
+      <anvil-component type="RepeatingPanel" name="rp_rules" prop:item_template="Titan_Daily_Plan_v1_0.retro_review.RuleCandidateRow" prop:spacing='{"margin":["3",null,"10",null]}' container:grid_position="RULERP,RULEC3" container:full_width_row="false"></anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_days" prop:role="outlined-card" container:grid_position="QLQNJI,ULZGIV">
       <anvil-component type="Label" name="lbl_days_head" prop:text="Days" prop:bold="true" prop:font_size="13" prop:spacing='{"margin":["10",null,"0",null],"padding":["0",null,"0",null]}' container:grid_position="RVWIUU,HDVXMI"></anvil-component>
