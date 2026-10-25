@@ -3,3 +3,6 @@
 __pycache__
 .anvil-data
 /.anvil/
+
+# Cowork -> editor-agent handoff specs are working notes, never deployed
+SPEC.md

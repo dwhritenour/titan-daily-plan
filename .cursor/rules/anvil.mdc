@@ -1,0 +1,9 @@
+---
+description: Anvil app workflow + house build rules for Titan Daily Plan v1.0 (Titan Flow Control) - the rules live in AGENTS.md
+alwaysApply: true
+---
+
+The house rules for this repository live in `AGENTS.md` at the repo root (single source,
+shared with VS Code agents). Read it in full before any work and follow it exactly.
+
+@AGENTS.md
