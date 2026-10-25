@@ -2340,7 +2340,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.5' # v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.5.1' # v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2556,6 +2556,52 @@ def _md_assemblers(cursor, orders):
   return {o: '+'.join(sorted(v)) for o, v in out.items()}
 
 
+def _md_tablet_facts(cursor, orders, days_back=30):
+  """v1.5.1: the Assembly tablet per e21 line of the given orders, from the
+  floor taps of the last days_back days (Assign is the board, not the floor):
+  {(order, rel, item): {'state': running | paused | done | None,
+                        'count_total': pieces from Count taps (note 'pieces=N',
+                        migration 118), 'done_at', 'first_start', 'last_tap'}}."""
+  orders = [o for o in set(orders or []) if o]
+  if not orders:
+    return {}
+  cursor.execute("""
+      SELECT wo.sales_order_number AS o, wo.sales_order_rel AS rel,
+             CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+             e.event_type, e.event_at, e.note
+      FROM dbo.work_order_events e
+      JOIN dbo.work_orders wo ON wo.work_order_id = e.work_order_id
+      WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
+        AND e.event_type IN ('Start', 'Restart', 'Stop', 'Complete', 'Reopen', 'Count')
+        AND e.event_at >= DATEADD(day, -%s, CAST(GETDATE() AS DATE))
+      ORDER BY e.event_at, e.event_id
+  """, (tuple(orders), int(days_back)))
+  out = {}
+  for e in cursor.fetchall():
+    k = (e['o'], e['rel'] or '', str(e['item'] or ''))
+    t = out.setdefault(k, {'state': None, 'count_total': 0, 'done_at': None,
+                           'first_start': None, 'last_tap': None})
+    at = e['event_at']
+    d = at.date() if isinstance(at, datetime) else at
+    t['last_tap'] = d
+    typ = e['event_type']
+    if typ in ('Start', 'Restart', 'Reopen'):
+      t['state'] = 'running'
+      t['first_start'] = t['first_start'] or d
+    elif typ == 'Stop':
+      t['state'] = 'paused'
+    elif typ == 'Complete':
+      t['state'] = 'done'
+      t['done_at'] = at
+    elif typ == 'Count':
+      mm = re.search(r'pieces\s*=\s*(\d+)', e['note'] or '', re.I) or re.match(r'\s*(\d+)\s*$', e['note'] or '')
+      if mm:
+        t['count_total'] += int(mm.group(1))
+        if t['state'] is None:
+          t['state'] = 'running'
+  return out
+
+
 def _md_note(c, ship_complete):
   """Board note for a day-sized share. MUST start 'SPLIT n of N · day d of
   about k' (the prior-share query, _system_prefix, set_qty and recalc read
@@ -2571,6 +2617,12 @@ def _md_note(c, ship_complete):
 
 
 def _md_done_note(c):
+  t = c.get('md_tablet') or {}
+  if c.get('md_done_fact'):
+    when = t.get('done_at')
+    return (f"{_MD_DONE_PREFIX}built - tablet Complete"
+            + (f" {when:%m/%d %H:%M}" if when else '')
+            + " · rides at 0 in until the order ships")[:200]
   days = sorted(c.get('md_days') or [])
   span = (f"{str(days[0])[:10]}" + (f" to {str(days[-1])[:10]}" if len(days) > 1 else '')) if days else 'earlier'
   return (f"{_MD_DONE_PREFIX}{float(c['md_full']):g} planned over {len(days) or 1} day(s) ({span}), "
@@ -3083,12 +3135,19 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
     md_pool = target * ap['multiday_share_pct']
     md_used, md_taker, md_out, md_waiting = 0.0, None, [], []
     md_prior = _md_prior_shares(cursor, plan_date) if md_pool > 0 else {}
-    if md_prior:
-      group_order.sort(key=lambda gk: 0 if any(_mdkey(m) in md_prior for m in groups[gk]) else 1)
-    md_asm = _md_assemblers(cursor, [gk[0] for gk in group_order
-                                     if any(_mdkey(m) in md_prior for m in groups[gk])
-                                     or sum(float(m.get('load_inches') or 0) for m in groups[gk]) > max_line]
-                            ) if md_pool > 0 else {}
+    md_orders = [gk[0] for gk in group_order
+                 if any(_mdkey(m) in md_prior for m in groups[gk])
+                 or sum(float(m.get('load_inches') or 0) for m in groups[gk]) > max_line]
+    # v1.5.1: the tablet is the fact - Complete = built, an open Start =
+    # started, Count taps = pieces done; the prior-share estimate fills in
+    # where the tablet is silent.
+    md_tab = _md_tablet_facts(cursor, md_orders) if md_pool > 0 else {}
+    def _md_started(gk):
+      return any(_mdkey(m) in md_prior or (md_tab.get(_mdkey(m)) or {}).get('state') in ('running', 'paused', 'done')
+                 for m in groups[gk])
+    if md_prior or md_tab:
+      group_order.sort(key=lambda gk: 0 if _md_started(gk) else 1)
+    md_asm = _md_assemblers(cursor, md_orders) if md_pool > 0 else {}
 
     picks, deferred, gated, split_needed, blocked = [], [], [], [], []
     short_lines = []
@@ -3234,7 +3293,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
       # rides at ZERO load (visible, so the retro sees it the day the order
       # ships). Stretch never applies to a multi-day order (paper s10). The
       # board note starts 'SPLIT n of N · day d of about k' - machine-read.
-      started = any(_mdkey(m) in md_prior for m in members)
+      started = any(_mdkey(m) in md_prior for m in members) or (md_pool > 0 and _md_started(k))
       if md_pool > 0 and (started or load > cap_in + 1e-9 or load > max_line + 1e-9):
         gdays = set()
         for m in members:
@@ -3266,9 +3325,16 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
             continue                          # zero-touch sibling: rides as today
           per_piece = li / need
           m['md_per_piece'] = per_piece
-          remaining = max(0.0, need - m['md_prior'])
-          if remaining < 1:
-            m['md_done'] = True               # shares cover it: visible at 0 in
+          t = md_tab.get(_mdkey(m)) or {}
+          m['md_tablet'] = t
+          if t.get('count_total'):
+            remaining = max(0.0, need - float(t['count_total']))   # the count is the fact
+            m['md_prior'] = float(t['count_total'])
+          else:
+            remaining = max(0.0, need - m['md_prior'])
+          if t.get('state') == 'done' or remaining < 1:
+            m['md_done'] = True               # built (tablet) or shares cover it: visible at 0 in
+            m['md_done_fact'] = (t.get('state') == 'done')
             m['load_inches'] = 0.0
             continue
           work.append((m, remaining, per_piece))

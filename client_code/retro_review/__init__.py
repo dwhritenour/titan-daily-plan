@@ -28,7 +28,10 @@ class retro_review(retro_reviewTemplate):
                'REMOVED_WITH_REASON': 'removed with reason',
                'UNPLANNED_SHIP': 'shipped, not on the plan',
                'DATE_MOVED': 'ship-by moved', 'SHIPPED': 'shipped',
-               'WORKED': 'worked', 'UNTOUCHED_STRETCH': 'stretch, not reached'}
+               'WORKED': 'worked', 'UNTOUCHED_STRETCH': 'stretch, not reached',
+               'FINISHED': 'multi-day: finished', 'ON_TRACK': 'multi-day: on track',
+               'SLOW': 'multi-day: slow', 'PAUSED': 'multi-day: paused',
+               'STOPPED': 'multi-day: stopped'}
 
   def __init__(self, **properties):
     self.init_components(**properties)

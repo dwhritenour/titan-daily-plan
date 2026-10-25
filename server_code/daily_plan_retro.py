@@ -58,14 +58,34 @@ Project: Titan Flow Control - Year of Automation
 
 import anvil.server
 import anvil.secrets
+import re
 from datetime import datetime, date, timedelta
 
 from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.6.2'   # 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.7'   # 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
+
+# retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
+# line whose board note starts 'SPLIT n of N · day d of about k' (a day-sized
+# share, agent v1.5) or 'MULTI-DAY:' (a share planned on an earlier day) is
+# read from the Assembly tablet (dbo.work_order_events) instead of the
+# shipped / worked / untouched trio:
+#   FINISHED  Complete tapped (since the plan was published, or earlier)
+#   ON_TRACK  a Count today at or above half the share, or any floor tap today
+#             with no count recorded
+#   SLOW      a Count today under half the share (a question when it repeats)
+#   PAUSED    the last tap is Stop (no Restart) - no question
+#   STOPPED   started on the tablet, no tap today; stalls after
+#             MULTIDAY_STALL_DAYS published plan days without a tap (2)
+# A share line the tablet never started stays UNTOUCHED (the 3-day stall rule).
+# The Count tap is event_type 'Count', note 'pieces=<n>' (migration 118, the
+# tablet app writes it); until it exists ON_TRACK means 'tapped today'.
+_MD_SHARE_LIKE = 'SPLIT % of % · day %'
+_MD_BUILT_LIKE = 'MULTI-DAY: %'
+_MD_FLOOR_TAPS = ('Start', 'Restart', 'Stop', 'Complete', 'Count')   # Assign is the board, not the floor
 
 
 # =============================================================================
@@ -120,6 +140,9 @@ def _retro_params(cursor):
           # dated answer (business days).
           'stall_days': max(0, _i('STALL_DAYS', 3)),
           'stall_hold_days': max(1, _i('STALL_HOLD_DAYS', 5)),
+          # retro-1.7 (decision 4): a STARTED multi-day line stalls this many
+          # published plan days after its last floor tap (0 = off).
+          'md_stall_days': max(0, _i('MULTIDAY_STALL_DAYS', 2)),
           'pc_owners': _names('RETRO_PC_OWNERS'),
           'sales_owners': _names('RETRO_SALES_OWNERS'),
           'fill_pct': max(0.0, min(float(p.get('AGENT_FILL_PCT', 80) or 80), 100.0)) / 100.0}
@@ -156,6 +179,127 @@ def _owners(role, rp):
 # =============================================================================
 # 096 - the stall rule (decision 2, 2026-10-12)
 # =============================================================================
+
+def _md_plan_lines(cursor, plan_date):
+  """retro-1.7: the day's multi-day lines from their board notes.
+  {(order, rel, item): {'share': qty_planned, 'day': d, 'about': k,
+                        'built': True when the note is 'MULTI-DAY:' (0 in)}}"""
+  cursor.execute("""
+      SELECT nx_order_numb, nx_rel_numb, nx_item_no, qty_planned, priority_note
+      FROM dbo.pc_ship_plan_line
+      WHERE plan_date = %s AND line_status IN ('Planned', 'Proposed', 'Confirmed')
+        AND (priority_note LIKE %s OR priority_note LIKE %s)
+  """, (plan_date, _MD_SHARE_LIKE, _MD_BUILT_LIKE))
+  out = {}
+  for r in cursor.fetchall():
+    note = r['priority_note'] or ''
+    m = re.search(r' · day (\d+) of about (\d+)', note)
+    out[(r['nx_order_numb'], r['nx_rel_numb'] or '', str(r['nx_item_no'] or ''))] = {
+      'share': float(r['qty_planned'] or 0),
+      'day': int(m.group(1)) if m else None, 'about': int(m.group(2)) if m else None,
+      'built': note.startswith('MULTI-DAY:')}
+  return out
+
+
+def _md_count(note):
+  """pieces from a Count tap's note ('pieces=120'; a bare number also counts)."""
+  m = re.search(r'pieces\s*=\s*(\d+)', note or '', re.I) or re.match(r'\s*(\d+)\s*$', note or '')
+  return int(m.group(1)) if m else None
+
+
+def _md_tablet(cursor, plan_date, days_back=30):
+  """retro-1.7: what the Assembly tablet says per e21 line, from the floor
+  taps of the last `days_back` days up to the end of plan_date:
+  {(order, rel, item): {'state': running | paused | done | None,
+                        'last_tap': date or None, 'tapped_today': bool,
+                        'done_at': datetime or None,
+                        'count_today': int or None, 'count_total': int,
+                        'first_start': date or None}}.
+  Assign (the Supervisor board) is not a floor tap. Several work orders on
+  one line (rework) fold into one record, newest tap wins the state."""
+  cursor.execute("""
+      SELECT wo.sales_order_number AS o, wo.sales_order_rel AS rel,
+             CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+             e.event_type, e.event_at, e.note
+      FROM dbo.work_order_events e
+      JOIN dbo.work_orders wo ON wo.work_order_id = e.work_order_id
+      WHERE wo.status <> 'Cancelled'
+        AND e.event_type IN %s
+        AND e.event_at >= DATEADD(day, -%s, %s)
+        AND e.event_at < DATEADD(day, 1, %s)
+      ORDER BY e.event_at, e.event_id
+  """, (_MD_FLOOR_TAPS, int(days_back), plan_date, plan_date))
+  out = {}
+  for e in cursor.fetchall():
+    k = (e['o'], e['rel'] or '', e['item'] or '')
+    t = out.setdefault(k, {'state': None, 'last_tap': None, 'tapped_today': False,
+                           'done_at': None, 'count_today': None, 'count_total': 0,
+                           'first_start': None})
+    at = e['event_at']
+    d = at.date() if isinstance(at, datetime) else at
+    typ = e['event_type']
+    t['last_tap'] = d
+    if d == plan_date:
+      t['tapped_today'] = True
+    if typ in ('Start', 'Restart'):
+      t['state'] = 'running'
+      t['first_start'] = t['first_start'] or d
+    elif typ == 'Stop':
+      t['state'] = 'paused'
+    elif typ == 'Complete':
+      t['state'] = 'done'
+      t['done_at'] = at
+    elif typ == 'Count':
+      n = _md_count(e['note'])
+      if n is not None:
+        t['count_total'] += n
+        if d == plan_date:
+          t['count_today'] = (t['count_today'] or 0) + n
+      if t['state'] is None:
+        t['state'] = 'running'          # a count is proof of work even without a Start
+  return out
+
+
+def _md_stall_scan(cursor, plan_date, rows, rp):
+  """retro-1.7 (decision 4): a STOPPED multi-day line - started on the
+  tablet, no floor tap today - stalls when the published plan days since
+  its last tap reach MULTIDAY_STALL_DAYS (2). Same hold as the 3-day rule
+  (STALLED, X07), its own question. Returns the stalled rows."""
+  n = rp.get('md_stall_days') or 0
+  if n <= 0:
+    return []
+  cursor.execute("""
+      SELECT TOP (12) plan_date FROM dbo.pc_plan_retro
+      WHERE plan_date < %s ORDER BY plan_date DESC
+  """, (plan_date,))
+  prior_days = [r['plan_date'] for r in cursor.fetchall()]
+  stalled = []
+  for r in rows:
+    if r.get('case') != 'STOPPED' or not r.get('md_last_tap'):
+      continue
+    last = r['md_last_tap']
+    days = [d for d in [plan_date] + prior_days if d > last]
+    if len(days) < n:
+      continue
+    cursor.execute("""
+        SELECT TOP 1 hold_id FROM dbo.pc_plan_line_hold
+        WHERE nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+          AND released_at IS NULL AND expires_on >= CAST(GETDATE() AS DATE)
+    """, (r['order'], r.get('rel'), r.get('item')))
+    if cursor.fetchone():
+      continue
+    r['stall_days'] = len(days)
+    r['stall_first'] = min(days)
+    r['routed_to'] = 'PC'
+    r['question'] = (f"Multi-day order {r.get('line') or r['order']} (day {r.get('md_day') or '?'} of about "
+                     f"{r.get('md_about') or '?'}) was started on the tablet on {last:%m/%d} and has had "
+                     f"no tap for {len(days)} plan days. It has been taken off the plan. Is it still being "
+                     "built, paused, or blocked - and on what date does it continue? It comes back on that "
+                     "date, or sooner if PC releases the hold.")
+    r['explanation'] = (r.get('explanation') or '') + f"; STALLED - {len(days)} plan days since the last tap"
+    stalled.append(r)
+  return stalled
+
 
 def _stall_streaks(cursor, plan_date, max_days=12):
   """For every line UNTOUCHED on plan_date (in-memory rows, not yet
@@ -388,6 +532,20 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         a['done_since'] = max(a['done_since'], r['done_since'])
         a['touched'] = max(a['touched'], r['touched'])
 
+    # --- retro-1.7: the day's multi-day lines and what the tablet says ----
+    md_lines = _md_plan_lines(cursor, plan_date)
+    tablet = _md_tablet(cursor, plan_date) if md_lines else {}
+    # yesterday's SLOW rows: a second SLOW day earns the question
+    slow_before = set()
+    if md_lines:
+      cursor.execute("""
+          SELECT nx_order_numb, nx_rel_numb, nx_item_no FROM dbo.pc_plan_variance
+          WHERE plan_date = (SELECT MAX(plan_date) FROM dbo.pc_plan_retro WHERE plan_date < %s)
+            AND variance_case = 'SLOW'
+      """, (plan_date,))
+      slow_before = {(r['nx_order_numb'], r['nx_rel_numb'] or '', str(r['nx_item_no'] or ''))
+                     for r in cursor.fetchall()}
+
     # --- what Order Entry changed since publish (v1.2) -----------------
     # dbo.work_order_changes: the EM job diffs every work order against its
     # sales-order line every 15 min. Time-stamped evidence the open book
@@ -440,7 +598,8 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     rows, counts = [], {'SHIPPED': 0, 'WORKED': 0, 'REMOVED_WITH_REASON': 0,
                         'REMOVED_NO_REASON': 0, 'UNTOUCHED': 0,
                         'UNTOUCHED_STRETCH': 0, 'DATE_MOVED': 0, 'UNPLANNED_SHIP': 0,
-                        'CANCELLED': 0, 'QTY_CHANGED': 0, 'PARTIAL_ORDER': 0}
+                        'CANCELLED': 0, 'QTY_CHANGED': 0, 'PARTIAL_ORDER': 0,
+                        'FINISHED': 0, 'ON_TRACK': 0, 'SLOW': 0, 'PAUSED': 0, 'STOPPED': 0}   # retro-1.7
     planned_in = moved_in = 0.0
     n_stretch = 0
     for s in planned:
@@ -522,6 +681,63 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                              f"to {q0['new_value']} at {_hm(q0['detected_at'])} after "
                              f"{_fmt_day(plan_date)}'s plan was published. Customer change, "
                              "or an entry correction?"))
+      elif lkey in md_lines:
+        # retro-1.7: a multi-day share is read from the tablet (paper s13)
+        md = md_lines[lkey]
+        t = tablet.get(lkey) or {}
+        dk = (f"day {md['day']} of about {md['about']}" if md.get('day') else 'multi-day')
+        share = md['share']
+        row['md_day'], row['md_about'] = md.get('day'), md.get('about')
+        row['md_last_tap'] = t.get('last_tap')
+        if t.get('state') == 'done' or (w and w['done_since']):
+          when = t.get('done_at')
+          row.update(case='FINISHED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
+                     explanation=base + f"; {dk}: FINISHED - tablet Complete"
+                     + (f" {when:%m/%d %H:%M}" if when else ' (work order done)')
+                     + (f", {md['day']} of about {md['about']} days" if md.get('day') and md.get('about') else ''))
+          if tier != 'Stretch':
+            moved_in += load
+        elif md.get('built'):
+          # a share planned on an earlier day, riding at 0 in until the order ships
+          row.update(case='WORKED', expected='WORKED_ON', observed=bool(t.get('first_start')),
+                     resolution='EXPLAINED',
+                     explanation=base + '; multi-day: share planned on an earlier day, awaiting the order'
+                     + (f" (tablet: {t.get('state')}, last tap {t['last_tap']:%m/%d})" if t.get('last_tap') else ' (no tablet record)'))
+        elif t.get('count_today') is not None:
+          n = int(t['count_today'])
+          row.update(expected='QTY_COMPLETED', expected_value=share, actual_value=float(n), observed=True)
+          if share <= 0 or n >= 0.5 * share:
+            row.update(case='ON_TRACK', resolution='EXPLAINED',
+                       explanation=base + f"; {dk}: ON TRACK - {n:,} of {share:,.0f} counted today")
+          else:
+            repeat = lkey in slow_before
+            row.update(case='SLOW', routed_to='PC', resolution=('OPEN' if repeat else 'EXPLAINED'),
+                       explanation=base + f"; {dk}: SLOW - {n:,} of {share:,.0f} counted today"
+                       + (' (second day running)' if repeat else ' (first day - not asked)'),
+                       question=(f"Multi-day order {_line_txt(s)} ({dk}) counted {n:,} pieces today "
+                                 f"against a share of {share:,.0f}, and was under half its share yesterday "
+                                 "too. What is slowing it - and should the share, the assembler count, "
+                                 "or the day estimate change?") if repeat else None)
+          if tier != 'Stretch':
+            moved_in += load * (min(1.0, n / share) if share > 0 else 1.0)
+        elif t.get('state') == 'paused':
+          row.update(case='PAUSED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
+                     explanation=base + f"; {dk}: PAUSED - tablet Stop on {t['last_tap']:%m/%d}, no Restart")
+        elif t.get('tapped_today'):
+          row.update(case='ON_TRACK', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
+                     explanation=base + f"; {dk}: ON TRACK - floor tap today, no count recorded")
+          if tier != 'Stretch':
+            moved_in += load
+        elif t.get('state') == 'running':
+          row.update(case='STOPPED', expected='WORKED_ON', observed=False, routed_to='PC',
+                     explanation=base + f"; {dk}: STOPPED - started on the tablet "
+                     f"{t['first_start']:%m/%d}, last tap {t['last_tap']:%m/%d}, nothing today")
+        else:
+          row.update(case='UNTOUCHED', expected='WORKED_ON', routed_to='PC',
+                     explanation=base + f"; {dk}: no tablet record - never started on the floor",
+                     question=(f"Multi-day order {_line_txt(s)} ({dk}, share {share:,.0f}) was on "
+                               f"{_fmt_day(plan_date)}'s plan and the tablet shows no Start. "
+                               "Was it started? If not, what stopped it?"))
       elif worked:
         row.update(case='WORKED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
                    explanation=base + f"; work order {w['wo_status']}"
@@ -665,7 +881,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                      'removed_by_role': None})
 
     # --- ration the questions: max_q total, min_sales floor ------------
-    order_key = {'UNTOUCHED': 0, 'REMOVED_NO_REASON': 1, 'UNPLANNED_SHIP': 2,
+    order_key = {'STOPPED': 0, 'UNTOUCHED': 0, 'SLOW': 1, 'REMOVED_NO_REASON': 1, 'UNPLANNED_SHIP': 2,
                  'CANCELLED': 3, 'QTY_CHANGED': 4, 'DATE_MOVED': 5, 'PARTIAL_ORDER': 6}
     def _rank(r):
       # v1.2.1: planned lines rank by PLAN POSITION (the order the floor
@@ -688,6 +904,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       r['rank'] = i
     # 096: stalled lines are ALWAYS asked (one each), on top of max_q
     stalled = _stall_scan(cursor, plan_date, rows, rp)
+    stalled += _md_stall_scan(cursor, plan_date, rows, rp)      # retro-1.7: STOPPED multi-day lines
     for r in stalled:
       if not r.get('question'):
         if r in chosen:                 # a sibling carries the order's question
@@ -1279,4 +1496,4 @@ def retro_ask_anyway(variance_id):
     conn.rollback()
     return {'status': 'error', 'message': f'{e}'}
   finally:
-    conn.close()
+    conn.close()
