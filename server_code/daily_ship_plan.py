@@ -2340,7 +2340,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.5.1' # v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.5.2' # v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2798,7 +2798,7 @@ def ship_plan_agent_compare(plan_date=None):
       out.append(f"      {l['line']} / {l['sku']:<14} {l['qty_today']:g} of {l['qty_full']:g}"
                  f" (prior {l['qty_prior']:g}) {l['load_inches']:7,.1f} in")
     if g.get('built_est'):
-      out.append(f"      built (est.), at 0 in: {', '.join(g['built_est'])}")
+      out.append(f"      built (tablet Complete or earlier shares), at 0 in: {', '.join(g['built_est'])}")
     if g.get('waiting'):
       out.append(f"      not today (pool used): {', '.join(g['waiting'])}")
   for w in new.get('multiday_waiting') or []:
@@ -2827,7 +2827,7 @@ def ship_plan_agent_compare(plan_date=None):
     out.append(f"  #{l['rank']:<3} {l['line']} / {l['sku']:<14} {l['tier']:<7} {l['load_inches']:7,.1f} in  "
                f"{('(partial %g of %g)' % (l['qty_planned'], l['qty_full'])) if l.get('qty_planned') else ''}"
                f"{(' multi-day ' + l['multiday']) if l.get('multiday') else ''}"
-               f"{' (built est., 0 in)' if l.get('multiday_built_est') else ''}"
+               f"{' (built, 0 in)' if l.get('multiday_built_est') else ''}"
                f"{('(SHELF DECISION - %s has the stock)' % l.get('decision_taker')) if l.get('shelf_decision') else ''}")
   changed = [k for k in kept if (newl[k].get('qty_planned') or newl[k].get('shelf_decision')
                                  or old[k]['proposed_tier'] != newl[k]['tier'])]
@@ -3364,10 +3364,13 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
           m['load_inches'] = round(pieces * per_piece, 2)
           take_in += m['load_inches']
           taken.append(m)
-        if not taken and not work and any(m.get('md_done') for m in members):
-          # every line's shares are planned, nothing shipped: one lot of the
-          # biggest line keeps the order in front of PC - check the floor
-          m = max((m for m in members if m.get('md_done')), key=lambda m: float(m['md_full']))
+        est_done = [m for m in members if m.get('md_done') and not m.get('md_done_fact')]
+        if not taken and not work and est_done:
+          # every line's shares are planned (ESTIMATE, no tablet Complete),
+          # nothing shipped: one lot of the biggest such line keeps the order
+          # in front of PC - check the floor. A tablet Complete needs no
+          # check: the line rides at 0 in as built (v1.5.2, 597535 10-25).
+          m = max(est_done, key=lambda m: float(m['md_full']))
           m['md_done'] = False
           m['md_check'] = True
           m['md_qty'] = min(float(m['md_full']), float(_md_lot(m['md_full'])))
