@@ -1869,7 +1869,8 @@ def ship_plan_recalc_line(plan_date, order, rel, item):
             UPDATE dbo.pc_ship_plan_line SET priority_note = %s
             WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
         """, (_split_note(keep, float(sum(float(r['nx_qty_ordered'] if r.get('nx_qty_ordered') is not None
-                                                else r['nx_qty_balance_due']) for r in rows))),
+                                                else r['nx_qty_balance_due']) for r in rows)))
+              + _md_clause(old.get('priority_note')),        # v1.5: the day clause survives a Refresh
               plan_date, order, rel, item))
 
     _delete_source_rows(cursor, plan_date, order, rel, item)
@@ -2339,7 +2340,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.4.1' # v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.5' # v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2385,7 +2386,12 @@ def _agent_params(cursor):
           # a single line bigger than this share of the fill target is a
           # SPLIT decision, not a proposal (first run: one 1,631-in line
           # took 82% of the day).
-          'max_line_pct': max(1.0, min(_f('AGENT_MAX_LINE_PCT', 50), 100.0)) / 100.0}
+          'max_line_pct': max(1.0, min(_f('AGENT_MAX_LINE_PCT', 50), 100.0)) / 100.0,
+          # v1.5 (decisions 2026-10-25): the day's multi-day POOL as a share
+          # of the fill target. An order over the max-line test is proposed
+          # at a day-sized share out of this pool instead of being left as
+          # a SPLIT decision. 0 = off (v1.4 behaviour). Migration 116.
+          'multiday_share_pct': max(0.0, min(_f('AGENT_MULTIDAY_SHARE_PCT', 40), 100.0)) / 100.0}
 
 
 def _next_business_day(d=None):
@@ -2471,11 +2477,104 @@ def _system_prefix(note):
   'SHELF DECISION: ...') that a hand edit must not lose; '' when none."""
   n = (note or '')
   if n.startswith('SPLIT '):
-    m = re.match(r'SPLIT \S+ of \S+', n)
+    # v1.5: the multi-day day clause rides inside the prefix ('SPLIT 100 of
+    # 315 · day 2 of about 4') - the next morning's prior-share query reads it
+    m = re.match(r'SPLIT \S+ of \S+( · day \d+ of about \d+)?', n)
     return m.group(0) if m else ''
   if n.startswith(_SHELF_DECISION_PREFIX):
     return n.split(' · ')[0]
   return ''
+
+
+# --- v1.5 multi-day orders (daily-plan-multi-day-work-orders.md s16-18) ----
+_MD_CLAUSE_RE = re.compile(r' · day (\d+) of about (\d+)')
+_MD_PRIOR_LIKE = 'SPLIT % of % · day %'      # the board note of a day-sized share
+_MD_DONE_PREFIX = 'MULTI-DAY: '              # a sibling whose shares already cover it
+
+
+def _md_clause(note):
+  """' · day d of about k' from a board note, or ''."""
+  m = _MD_CLAUSE_RE.search(_system_prefix(note))
+  return m.group(0) if m else ''
+
+
+def _mdkey(m):
+  return (m['nx_order_numb'], m['nx_rel_numb'], str(m['nx_item_no']))
+
+
+def _md_lot(pieces):
+  """The lot a day-sized share rounds down to (paper s5: 10 / 25 / 50)."""
+  p = float(pieces or 0)
+  return 50 if p >= 500 else 25 if p >= 100 else 10 if p >= 20 else 1
+
+
+def _md_round(pieces):
+  lot = _md_lot(pieces)
+  return float(int(float(pieces) / lot) * lot)
+
+
+def _md_prior_shares(cursor, plan_date):
+  """Shares already planned for each line on EARLIER published plans:
+  {(order, rel, item): {'qty': sum, 'days': {plan_date, ...}}}. Until the
+  tablet count arrives (step 2) the engine assumes those shares were built
+  (Dave 2026-10-25). 45-day window; a line that shipped is no candidate."""
+  cursor.execute("""
+      SELECT pl.nx_order_numb, pl.nx_rel_numb, pl.nx_item_no, pl.plan_date, pl.qty_planned
+      FROM dbo.pc_ship_plan_line pl
+      JOIN dbo.pc_ship_plan h ON h.plan_date = pl.plan_date
+      WHERE h.plan_status = 'Published'
+        AND pl.plan_date < %s AND pl.plan_date >= DATEADD(day, -45, %s)
+        AND pl.line_status IN ('Planned', 'Proposed', 'Confirmed')
+        AND pl.priority_note LIKE %s
+  """, (plan_date, plan_date, _MD_PRIOR_LIKE))
+  out = {}
+  for r in cursor.fetchall():
+    k = (r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))
+    e = out.setdefault(k, {'qty': 0.0, 'days': set()})
+    e['qty'] += float(r['qty_planned'] or 0)
+    e['days'].add(r['plan_date'])
+  return out
+
+
+def _md_assemblers(cursor, orders):
+  """{order: 'ASM9+ASM3'} - assemblers the PC app / Supervisor board has on
+  the order's open work orders. Read as a fact (one owner per table, 074);
+  shown on the note, not used in the share in this iteration."""
+  orders = [o for o in set(orders or []) if o]
+  if not orders:
+    return {}
+  cursor.execute("""
+      SELECT sales_order_number AS o, assigned_assembler AS a
+      FROM dbo.work_orders
+      WHERE sales_order_number IN %s AND completed_at IS NULL
+        AND NULLIF(LTRIM(RTRIM(assigned_assembler)), '') IS NOT NULL
+      GROUP BY sales_order_number, assigned_assembler
+  """, (tuple(orders),))
+  out = {}
+  for r in cursor.fetchall():
+    out.setdefault(r['o'], []).append(str(r['a']).strip())
+  return {o: '+'.join(sorted(v)) for o, v in out.items()}
+
+
+def _md_note(c, ship_complete):
+  """Board note for a day-sized share. MUST start 'SPLIT n of N · day d of
+  about k' (the prior-share query, _system_prefix, set_qty and recalc read
+  that clause). <= 200 chars."""
+  who = c.get('md_assemblers') or 'no assembler assigned yet'
+  tail = 'ships when complete' if ship_complete else 'ship partial: PC decides'
+  if c.get('md_check'):
+    tail = 'earlier shares cover the order, not shipped - check the floor'
+  stock = (f" · stock: the rest is planned on order {c.get('stock_taker') or '?'}"
+           if c.get('stock_qty') else '')
+  return (f"SPLIT {float(c['md_qty']):g} of {float(c['md_full']):g}"
+          f" · day {int(c['md_day'])} of about {int(c['md_about'])} · {who} · {tail}{stock}")[:200]
+
+
+def _md_done_note(c):
+  days = sorted(c.get('md_days') or [])
+  span = (f"{str(days[0])[:10]}" + (f" to {str(days[-1])[:10]}" if len(days) > 1 else '')) if days else 'earlier'
+  return (f"{_MD_DONE_PREFIX}{float(c['md_full']):g} planned over {len(days) or 1} day(s) ({span}), "
+          f"est. built · rides at 0 in until the order ships")[:200]
 
 
 @anvil.server.callable
@@ -2519,7 +2618,10 @@ def ship_plan_set_qty(plan_date, order, rel, item, qty, why=None):
       note = (tail or None)
     else:
       agg = _scale_agg(agg, qty)
-      note = _split_note(qty, full) + ' - PARTIAL' + (': ' + (why or tail) if (why or tail) else '')
+      # v1.5: a multi-day share keeps its day clause so tomorrow's run still
+      # counts today's (new) quantity as a prior share
+      note = (_split_note(qty, full) + _md_clause(old_note) + ' - PARTIAL'
+              + (': ' + (why or tail) if (why or tail) else ''))
       note = note[:200]
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
@@ -2632,7 +2734,23 @@ def ship_plan_agent_compare(plan_date=None):
          f"   |   now: {len(newl)} lines, {new['proposed_inches']:,.0f} in of {new['target_inches']:,.0f} target; "
          f"gated {new['n_gated']}, short {new['n_short']} (stock {new.get('n_stock_short', 0)}), "
          f"partials {new.get('n_stock_partial', 0)}, shelf decisions {new.get('n_shelf_decision', 0)}, "
-         f"split-needed {new['n_split_needed']}, blocked {new['n_blocked']}"]
+         f"split-needed {new['n_split_needed']}, blocked {new['n_blocked']}, "
+         f"multi-day {new.get('n_multiday', 0)} ({new.get('multiday_used_inches', 0):,.0f} of "
+         f"{new.get('multiday_pool_inches', 0):,.0f} in pool), waiting {new.get('n_multiday_waiting', 0)}"]
+  for g in new.get('multiday') or []:                       # v1.5
+    out.append(f"  MULTI-DAY order {g['order']}: day {g['day']} of about {g['about']}"
+               f"{' (started)' if g.get('started') else ''}, {g['tier']}, {g['took_inches']:,.0f} in today, "
+               f"{g['remaining_inches_after']:,.0f} in left after; assemblers {g.get('assemblers') or 'none yet'}"
+               f"{'; ships when complete' if g.get('ship_complete') else ''}")
+    for l in g['lines']:
+      out.append(f"      {l['line']} / {l['sku']:<14} {l['qty_today']:g} of {l['qty_full']:g}"
+                 f" (prior {l['qty_prior']:g}) {l['load_inches']:7,.1f} in")
+    if g.get('built_est'):
+      out.append(f"      built (est.), at 0 in: {', '.join(g['built_est'])}")
+    if g.get('waiting'):
+      out.append(f"      not today (pool used): {', '.join(g['waiting'])}")
+  for w in new.get('multiday_waiting') or []:
+    out.append(f"  MULTI-DAY order {w['order']} waits ({w['load_inches']:,.0f} in): {w['why']}")
   dropped = [k for k in old if k not in newl]
   added = [k for k in newl if k not in old]
   kept = [k for k in old if k in newl]
@@ -2656,6 +2774,8 @@ def ship_plan_agent_compare(plan_date=None):
     l = newl[k]
     out.append(f"  #{l['rank']:<3} {l['line']} / {l['sku']:<14} {l['tier']:<7} {l['load_inches']:7,.1f} in  "
                f"{('(partial %g of %g)' % (l['qty_planned'], l['qty_full'])) if l.get('qty_planned') else ''}"
+               f"{(' multi-day ' + l['multiday']) if l.get('multiday') else ''}"
+               f"{' (built est., 0 in)' if l.get('multiday_built_est') else ''}"
                f"{('(SHELF DECISION - %s has the stock)' % l.get('decision_taker')) if l.get('shelf_decision') else ''}")
   changed = [k for k in kept if (newl[k].get('qty_planned') or newl[k].get('shelf_decision')
                                  or old[k]['proposed_tier'] != newl[k]['tier'])]
@@ -2741,6 +2861,10 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
   group used to be tested alone, so five groups of 200-400 in rode on a
   496 in buffer - '+1,385 if time' on 10-13).
   Tier rule: Must = late (A01) or due today/tomorrow (A02); else Next.
+  v1.5 (2026-10-25): an order over the max-line test is a MULTI-DAY order,
+  proposed at a day-sized share out of a pool (AGENT_MULTIDAY_SHARE_PCT of
+  the fill target); started orders first; progress estimated from the
+  shares on earlier published plans until the tablet count (step 2).
   Re-running supersedes the earlier proposal and clears ONLY its
   still-Proposed lines — anything PC confirmed stays and counts.
   Refuses a Published day unless force. Takes a proposal-time flag
@@ -2864,7 +2988,9 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
     #     is BLOCKED: it cannot go short, nothing on it ships until the
     #     gate clears (an X06 due in by the plan date is not short).
     #   - a group bigger than the whole day, or than AGENT_MAX_LINE_PCT
-    #     of the fill target, is a SPLIT DECISION for PC - not proposed.
+    #     of the fill target, is a MULTI-DAY order: proposed at a day-sized
+    #     share out of the multi-day pool (v1.5, below). With the pool off
+    #     (AGENT_MULTIDAY_SHARE_PCT 0) it is a SPLIT DECISION for PC.
     #   - first-fit by the group's best ungated line (the candidate order
     #     already is score DESC, ship-by, load DESC); tier by its drivers
     #     (Must = A01/A02 on any driver, else Next). Stretch is decided
@@ -2947,6 +3073,22 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         groups[k] = []
         group_order.append(k)
       groups[k].append(c)
+
+    # --- v1.5 MULTI-DAY ORDERS (decisions 1-8, 2026-10-25) --------------
+    # The day's multi-day POOL is AGENT_MULTIDAY_SHARE_PCT of the fill
+    # target (40% = ~794 in at 2,482 cap). Started orders - a share on an
+    # earlier PUBLISHED plan - go FIRST (decision 7); the pool is used in
+    # that order, so the first order takes it and the next gets what is
+    # left (usually nothing: one multi-day order at a time in practice).
+    md_pool = target * ap['multiday_share_pct']
+    md_used, md_taker, md_out, md_waiting = 0.0, None, [], []
+    md_prior = _md_prior_shares(cursor, plan_date) if md_pool > 0 else {}
+    if md_prior:
+      group_order.sort(key=lambda gk: 0 if any(_mdkey(m) in md_prior for m in groups[gk]) else 1)
+    md_asm = _md_assemblers(cursor, [gk[0] for gk in group_order
+                                     if any(_mdkey(m) in md_prior for m in groups[gk])
+                                     or sum(float(m.get('load_inches') or 0) for m in groups[gk]) > max_line]
+                            ) if md_pool > 0 else {}
 
     picks, deferred, gated, split_needed, blocked = [], [], [], [], []
     short_lines = []
@@ -3078,15 +3220,143 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
           m['block_reason'] = why
         blocked.extend(members)
         continue
-      if load > cap_in + 1e-9 or load > max_line + 1e-9:
+      codes = ' '.join((m.get('flag_codes') or '') for m in drivers)
+      tier = 'Must' if ('A01' in codes or 'A02' in codes) else 'Next'
+      # --- v1.5: an order over the max-line test is a MULTI-DAY order -
+      # proposed at a day-sized share out of the pool, not left as a SPLIT
+      # decision. A STARTED order stays on this path until done, whether or
+      # not what remains still looks oversize. Progress until the tablet
+      # count (step 2): remaining = ordered - shares on earlier published
+      # days (assume they were built). Inside the order the lines with the
+      # least remaining load go whole first; the first that does not fit
+      # gets the rounded remainder (lot 50 / 25 / 10 / 1); the rest stay in
+      # the candidates for a later day. A line whose shares already cover it
+      # rides at ZERO load (visible, so the retro sees it the day the order
+      # ships). Stretch never applies to a multi-day order (paper s10). The
+      # board note starts 'SPLIT n of N · day d of about k' - machine-read.
+      started = any(_mdkey(m) in md_prior for m in members)
+      if md_pool > 0 and (started or load > cap_in + 1e-9 or load > max_line + 1e-9):
+        gdays = set()
+        for m in members:
+          pr = md_prior.get(_mdkey(m))
+          if pr:
+            gdays |= set(pr['days'])
+        day_no = len(gdays) + 1
+        budget = max(0.0, min(md_pool - md_used, target - used))
+        if not started and budget < 0.25 * md_pool:
+          # a NEW multi-day order does not start on the scraps of the pool
+          # (a 17-piece day 1 is a trickle, not a start); it waits its turn
+          why = (f"multi-day: waits for the pool - order {md_taker} has it today" if md_taker
+                 else f"multi-day: no room in the pool today ({md_pool:,.0f} in, {budget:,.0f} left)")
+          for m in members:
+            m['split_reason'] = why
+          md_waiting.append({'order': order, 'why': why, 'load_inches': round(load, 1),
+                             'started': False, 'day': 1})
+          split_needed.extend(members)
+          continue
+        work, rem_total_in = [], 0.0
+        for m in members:
+          need = float(m.get('stock_qty') or m.get('qty_open') or 0)
+          li = float(m.get('load_inches') or 0)
+          pr = md_prior.get(_mdkey(m))
+          m['md_full'] = need
+          m['md_prior'] = float(pr['qty']) if pr else 0.0
+          m['md_days'] = sorted(pr['days']) if pr else []
+          if need <= 0 or li <= 0:
+            continue                          # zero-touch sibling: rides as today
+          per_piece = li / need
+          m['md_per_piece'] = per_piece
+          remaining = max(0.0, need - m['md_prior'])
+          if remaining < 1:
+            m['md_done'] = True               # shares cover it: visible at 0 in
+            m['load_inches'] = 0.0
+            continue
+          work.append((m, remaining, per_piece))
+          rem_total_in += remaining * per_piece
+        work.sort(key=lambda t: t[1] * t[2])  # least remaining load first
+        take_in, taken, cut = 0.0, [], False
+        for m, remaining, per_piece in work:
+          left = budget - take_in
+          if cut:
+            m['md_wait'] = True               # one cut line per day; the rest wait
+            continue
+          if remaining * per_piece <= left + 1e-9:
+            pieces = remaining
+          else:
+            cut = True
+            pieces = _md_round(left / per_piece)
+            if remaining - pieces < _md_lot(remaining) and remaining * per_piece <= left * 1.15:
+              pieces = remaining              # no tail smaller than a lot
+            if taken and pieces * per_piece < 0.10 * md_pool:
+              pieces = 0.0                    # a scrap after whole lines is not a day's work
+            if pieces < 1 and not taken and started:
+              pieces = min(remaining, float(_md_lot(remaining)))   # a started order never stands still
+          if pieces < 1:
+            m['md_wait'] = True               # stays in the candidates today
+            continue
+          m['md_qty'] = pieces
+          m['load_inches'] = round(pieces * per_piece, 2)
+          take_in += m['load_inches']
+          taken.append(m)
+        if not taken and not work and any(m.get('md_done') for m in members):
+          # every line's shares are planned, nothing shipped: one lot of the
+          # biggest line keeps the order in front of PC - check the floor
+          m = max((m for m in members if m.get('md_done')), key=lambda m: float(m['md_full']))
+          m['md_done'] = False
+          m['md_check'] = True
+          m['md_qty'] = min(float(m['md_full']), float(_md_lot(m['md_full'])))
+          m['load_inches'] = round(m['md_qty'] * float(m.get('md_per_piece') or 0), 2)
+          take_in += m['load_inches']
+          taken.append(m)
+        if not taken and not any(m.get('md_done') for m in members):
+          why = (f"multi-day: waits for the pool - order {md_taker} has it today" if md_taker
+                 else f"multi-day: no room in the pool today ({md_pool:,.0f} in, {budget:,.0f} left)")
+          for m in members:
+            m['split_reason'] = why
+          md_waiting.append({'order': order, 'why': why, 'load_inches': round(load, 1),
+                             'started': started, 'day': day_no})
+          split_needed.extend(members)
+          continue
+        about = (day_no - 1) + max(1, int(-(-rem_total_in // md_pool))) if md_pool > 0 else day_no
+        for m in members:
+          m['multiday'] = True
+          m['md_day'] = day_no
+          m['md_about'] = about
+          m['md_assemblers'] = md_asm.get(order)
+          m['md_started'] = started
+          m['group_inches'] = take_in
+        proposed = [m for m in members if not m.get('md_wait')]
+        picks.extend((m, tier) for m in proposed)
+        used += take_in
+        md_used += take_in
+        md_taker = md_taker or order
+        n_groups += 1
+        for m in taken:                          # book the shelf for today's pieces only
+          chk = _shelf_check(m)
+          if chk is not None:
+            stock_used[chk[2]] = stock_used.get(chk[2], 0.0) + float(m['md_qty'])
+            stock_taker.setdefault(chk[2], order)
+        md_out.append({'order': order, 'day': day_no, 'about': about, 'started': started,
+                       'assemblers': md_asm.get(order), 'tier': tier,
+                       'took_inches': round(take_in, 1),
+                       'remaining_inches_after': round(max(0.0, rem_total_in - take_in), 1),
+                       'ship_complete': order in ship_complete,
+                       'lines': [{'line': _line_label(order, m['nx_rel_numb'], m['nx_item_no']),
+                                  'sku': m['nx_sku'], 'qty_today': float(m['md_qty']),
+                                  'qty_full': float(m['md_full']), 'qty_prior': float(m['md_prior']),
+                                  'load_inches': float(m['load_inches'])} for m in taken],
+                       'built_est': [_line_label(order, m['nx_rel_numb'], m['nx_item_no'])
+                                     for m in members if m.get('md_done')],
+                       'waiting': [_line_label(order, m['nx_rel_numb'], m['nx_item_no'])
+                                   for m in members if m.get('md_wait')]})
+        continue
+      if load > cap_in + 1e-9 or load > max_line + 1e-9:     # multi-day pool off (v1.4 rule)
         why = ('order bigger than the whole day' if load > cap_in
                else f"order over {int(ap['max_line_pct'] * 100)}% of the fill target")
         for m in members:
           m['split_reason'] = why
         split_needed.extend(members)
         continue
-      codes = ' '.join((m.get('flag_codes') or '') for m in drivers)
-      tier = 'Must' if ('A01' in codes or 'A02' in codes) else 'Next'
       if used + load <= target + 1e-9:
         picks.extend((m, tier) for m in members)
         used += load
@@ -3147,7 +3417,14 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         # v1.4: the board note must START with 'SHELF DECISION:' (publish
         # cleanup, filter, chip glyph); the full reason follows on the proposal
         reason = (_shelf_decision_note(c) + ' · ' + reason)[:500]
-      if c.get('stock_qty'):
+      if c.get('md_qty'):
+        # v1.5: a day-sized share - the note must START with 'SPLIT n of N ·
+        # day d of about k' (prior-share query, drift rule, Refresh); it
+        # names the stock clause itself when the shelf also cut the line
+        reason = (_md_note(c, order in ship_complete) + ' · ' + reason)[:500]
+      elif c.get('md_done'):
+        reason = (_md_done_note(c) + ' · ' + reason)[:500]
+      elif c.get('stock_qty'):
         # v1.3: the board note must START with 'SPLIT n of N' (drift rule,
         # Refresh); the rest of the shelf is on another order of this plan
         reason = (f"SPLIT {c['stock_qty']:g} of {c['stock_full_qty']:g} - stock: the rest is "
@@ -3167,6 +3444,10 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         agg_p = _scale_agg(agg_p, c['stock_qty'])        # v1.3 partial
       if agg_p and c.get('shelf_decision'):              # v1.4: on the board, not in the load
         agg_p = dict(agg_p, inches=0.0, minutes=0.0, surcharge=0.0)
+      if agg_p and c.get('md_qty'):                      # v1.5: today's share of the line
+        agg_p = _scale_agg(agg_p, c['md_qty'])
+      if agg_p and c.get('md_done'):                     # v1.5: shares cover it - visible at 0 in
+        agg_p = dict(agg_p, inches=0.0, minutes=0.0, surcharge=0.0)
       if not dry_run and rows and _upsert_proposed_line(cursor, plan_date, order, rel, item, rows,
                                                         agg_p, tier, reason, actor):
         n_added += 1
@@ -3179,8 +3460,11 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
                         'ship_by': c.get('ship_by_date'),
                         'score': int(c.get('priority_score') or 0),
                         'flags': c.get('flag_codes'), 'reason': reason,
-                        'qty_planned': (c.get('stock_qty') or None),     # v1.3
-                        'qty_full': (c.get('stock_full_qty') or None),
+                        'qty_planned': (c.get('md_qty') or c.get('stock_qty') or None),     # v1.3 / v1.5
+                        'qty_full': (c.get('md_full') if c.get('md_qty') else c.get('stock_full_qty')) or None,
+                        'multiday': (f"day {int(c['md_day'])} of about {int(c['md_about'])}"
+                                     if c.get('multiday') else None),     # v1.5
+                        'multiday_built_est': bool(c.get('md_done')),
                         'shelf_decision': bool(c.get('shelf_decision')),  # v1.4
                         'decision_taker': c.get('decision_taker'),
                         'decision_load': float(c.get('decision_load') or 0)})
@@ -3236,7 +3520,15 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
             'stretch_inches': round(stretch_in, 1),                    # v1.4.1
             'n_added_to_plan': n_added, 'n_cleared': n_cleared,
             'n_gated': len(gated), 'n_skipped': skipped,
-            'n_oversize': len(oversize), 'n_split_needed': len(oversize),
+            'n_oversize': len(oversize),
+            # v1.5: with the pool on, 'oversize' holds multi-day orders that
+            # WAIT for the pool (why names the order that has it) - not
+            # split decisions for PC. n_split_needed counts only the latter.
+            'n_split_needed': (0 if md_pool > 0 else len(oversize)),
+            'n_multiday': len(md_out), 'multiday': md_out,
+            'n_multiday_waiting': len(md_waiting), 'multiday_waiting': md_waiting,
+            'multiday_pool_inches': round(md_pool, 1), 'multiday_used_inches': round(md_used, 1),
+            'multiday_share_pct': ap['multiday_share_pct'],
             'max_line_inches': round(max_line, 1), 'slack_inches': round(slack, 1),
             'n_zero_touch_skipped': skipped_zero,
             'n_candidates': len(cands), 'horizon_end': end.isoformat(),
@@ -3650,4 +3942,4 @@ def ship_plan_get_proposal(plan_date):
   except Exception as e:
     return {'status': 'error', 'message': f'{e}'}
   finally:
-    conn.close()
+    conn.close()
