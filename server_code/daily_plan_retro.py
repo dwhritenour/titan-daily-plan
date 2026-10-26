@@ -16,7 +16,8 @@ events unused since 08-21):
               status at publish is not snapshotted yet, and 86 lines sat
               at 15 before the first plan existed (2026-09-07 test).
     WORKED    a work order for the line completed since the plan day, or
-              a WO Assign/Start/Complete event on the plan day
+              a floor tap (Start/Restart/Stop/Complete/Count) on the plan day
+              - NOT an Assign (that is the Supervisor board, retro-1.7.1)
     REMOVED   plan event Removed / TierChange after publish - with a reason
               it is a variance with the cause attached (counts toward the
               N=3 recurrence); without one it earns a question
@@ -65,7 +66,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.7'   # 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.7.1'   # 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 # retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
@@ -517,7 +518,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         FROM dbo.work_orders wo
         LEFT JOIN dbo.work_order_events e
                ON e.work_order_id = wo.work_order_id
-              AND e.event_type IN ('Assign','Start','Complete','Restart')
+              AND e.event_type IN ('Start','Restart','Stop','Complete','Count')   -- 1.7.1: floor taps only; Assign is the Supervisor board (10-23: 36 lines read WORKED on bulk assigns)
               AND CAST(e.event_at AS DATE) = %s
         WHERE wo.status <> 'Cancelled'
         GROUP BY wo.sales_order_number, wo.sales_order_rel, wo.sales_order_line, wo.part_number
@@ -741,7 +742,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       elif worked:
         row.update(case='WORKED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
                    explanation=base + f"; work order {w['wo_status']}"
-                   + (' completed since the plan day' if w['done_since'] else ' had floor activity on the day'))
+                   + (' completed since the plan day' if w['done_since'] else ' had a floor tap on the day'))
         if tier != 'Stretch':
           moved_in += load
       elif rem:

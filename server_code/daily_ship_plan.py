@@ -2340,7 +2340,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.5.2' # v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.5.3' # v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -3398,7 +3398,8 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         picks.extend((m, tier) for m in proposed)
         used += take_in
         md_used += take_in
-        md_taker = md_taker or order
+        if take_in > 0:
+          md_taker = md_taker or order          # v1.5.3: a built order (0 in) holds nothing
         n_groups += 1
         for m in taken:                          # book the shelf for today's pieces only
           chk = _shelf_check(m)
