@@ -959,8 +959,18 @@ class ship_plan(ship_planTemplate):
       items=[('— no reason set —', '')] +
       [(x['description'], x['reason_code']) for x in self._reasons],
       selected_value=item.get('priority_reason') or '')
-    tb_note = TextBox(text=item.get('priority_note') or '',
-                      placeholder='note — required for "Other"')
+    md = item.get('md')
+    note0 = item.get('priority_note') or ''
+    # v1.6.1: on a multi-day line the system text is shown, not edited; the
+    # box holds PC's own words only (the server keeps the system text in front)
+    sys_txt = ''
+    if md:
+      cuts = [i for i in (note0.find(' · Must:'), note0.find(' · Next:'), note0.find(' · Stretch:')) if i > 0]
+      sys_txt = note0[:min(cuts)] if cuts else note0
+    note_init = '' if md else note0
+    tb_note = TextBox(text=note_init,
+                      placeholder=('your note - shown after the system text' if md
+                                   else 'note — required for "Other"'))
     # decision 5 (10-12): plan ANY line at a quantity from the same dialog
     full = item.get('live_ordered')
     full = float(full) if full is not None else float(item.get('qty_planned') or 0)
@@ -975,32 +985,41 @@ class ship_plan(ship_planTemplate):
     pnl.add_component(dd_tier)
     pnl.add_component(Label(text='Reason (why it matters)', bold=True))
     pnl.add_component(dd_reason)
-    pnl.add_component(Label(text='Note', bold=True))
-    pnl.add_component(tb_note)
-    pnl.add_component(Label(text=f'Quantity to plan today (of {full:g} ordered) — this line only', bold=True))
-    pnl.add_component(tb_qty)
-    # v1.6 (step 3): a multi-day line carries PC's two order-level decisions
-    md = item.get('md')
-    dd_partials = tb_pause_to = tb_pause_why = None
     if md:
-      pnl.add_component(Label(text=f"Multi-day — order {order}"
-                              + (f" · day {md['day']} of about {md['about']}" if md.get('day') else ' · built, awaiting ship'),
-                              bold=True))
-      dd_partials = DropDown(items=[('Undecided — "ship partial: PC decides"', 'DECIDE'),
-                                    ('Partials OK — ship each day\'s pieces', 'OK'),
-                                    ('Ships when complete — hold until the order is built', 'COMPLETE')],
+      pnl.add_component(Label(text='System text (kept)', bold=True))
+      pnl.add_component(Label(text=sys_txt, font_size=11, foreground='#595959'))
+      pnl.add_component(Label(text='Your note', bold=True))
+    else:
+      pnl.add_component(Label(text='Note', bold=True))
+    pnl.add_component(tb_note)
+    dd_partials = tb_pause_to = tb_pause_why = None
+    if md and md.get('built'):
+      pnl.add_component(Label(text='Built — awaiting shipment', bold=True))
+      pnl.add_component(Label(text=(f"{order}: this line is built (tablet Complete). It rides on the plan at 0 in "
+                                    "until the order ships. Nothing to set here - ship it, or Remove it with a reason."),
+                              font_size=11))
+    elif md:
+      pnl.add_component(Label(text=f"Daily share — pieces of this line to build today (of {full:g} ordered)", bold=True))
+      pnl.add_component(tb_qty)
+      pnl.add_component(Label(text=f"Multi-day order {order} — day {md['day']} of about {md['about']}", bold=True))
+      pnl.add_component(Label(text="When the day's pieces are done (applies to every line of the order):"))
+      dd_partials = DropDown(items=[('Not decided yet', 'DECIDE'),
+                                    ('Ship them that day', 'OK'),
+                                    ('Hold until the order is complete', 'COMPLETE')],
                              selected_value=md.get('partials') or 'DECIDE')
-      pnl.add_component(Label(text='Partial shipments (decision 5) — applies to every line of the order'))
       pnl.add_component(dd_partials)
-      tb_pause_to = TextBox(placeholder='YYYY-MM-DD — leave empty for no pause')
-      tb_pause_why = TextBox(placeholder='reason (required to pause)')
-      pnl.add_component(Label(text='Pause the order until (decision 6) — it comes back first on that morning'))
+      pnl.add_component(Label(text='Pause this order until (YYYY-MM-DD) — it comes back first on that morning. Leave empty for no pause.'))
+      tb_pause_to = TextBox(placeholder='YYYY-MM-DD')
+      tb_pause_why = TextBox(placeholder='why? (required to pause)')
       pnl.add_component(tb_pause_to)
       pnl.add_component(tb_pause_why)
+    else:
+      pnl.add_component(Label(text=f'Quantity to plan today (of {full:g} ordered) — this line only', bold=True))
+      pnl.add_component(tb_qty)
     if not confirm(f"Priority — {line_label(item)}",
                    content=pnl):
       return
-    if md:
+    if md and dd_partials is not None:
       new_mode = dd_partials.selected_value
       pause_to = (tb_pause_to.text or '').strip()
       pause_why = (tb_pause_why.text or '').strip()
@@ -1046,7 +1065,7 @@ class ship_plan(ship_planTemplate):
       Notification(f"Quantity: {rq['old']} → {rq['new']}", timeout=4).show()
       note_arg = None                # the quantity call wrote the note (with the typed text); leave it
     else:
-      note_arg = tb_note.text or ''
+      note_arg = None if (tb_note.text or '') == note_init else (tb_note.text or '')   # v1.6.1: unchanged = untouched
     if cb_all and cb_all.checked:
       r = anvil.server.call('ship_plan_set_order_priority', self.plan_date, order,
                             tier=dd_tier.selected_value,

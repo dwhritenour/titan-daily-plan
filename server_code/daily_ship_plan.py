@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.6' # v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.6.1' # v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2488,10 +2488,25 @@ def _system_prefix(note):
     # v1.5: the multi-day day clause rides inside the prefix ('SPLIT 100 of
     # 315 · day 2 of about 4') - the next morning's prior-share query reads it
     m = re.match(r'SPLIT \S+ of \S+( · day \d+ of about \d+)?', n)
-    return m.group(0) if m else ''
+    if not m:
+      return ''
+    if m.group(1):
+      return _md_system_text(n)       # v1.6.1: assemblers, partials rule, pause ride with it
+    return m.group(0)
+  if n.startswith(_MD_DONE_PREFIX):   # v1.6.1: a built line's note survives a hand edit too
+    return _md_system_text(n)
   if n.startswith(_SHELF_DECISION_PREFIX):
     return n.split(' · ')[0]
   return ''
+
+
+def _md_system_text(note):
+  """v1.6.1: the machine part of a multi-day note - everything before the
+  engine's tier reason (' · Must:' / ' · Next:' / ' · Stretch:'), which is
+  the part PC's own words replace."""
+  n = note or ''
+  cuts = [i for i in (n.find(' · Must:'), n.find(' · Next:'), n.find(' · Stretch:')) if i > 0]
+  return n[:min(cuts)] if cuts else n
 
 
 # --- v1.5 multi-day orders (daily-plan-multi-day-work-orders.md s16-18) ----
@@ -2727,7 +2742,10 @@ def ship_plan_set_qty(plan_date, order, rel, item, qty, why=None):
       agg = _scale_agg(agg, qty)
       # v1.5: a multi-day share keeps its day clause so tomorrow's run still
       # counts today's (new) quantity as a prior share
-      note = (_split_note(qty, full) + _md_clause(old_note) + ' - PARTIAL'
+      pfx0 = _system_prefix(old_note)
+      m0 = re.match(r'SPLIT \S+ of \S+ · day \d+ of about \d+', pfx0)
+      md_tail = pfx0[m0.end():] if m0 else ''       # v1.6.1: ' · ASM9 · partials OK: ship daily' survives
+      note = (_split_note(qty, full) + _md_clause(old_note) + md_tail + ' - PARTIAL'
               + (': ' + (why or tail) if (why or tail) else ''))
       note = note[:200]
     cursor.execute("""
