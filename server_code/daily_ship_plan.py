@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.6.2' # v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.6.3' # v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -3311,7 +3311,11 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         SELECT pl.nx_order_numb, pl.nx_rel_numb, pl.nx_item_no, pl.nx_sku, pl.plan_date,
                pl.line_status, pl.snooze_to_date
         FROM dbo.pc_ship_plan_line pl
-        WHERE (pl.plan_date <> %s AND pl.plan_date >= CAST(GETDATE() AS DATE)
+        WHERE (pl.plan_date <> %s AND pl.plan_date > CAST(GETDATE() AS DATE)
+               -- v1.6.3: 'another day' = a FUTURE day. A line on TODAY's plan is not
+               -- elsewhere when a later day is planned (dry run / afternoon Run agent for
+               -- tomorrow: 60 lines blocked on 10-26, 602392 among them); at 06:30 the
+               -- plan day IS today, so the real run reads the same as before.
                AND pl.line_status IN ('Planned', 'Proposed', 'Confirmed'))
            OR (pl.line_status = 'Snoozed'
                AND ISNULL(pl.snooze_to_date, pl.plan_date) >= CAST(GETDATE() AS DATE))
