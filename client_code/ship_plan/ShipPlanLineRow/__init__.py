@@ -108,6 +108,23 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
                                  'stock this line needs. On the board at 0 in. Before publish: '
                                  'Remove it (ship the other complete) or plan a quantity on each '
                                  '(star). Undecided at publish = it leaves the plan.')
+    md = item.get('md')                  # v1.6 (step 3): multi-day facts parsed server-side
+    if md:
+      chip_text = '⧗ ' + chip_text
+      if md.get('built'):
+        self.lbl_status.tooltip = ('MULTI-DAY - built on earlier days (tablet Complete or earlier shares); '
+                                   'rides at 0 in until the order ships.')
+        self.lbl_qty.tooltip = 'built - awaiting the order'
+      else:
+        self.lbl_status.tooltip = (f"MULTI-DAY - today's share {md['share']:g} of {md['full']:g}, "
+                                   f"day {md['day']} of about {md['about']}. Partials: "
+                                   + {'OK': 'ship daily', 'COMPLETE': 'ships when complete'}.get(md.get('partials'), 'PC decides')
+                                   + '. The star sets the share, the partials rule and a pause.')
+      if md.get('paused_to'):
+        chip_text = f"⏸ PAUSED → {md['paused_to']}"
+        self.lbl_status.tooltip = (f"Paused by PC until {md['paused_to']}"
+                                   + (f": {md['pause_reason']}" if md.get('pause_reason') else '')
+                                   + '. It comes back first on that morning; Resume ends it early.')
     if item.get('is_rush'):              # 091: rush lane - same glyph as the flags
       chip_text = '⚡ ' + chip_text
       self.lbl_status.tooltip = ('RUSH — expedited ship method, due by the next '
@@ -148,6 +165,14 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     if on_snooze:
       self.btn_snooze.set_event_handler('click',
                                         lambda **e: on_snooze(self.item))
+    # v1.6: a PAUSED multi-day line (Snoozed by the star) offers Resume on
+    # the snooze control - the only control a Snoozed row has
+    on_resume = item.get('on_resume')
+    if status == 'Snoozed' and md and md.get('paused_to') and on_resume:
+      self.btn_snooze.visible = True
+      self.btn_snooze.text = '▶'
+      self.btn_snooze.tooltip = 'Resume the paused order'
+      self.btn_snooze.set_event_handler('click', lambda **e: on_resume(self.item))
     if on_remove:
       self.btn_remove.set_event_handler('click',
                                         lambda **e: on_remove(self.item))
@@ -168,4 +193,4 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
       self.btn_confirm.visible = bool(on_confirm) and status == 'Proposed'
       if on_confirm:
         self.btn_confirm.set_event_handler(
-          'click', lambda **e: on_confirm(self.item))
+          'click', lambda **e: on_confirm(self.item))

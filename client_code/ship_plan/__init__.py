@@ -355,6 +355,8 @@ class ship_plan(ship_planTemplate):
         return False
       if ff == 'SHELF' and not (l.get('priority_note') or '').startswith('SHELF DECISION:'):   # decision 7
         return False
+      if ff == 'MULTIDAY' and not (l.get('md') or l.get('multiday')):   # v1.6: plan grid (md) and candidates (multiday)
+        return False
       if ff in ('ANY_A', 'ANY_B') and not any(c.startswith(ff[-1]) for c in codes):
         return False
       if len(ff) == 3 and ff[0] in 'XABC' and ff[1:].isdigit() and ff not in codes:
@@ -392,7 +394,8 @@ class ship_plan(ship_planTemplate):
              ('Any A — urgency', 'ANY_A'),
              ('Any B — value', 'ANY_B'),
              ('Partial quantity — planned n of N (plan grid)', 'PARTIAL'),      # decision 5, 10-12
-             ('⚖ Shelf decision — two orders, one shelf (plan grid)', 'SHELF')]  # decision 7, 10-12
+             ('⚖ Shelf decision — two orders, one shelf (plan grid)', 'SHELF'),  # decision 7, 10-12
+             ('⧗ Multi-day — day-sized shares, built lines, waiting orders', 'MULTIDAY')]   # v1.6, 10-26
     for f in self._flag_defs:
       if f.get('active') and f.get('category') in ('X', 'A', 'B'):
         items.append((f"{f['flag_code']}  {f['flag_name']}", f['flag_code']))
@@ -704,9 +707,10 @@ class ship_plan(ship_planTemplate):
         it['on_remove'] = self._remove_line
         it['on_priority'] = self._priority_dialog
         it['on_confirm'] = self._confirm_line
+        it['on_resume'] = self._resume_order           # v1.6: paused multi-day order
       else:
         it['on_recalc'] = it['on_snooze'] = it['on_remove'] = None
-        it['on_priority'] = it['on_confirm'] = None
+        it['on_priority'] = it['on_confirm'] = it['on_resume'] = None
     self.rp_plan_lines.items = shown
 
   # =================================================================
@@ -975,9 +979,48 @@ class ship_plan(ship_planTemplate):
     pnl.add_component(tb_note)
     pnl.add_component(Label(text=f'Quantity to plan today (of {full:g} ordered) — this line only', bold=True))
     pnl.add_component(tb_qty)
+    # v1.6 (step 3): a multi-day line carries PC's two order-level decisions
+    md = item.get('md')
+    dd_partials = tb_pause_to = tb_pause_why = None
+    if md:
+      pnl.add_component(Label(text=f"Multi-day — order {order}"
+                              + (f" · day {md['day']} of about {md['about']}" if md.get('day') else ' · built, awaiting ship'),
+                              bold=True))
+      dd_partials = DropDown(items=[('Undecided — "ship partial: PC decides"', 'DECIDE'),
+                                    ('Partials OK — ship each day\'s pieces', 'OK'),
+                                    ('Ships when complete — hold until the order is built', 'COMPLETE')],
+                             selected_value=md.get('partials') or 'DECIDE')
+      pnl.add_component(Label(text='Partial shipments (decision 5) — applies to every line of the order'))
+      pnl.add_component(dd_partials)
+      tb_pause_to = TextBox(placeholder='YYYY-MM-DD — leave empty for no pause')
+      tb_pause_why = TextBox(placeholder='reason (required to pause)')
+      pnl.add_component(Label(text='Pause the order until (decision 6) — it comes back first on that morning'))
+      pnl.add_component(tb_pause_to)
+      pnl.add_component(tb_pause_why)
     if not confirm(f"Priority — {line_label(item)}",
                    content=pnl):
       return
+    if md:
+      new_mode = dd_partials.selected_value
+      pause_to = (tb_pause_to.text or '').strip()
+      pause_why = (tb_pause_why.text or '').strip()
+      if pause_to and not pause_why:
+        alert('A pause needs a reason. Nothing saved; open ★ again.')
+        return
+      if new_mode != (md.get('partials') or 'DECIDE') or pause_to:
+        rm = anvil.server.call('ship_plan_multiday_set', self.plan_date, order,
+                               partials=(new_mode if new_mode != (md.get('partials') or 'DECIDE') else None),
+                               pause_to=(pause_to or None), pause_reason=(pause_why or None))
+        if rm.get('status') != 'success':
+          alert(rm.get('message', 'Multi-day update failed'))
+          self.load_day()
+          return
+        Notification((f"{order}: paused to {rm['paused_to']}" if rm.get('paused_to')
+                      else f"{order}: partials = {rm.get('partials')}") + f" ({rm.get('n_lines')} line(s))",
+                     timeout=4).show()
+        if pause_to:
+          self.load_day()
+          return                           # the lines are Snoozed now; tier / reason no longer apply
     if (dd_reason.selected_value == 'OTHER'
         and not (tb_note.text or '').strip()):
       alert('"Other (see note)" needs the note — that IS the reason. '
@@ -1022,6 +1065,23 @@ class ship_plan(ship_planTemplate):
                             note=note_arg)
     if r.get('status') != 'success':
       alert(r.get('message', 'Priority change failed'))
+    self.load_day()
+
+  def _resume_order(self, item):
+    """v1.6 (step 3): end a multi-day pause early. The order is proposed
+    first on the next morning run (today's lines keep their Snoozed row)."""
+    order = item['nx_order_numb']
+    md = item.get('md') or {}
+    tb = TextBox(placeholder='note (optional)')
+    if not confirm(f"Resume {order} (paused to {md.get('paused_to') or '?'})? "
+                   "It is proposed first on the next morning run.",
+                   content=tb):
+      return
+    r = anvil.server.call('ship_plan_multiday_resume', order, note=(tb.text or '').strip() or None)
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Resume failed'))
+    else:
+      Notification(r.get('message') or f'{order} resumed', timeout=5).show()
     self.load_day()
 
   def _recalc_line(self, item):
@@ -1383,4 +1443,4 @@ class ship_plan(ship_planTemplate):
       if r.get('snapshot_warning'):
         msg += f"\n\nSnapshot warning: {r['snapshot_warning']}"
       alert(msg)
-    self.load_day()
+    self.load_day()

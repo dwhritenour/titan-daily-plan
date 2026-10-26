@@ -48,6 +48,9 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     self.lbl_sub.text = (f"{item.get('customer') or item.get('shipto_code') or ''}"
                          f" · {item.get('part_line') or item.get('bucket', '')}")
     self.lbl_sub.tooltip = f"ship-to {item.get('shipto_code') or '?'}"
+    if item.get('multiday'):             # v1.6 (step 3): where a multi-day order stands
+      self.lbl_sub.text += f"  · ⧗ {item['multiday']}"
+      self.lbl_sub.tooltip = item['multiday']
     # Qty = e21 ORDERED (orditem.qty) = qty_open since 066; "(balance)" only
     # when e21's balance due disagrees (065 / C05).
     ordered = float(item['qty_open'])
@@ -295,4 +298,4 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
     if item.get('n_class_defaulted'):
       lines.append(self._line('DEF  classification missing — charged '
                               'conservative (Non-Standard)', color='#a16207'))
-    self._popup('Load', lines)
+    self._popup('Load', lines)

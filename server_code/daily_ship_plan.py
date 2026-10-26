@@ -672,6 +672,13 @@ def ship_plan_get_candidates(search=None, bucket=None, due_within_days=None,
          'note': fr['note']})
     for r in rows:
       r['flags'] = fmap.get((r['nx_order_numb'], r['nx_rel_numb'], r['nx_item_no']), [])
+    try:                                           # v1.6: multi-day standing on the candidate rows
+      mdt = _md_candidate_text(cursor, rows)
+      for r in rows:
+        r['multiday'] = mdt.get((r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no'])))
+    except Exception as e:
+      for r in rows:
+        r['multiday'] = None
     # Feed freshness for the always-on Orders chip — age computed
     # SERVER-side (GETDATE) so browser clocks can't skew it.
     cursor.execute("""
@@ -794,6 +801,7 @@ def ship_plan_get_plan(plan_date):
                                       row.get('nx_item_no'))
       row['customer'] = _customer_label(row.get('nx_cust_name'), row.get('nx_cust_city'),
                                         row.get('nx_cust_state'), row.get('shipto_code'))
+      row['md'] = _md_parse_note(row.get('priority_note'))          # v1.6: multi-day facts for the row / star
       lines.append(row)
 
     planned_total = sum(float(l['load_inches']) for l in lines
@@ -2340,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.5.3' # v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.6' # v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2607,13 +2615,60 @@ def _md_note(c, ship_complete):
   about k' (the prior-share query, _system_prefix, set_qty and recalc read
   that clause). <= 200 chars."""
   who = c.get('md_assemblers') or 'no assembler assigned yet'
-  tail = 'ships when complete' if ship_complete else 'ship partial: PC decides'
+  mode = c.get('md_mode') or ('COMPLETE' if ship_complete else 'DECIDE')   # v1.6: PC's choice carries over
+  tail = _MD_PARTIALS.get(mode, _MD_PARTIALS['DECIDE'])
   if c.get('md_check'):
     tail = 'earlier shares cover the order, not shipped - check the floor'
   stock = (f" · stock: the rest is planned on order {c.get('stock_taker') or '?'}"
            if c.get('stock_qty') else '')
   return (f"SPLIT {float(c['md_qty']):g} of {float(c['md_full']):g}"
           f" · day {int(c['md_day'])} of about {int(c['md_about'])} · {who} · {tail}{stock}")[:200]
+
+
+_MD_PARTIALS = {'DECIDE': 'ship partial: PC decides',
+                'OK': 'partials OK: ship daily',
+                'COMPLETE': 'ships when complete'}
+_MD_PAUSED_RE = re.compile(r' · PAUSED( to (\d{4}-\d{2}-\d{2}))?(: ([^·]*))?')
+
+
+def _md_parse_note(note):
+  """v1.6: what a board note says about a multi-day line, for the row and
+  the star: {'share', 'full', 'day', 'about', 'built', 'partials' (DECIDE /
+  OK / COMPLETE), 'paused_to', 'pause_reason'} or None when the line is not
+  multi-day."""
+  n = note or ''
+  out = None
+  m = re.match(r'SPLIT (\S+) of (\S+) · day (\d+) of about (\d+)', n)
+  if m:
+    out = {'share': float(m.group(1)), 'full': float(m.group(2)),
+           'day': int(m.group(3)), 'about': int(m.group(4)), 'built': False}
+  elif n.startswith(_MD_DONE_PREFIX):
+    out = {'share': None, 'full': None, 'day': None, 'about': None, 'built': True}
+  if out is None:
+    return None
+  out['partials'] = next((k for k, v in _MD_PARTIALS.items() if (' · ' + v) in n), 'DECIDE')
+  pm = _MD_PAUSED_RE.search(n)
+  out['paused_to'] = pm.group(2) if pm else None
+  out['pause_reason'] = (pm.group(4) or '').strip() if pm else None
+  return out
+
+
+def _md_order_modes(cursor, plan_date):
+  """v1.6: the partials mode PC last set per order (OK / COMPLETE), read from
+  the newest multi-day note on any plan day in the last 45 days - including
+  plan_date itself (the star may have been used before a re-run)."""
+  cursor.execute("""
+      SELECT nx_order_numb, priority_note FROM dbo.pc_ship_plan_line
+      WHERE plan_date <= %s AND plan_date >= DATEADD(day, -45, %s)
+        AND priority_note LIKE %s
+      ORDER BY plan_date, updated_at
+  """, (plan_date, plan_date, _MD_PRIOR_LIKE))
+  out = {}
+  for r in cursor.fetchall():
+    md = _md_parse_note(r['priority_note'])
+    if md and md['partials'] != 'DECIDE':
+      out[r['nx_order_numb']] = md['partials']
+  return out
 
 
 def _md_done_note(c):
@@ -2700,6 +2755,182 @@ def ship_plan_set_qty(plan_date, order, rel, item, qty, why=None):
     return {'status': 'error', 'message': f'Quantity failed: {e}'}
   finally:
     conn.close()
+
+
+@anvil.server.callable
+def ship_plan_multiday_set(plan_date, order, partials=None, pause_to=None, pause_reason=None):
+  """v1.6 (step 3, decisions 5 and 6): PC's two multi-day decisions for an
+  ORDER, from the star of any of its lines.
+  partials: 'OK' (ship each day's pieces) / 'COMPLETE' (hold until the
+    order is built) / 'DECIDE' (back to undecided). Rewrites the mode clause
+    on every multi-day note of the order on this plan; the engine carries
+    the choice onto tomorrow's share (_md_order_modes).
+  pause_to + pause_reason: the order leaves the plan until that date. Its
+    active lines become Snoozed (snooze_to_date = pause_to) WITHOUT a
+    forward copy - the generic snooze would plan the WHOLE line on the
+    return day; the morning run re-proposes the right share instead,
+    first in line (started order). The note keeps its SPLIT clause and
+    gains ' · PAUSED to <date>: <reason>'. Logged as Snoozed / ReasonSet.
+    The paused lines stay Snoozed on this plan day (Resume does not revive
+    them today - the plan line's PK is taken; tomorrow's run proposes anew)."""
+  plan_date = _parse_date(plan_date)
+  actor = _current_actor()
+  partials = (partials or '').strip().upper() or None
+  if partials and partials not in _MD_PARTIALS:
+    return {'status': 'error', 'message': 'partials must be OK, COMPLETE or DECIDE.'}
+  if pause_to:
+    pause_to = _parse_date(pause_to)
+    if pause_to <= plan_date:
+      return {'status': 'error', 'message': 'The pause must end after the plan day.'}
+    if not (pause_reason or '').strip():
+      return {'status': 'error', 'message': 'A pause needs a reason (decision 6).'}
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT nx_rel_numb, nx_item_no, nx_sku, priority_note, line_status
+        FROM dbo.pc_ship_plan_line
+        WHERE plan_date = %s AND nx_order_numb = %s AND line_status IN %s
+          AND (priority_note LIKE %s OR priority_note LIKE %s)
+    """, (plan_date, order, ('Planned', 'Proposed', 'Confirmed'), _MD_PRIOR_LIKE, _MD_DONE_PREFIX + '%'))
+    lines = cursor.fetchall()
+    if not lines:
+      return {'status': 'error', 'message': f'{order} has no multi-day line on {plan_date}.'}
+    changed = []
+    for l in lines:
+      note = l['priority_note'] or ''
+      new = note
+      if partials:
+        for v in _MD_PARTIALS.values():
+          new = new.replace(' · ' + v, '')
+        new = new.replace(' · earlier shares cover the order, not shipped - check the floor', '')
+        head, sep, rest = new.partition(' · Must:') if ' · Must:' in new else new.partition(' · Next:')
+        new = (head + ' · ' + _MD_PARTIALS[partials] + sep + rest) if sep else (new + ' · ' + _MD_PARTIALS[partials])
+      if pause_to:
+        new = _MD_PAUSED_RE.sub('', new)
+        clause = f" · PAUSED to {pause_to.isoformat()}: {pause_reason.strip()}"
+        new = (new[:200 - len(clause)] + clause) if len(new) + len(clause) > 200 else new + clause
+      new = new[:200]
+      if pause_to:
+        cursor.execute("""
+            UPDATE dbo.pc_ship_plan_line
+            SET line_status = 'Snoozed', snooze_to_date = %s, priority_note = %s,
+                updated_by = %s, updated_at = GETDATE()
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+        """, (pause_to, new, actor, plan_date, order, l['nx_rel_numb'], l['nx_item_no']))
+        _log_event(cursor, plan_date, order, l['nx_sku'], 'Snoozed',
+                   old_value=l['line_status'], new_value=pause_to.isoformat(), actor=actor,
+                   note=('PAUSED (multi-day): ' + pause_reason.strip())[:400],
+                   rel=l['nx_rel_numb'], item=l['nx_item_no'])
+      elif new != note:
+        cursor.execute("""
+            UPDATE dbo.pc_ship_plan_line SET priority_note = %s, updated_by = %s, updated_at = GETDATE()
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+        """, (new, actor, plan_date, order, l['nx_rel_numb'], l['nx_item_no']))
+        _log_event(cursor, plan_date, order, l['nx_sku'], 'ReasonSet',
+                   old_value=note[:200], new_value=new[:200], actor=actor,
+                   note=f'MULTI-DAY partials: {partials}', rel=l['nx_rel_numb'], item=l['nx_item_no'])
+      changed.append(_line_label(order, l['nx_rel_numb'], l['nx_item_no'], l['nx_sku']))
+    _bump_revision(cursor, plan_date, actor)
+    conn.commit()
+    return {'status': 'success', 'order': order, 'n_lines': len(changed), 'lines': changed,
+            'partials': partials, 'paused_to': pause_to.isoformat() if pause_to else None}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Multi-day update failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def ship_plan_multiday_resume(order, note=None):
+  """v1.6: end a pause early. The paused lines (Snoozed with a PAUSED clause,
+  any plan day) get snooze_to_date = yesterday so they no longer block the
+  order; the next morning run proposes it first (not today: the day's
+  lines keep their Snoozed row)."""
+  actor = _current_actor()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT plan_date, nx_rel_numb, nx_item_no, nx_sku, priority_note, snooze_to_date
+        FROM dbo.pc_ship_plan_line
+        WHERE nx_order_numb = %s AND line_status = 'Snoozed' AND priority_note LIKE %s
+          AND ISNULL(snooze_to_date, plan_date) >= CAST(GETDATE() AS DATE)
+    """, (order, '% · PAUSED%'))
+    rows = cursor.fetchall()
+    if not rows:
+      return {'status': 'error', 'message': f'{order} is not paused.'}
+    for l in rows:
+      new = _MD_PAUSED_RE.sub(f" · RESUMED {date.today().isoformat()}", l['priority_note'] or '')[:200]
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET snooze_to_date = DATEADD(day, -1, CAST(GETDATE() AS DATE)), priority_note = %s,
+              updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (new, actor, l['plan_date'], order, l['nx_rel_numb'], l['nx_item_no']))
+      _log_event(cursor, l['plan_date'], order, l['nx_sku'], 'ReasonSet',
+                 old_value=f"paused to {l['snooze_to_date']}", new_value='resumed', actor=actor,
+                 note=('RESUMED (multi-day)' + (': ' + note if note else ''))[:400],
+                 rel=l['nx_rel_numb'], item=l['nx_item_no'])
+    conn.commit()
+    return {'status': 'success', 'order': order, 'n_lines': len(rows),
+            'message': f'{order} resumed - it is proposed first on the next morning run.'}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Resume failed: {e}'}
+  finally:
+    conn.close()
+
+
+def _md_candidate_text(cursor, rows):
+  """v1.6: {(order, rel, item): text} for candidate rows that belong to a
+  multi-day order - started (shares on earlier published plans), paused by
+  PC, or over the max-line test (will be proposed at a share)."""
+  if not rows:
+    return {}
+  nb = _next_business_day()
+  prior = _md_prior_shares(cursor, nb + timedelta(days=1))
+  cursor.execute("""
+      SELECT nx_order_numb, MAX(snooze_to_date) AS to_date, MAX(priority_note) AS note
+      FROM dbo.pc_ship_plan_line
+      WHERE line_status = 'Snoozed' AND priority_note LIKE %s
+        AND ISNULL(snooze_to_date, plan_date) >= CAST(GETDATE() AS DATE)
+      GROUP BY nx_order_numb
+  """, ('% · PAUSED%',))
+  paused = {r['nx_order_numb']: r for r in cursor.fetchall()}
+  ap = _agent_params(cursor)
+  cap = float(_capacity_for(cursor, nb, prefer_estimate=True).get('capacity_inches_effective') or 0)
+  max_line = cap * ap['fill_pct'] * ap['max_line_pct']
+  by_order, started_orders = {}, {}
+  for r in rows:
+    k = (r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))
+    gk = (r['nx_order_numb'], str(r.get('ship_by_date') or '')[:10])
+    by_order[gk] = by_order.get(gk, 0.0) + float(r.get('load_inches') or 0)
+    pr = prior.get(k)
+    if pr:
+      e = started_orders.setdefault(r['nx_order_numb'], {'qty': 0.0, 'full': 0.0, 'first': None})
+      e['qty'] += pr['qty']; e['full'] += float(r.get('qty_open') or 0)
+      d0 = min(pr['days'])
+      e['first'] = d0 if e['first'] is None or d0 < e['first'] else e['first']
+  out = {}
+  for r in rows:
+    k = (r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))
+    o = r['nx_order_numb']
+    gk = (o, str(r.get('ship_by_date') or '')[:10])
+    if o in paused:
+      p = paused[o]
+      md = _md_parse_note(p['note']) or {}
+      out[k] = (f"multi-day · PAUSED to {str(p['to_date'])[:10]}"
+                + (f": {md.get('pause_reason')}" if md.get('pause_reason') else ''))
+    elif o in started_orders:
+      e = started_orders[o]
+      out[k] = (f"multi-day · started {e['first']:%m/%d} · {e['qty']:g} of {e['full']:g} planned so far"
+                + (' · comes back first' ))
+    elif ap['multiday_share_pct'] > 0 and max_line > 0 and by_order.get(gk, 0.0) > max_line + 1e-9:
+      out[k] = (f"multi-day · {by_order[gk]:,.0f} in is over the day line ({max_line:,.0f}) · "
+                f"proposed at a share when its turn in the pool comes")
+  return out
 
 
 def _upsert_proposed_line(cursor, plan_date, order, rel, item, rows, agg, tier,
@@ -3148,6 +3379,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
     if md_prior or md_tab:
       group_order.sort(key=lambda gk: 0 if _md_started(gk) else 1)
     md_asm = _md_assemblers(cursor, md_orders) if md_pool > 0 else {}
+    md_modes = _md_order_modes(cursor, plan_date) if md_pool > 0 else {}   # v1.6
 
     picks, deferred, gated, split_needed, blocked = [], [], [], [], []
     short_lines = []
@@ -3392,6 +3624,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
           m['md_day'] = day_no
           m['md_about'] = about
           m['md_assemblers'] = md_asm.get(order)
+          m['md_mode'] = md_modes.get(order)
           m['md_started'] = started
           m['group_inches'] = take_in
         proposed = [m for m in members if not m.get('md_wait')]

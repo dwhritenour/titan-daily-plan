@@ -66,7 +66,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.7.1'   # 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.7.2'   # 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 # retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
@@ -186,19 +186,24 @@ def _md_plan_lines(cursor, plan_date):
   {(order, rel, item): {'share': qty_planned, 'day': d, 'about': k,
                         'built': True when the note is 'MULTI-DAY:' (0 in)}}"""
   cursor.execute("""
-      SELECT nx_order_numb, nx_rel_numb, nx_item_no, qty_planned, priority_note
+      SELECT nx_order_numb, nx_rel_numb, nx_item_no, qty_planned, priority_note, line_status, snooze_to_date
       FROM dbo.pc_ship_plan_line
-      WHERE plan_date = %s AND line_status IN ('Planned', 'Proposed', 'Confirmed')
+      WHERE plan_date = %s
+        AND (line_status IN ('Planned', 'Proposed', 'Confirmed')
+             OR (line_status = 'Snoozed' AND priority_note LIKE %s))     -- 1.7.2: paused by PC (v1.6 star)
         AND (priority_note LIKE %s OR priority_note LIKE %s)
-  """, (plan_date, _MD_SHARE_LIKE, _MD_BUILT_LIKE))
+  """, (plan_date, '% · PAUSED%', _MD_SHARE_LIKE, _MD_BUILT_LIKE))
   out = {}
   for r in cursor.fetchall():
     note = r['priority_note'] or ''
     m = re.search(r' · day (\d+) of about (\d+)', note)
+    pm = re.search(r' · PAUSED to (\d{4}-\d{2}-\d{2}): ([^·]*)', note)
     out[(r['nx_order_numb'], r['nx_rel_numb'] or '', str(r['nx_item_no'] or ''))] = {
       'share': float(r['qty_planned'] or 0),
       'day': int(m.group(1)) if m else None, 'about': int(m.group(2)) if m else None,
-      'built': note.startswith('MULTI-DAY:')}
+      'built': note.startswith('MULTI-DAY:'),
+      'paused_to': (pm.group(1) if pm else None) if r['line_status'] == 'Snoozed' else None,
+      'pause_reason': (pm.group(2).strip() if pm else '') if r['line_status'] == 'Snoozed' else ''}
   return out
 
 
@@ -698,6 +703,11 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                      + (f", {md['day']} of about {md['about']} days" if md.get('day') and md.get('about') else ''))
           if tier != 'Stretch':
             moved_in += load
+        elif md.get('paused_to'):
+          # 1.7.2: PC paused the order from the star (decision 6) - no question
+          row.update(case='PAUSED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
+                     explanation=base + f"; {dk}: PAUSED by PC to {md['paused_to']}"
+                     + (f" - {md['pause_reason']}" if md.get('pause_reason') else ''))
         elif md.get('built'):
           # a share planned on an earlier day, riding at 0 in until the order ships
           row.update(case='WORKED', expected='WORKED_ON', observed=bool(t.get('first_start')),
