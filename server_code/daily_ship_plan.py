@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.6.1' # v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.6.2' # v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2581,7 +2581,8 @@ def _md_assemblers(cursor, orders):
 
 def _md_tablet_facts(cursor, orders, days_back=30):
   """v1.5.1: the Assembly tablet per e21 line of the given orders, from the
-  floor taps of the last days_back days (Assign is the board, not the floor):
+  floor taps of the last days_back days (Assign is the board, not the floor;
+  v1.6.2: assembly operators only - the Screen kiosk shares the table):
   {(order, rel, item): {'state': running | paused | done | None,
                         'count_total': pieces from Count taps (note 'pieces=N',
                         migration 118), 'done_at', 'first_start', 'last_tap'}}."""
@@ -2597,6 +2598,11 @@ def _md_tablet_facts(cursor, orders, days_back=30):
       WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
         AND e.event_type IN ('Start', 'Restart', 'Stop', 'Complete', 'Reopen', 'Count')
         AND e.event_at >= DATEADD(day, -%s, CAST(GETDATE() AS DATE))
+        -- v1.6.2: work_order_events is shared with the Screen / Element kiosk (OP codes,
+        -- dbo.screen_operators, tapping since June). Only an ASSEMBLY operator's tap is an
+        -- assembly fact: a screen Complete is the element, not the valve (597535, 10-26).
+        AND (e.operator IN (SELECT operator_code FROM dbo.assembly_operators WHERE department_id = 1)
+             OR e.note LIKE 'dept=Assembly%%')
       ORDER BY e.event_at, e.event_id
   """, (tuple(orders), int(days_back)))
   out = {}
@@ -2734,6 +2740,8 @@ def ship_plan_set_qty(plan_date, order, rel, item, qty, why=None):
     old_note = old.get('priority_note') or ''
     tail = old_note[len(_system_prefix(old_note)):].lstrip(' -·:') if _system_prefix(old_note) else old_note
     tail = re.sub(r'^PARTIAL(\s*\(gate [^)]*\))?:?\s*', '', tail).strip()
+    if re.match(r'(Must|Next|Stretch): ', tail):
+      tail = ''                            # v1.6.2: the engine's reason sentence is not PC's why
     why = (why or '').strip()
     if qty >= full:                      # the whole line again
       qty = full
@@ -2746,7 +2754,7 @@ def ship_plan_set_qty(plan_date, order, rel, item, qty, why=None):
       m0 = re.match(r'SPLIT \S+ of \S+ · day \d+ of about \d+', pfx0)
       md_tail = pfx0[m0.end():] if m0 else ''       # v1.6.1: ' · ASM9 · partials OK: ship daily' survives
       note = (_split_note(qty, full) + _md_clause(old_note) + md_tail + ' - PARTIAL'
-              + (': ' + (why or tail) if (why or tail) else ''))
+              + ': ' + (why or tail or 'quantity set by PC'))
       note = note[:200]
     cursor.execute("""
         UPDATE dbo.pc_ship_plan_line
@@ -3126,8 +3134,10 @@ def ship_plan_agent_task_status(task_id):
 
 
 # dry run only: the body of dbo.vw_pc_ship_candidates (item grain, 066) with
-# ONE change - lines on the plan_date being dry-run are not suppressed. Keep
-# in step with the view if its column list changes. Params: plan_date, end.
+# ONE change - lines on the plan_date being dry-run are not suppressed, and
+# (v1.6.2) neither are TODAY's: a dry run for tomorrow must see today's
+# started multi-day lines as the 06:30 run will (10-26: 602392 was invisible).
+# Keep in step with the view if its column list changes. Params: plan_date, end.
 _DRY_CANDIDATES_SQL = """
     SELECT  r.nx_order_numb, r.nx_rel_numb, r.nx_item_no, r.nx_sku,
             r.nx_sku_desc AS sku_desc, r.nx_part_line AS part_line, r.bucket,
@@ -3147,7 +3157,7 @@ _DRY_CANDIDATES_SQL = """
               AND pl.nx_rel_numb   = r.nx_rel_numb
               AND pl.nx_item_no    = r.nx_item_no
               AND pl.line_status IN ('Planned','Snoozed','Proposed','Confirmed')
-              AND pl.plan_date >= CAST(GETDATE() AS DATE)
+              AND pl.plan_date > CAST(GETDATE() AS DATE)
               AND pl.plan_date <> %s)
 """
 

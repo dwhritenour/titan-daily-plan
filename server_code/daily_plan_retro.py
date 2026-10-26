@@ -66,7 +66,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.7.2'   # 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.7.3'   # 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 # retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
@@ -233,6 +233,9 @@ def _md_tablet(cursor, plan_date, days_back=30):
         AND e.event_type IN %s
         AND e.event_at >= DATEADD(day, -%s, %s)
         AND e.event_at < DATEADD(day, 1, %s)
+        -- 1.7.3: assembly operators only - the Screen kiosk (OP codes) shares this table
+        AND (e.operator IN (SELECT operator_code FROM dbo.assembly_operators WHERE department_id = 1)
+             OR e.note LIKE 'dept=Assembly%%')
       ORDER BY e.event_at, e.event_id
   """, (_MD_FLOOR_TAPS, int(days_back), plan_date, plan_date))
   out = {}
@@ -519,6 +522,10 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                MAX(CASE WHEN wo.status IN ('Complete','Shipped - Verify','Closed - Verify')
                          AND wo.completed_at >= %s THEN 1 ELSE 0 END) AS done_since,
                MAX(CASE WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END)   AS touched,
+               -- 1.7.3: which room tapped (OP = Screen / Element kiosk, ASM = Assembly tablet)
+               MAX(CASE WHEN e.operator IN (SELECT operator_code FROM dbo.assembly_operators WHERE department_id = 1)
+                          OR e.note LIKE 'dept=Assembly%%' THEN 2
+                        WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END) AS touched_by,
                MAX(wo.status) AS wo_status
         FROM dbo.work_orders wo
         LEFT JOIN dbo.work_order_events e
@@ -537,6 +544,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       else:
         a['done_since'] = max(a['done_since'], r['done_since'])
         a['touched'] = max(a['touched'], r['touched'])
+        a['touched_by'] = max(a.get('touched_by') or 0, r.get('touched_by') or 0)
 
     # --- retro-1.7: the day's multi-day lines and what the tablet says ----
     md_lines = _md_plan_lines(cursor, plan_date)
@@ -752,7 +760,9 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       elif worked:
         row.update(case='WORKED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
                    explanation=base + f"; work order {w['wo_status']}"
-                   + (' completed since the plan day' if w['done_since'] else ' had a floor tap on the day'))
+                   + (' completed since the plan day' if w['done_since']
+                      else (' had an Assembly tablet tap on the day' if (w.get('touched_by') or 0) >= 2
+                            else ' had a Screen / Element kiosk tap on the day (the element, not the valve)')))
         if tier != 'Stretch':
           moved_in += load
       elif rem:
