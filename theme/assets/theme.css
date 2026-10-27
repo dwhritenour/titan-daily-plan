@@ -1027,6 +1027,15 @@ input[disabled] ~ span {
   border-right: 0;
 }
 
+/* 2026-10-27 (Multi-day Order page): a DataRowPanel keeps an empty
+   'extra-column' div for every component that was placed outside the
+   grid's columns and later removed (MultidayGridRow's unused day slots);
+   the rule above gives each one a 1px border, so three of them read as a
+   thick rule under every row. An empty extra column has nothing to show. */
+.anvil-role-tonal-data-grid.anvil-data-grid .data-grid-child-panel div.data-row-col.extra-column:empty {
+  display: none;
+}
+
 
 /*Plots*/
 
