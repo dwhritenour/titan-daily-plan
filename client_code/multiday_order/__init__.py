@@ -4,35 +4,39 @@ import anvil.server
 
 
 # =============================================================================
-# multiday_order - the Multi-day WORK ORDER page (v1.8; concept
-# daily-plan-multiday-order-page-concept.md, decisions of 2026-10-27 evening:
-# one work order per page, one number).
+# multiday_order - the Multi-day WORK ORDER page (v1.9; concept
+# daily-plan-multiday-order-page-concept.md §10-11, Dave 2026-10-27 evening:
+# one work order per page, the week Mon-Fri across, assemblers typed per day).
 #
 # One page per WORK ORDER (a sales-order line): <app-url>#md=<order>-<item>,
-# the ⧗ link on a board line or a candidate row. Days across the top; the
-# work order's row shows what was planned, what the tablet counted, and what
-# the 06:30 run would propose ("est.") with the headcount PC typed. The
-# other lines of the same order are links under the header - never on the
-# same grid (an assembler works one work order at a time, Dave 10-27).
+# the ⧗ link on a board line or a candidate row. The five weekdays are the
+# columns (◀ ▶ move the week); the 'assemblers' row is a TextBox per day -
+# PC types the number of assemblers on this work order for that day; a blank
+# day carries the previous number, 0 = nobody, no number anywhere = the pool
+# rule. The 'pieces' row shows what was planned / counted, what is on the
+# board today, and what the 06:30 run would propose ("est.") with those
+# numbers. The other lines of the same order are links under the header -
+# never on the same grid (an assembler works one work order at a time).
 #
-# PC decides here: ASSEMBLERS ON THIS WORK ORDER (one number; holds until
-# changed; blank = the pool rule), the order's PARTIALS rule, PAUSE / RESUME
-# (the order's), and BUILT on PC's word (this work order). Today's quantity
-# on the board is still the star's.
+# PC decides here: the headcount per day, the order's PARTIALS rule, PAUSE /
+# RESUME (the order's), and BUILT on PC's word (this work order). Today's
+# quantity on the board is still the star's.
 #
 # The client computes nothing: the grid rows, the day list, the projection,
 # the cost sentence and the labels all come from ship_plan_multiday_get.
 # Writes:
-#   ship_plan_multiday_plan_set   assemblers (line row, dated today), done
+#   ship_plan_multiday_plan_set   assemblers (line row, that day), done,
+#                                 clear_assemblers (back to the pool rule)
 #   ship_plan_multiday_set        partials rule / pause (the notes, Snoozed)
 #   ship_plan_multiday_resume     end a pause early
 #
 # Designer components (custom-HTML form; hasattr-guarded like the others):
 #   lk_plan, lbl_title, btn_refresh, lbl_sub, lbl_paused
 #   flow_siblings: lbl_sib_prompt, lk_sib1..lk_sib3 (the order's other lines)
-#   dg_grid (DataGrid, columns set at runtime) > rp_grid (RepeatingPanel,
-#     item template MultidayGridRow: lbl_line, lbl_d1..lbl_d8, lbl_left), lbl_grid_note
-#   tb_assemblers, btn_save_asm, lbl_cost, lbl_asm_hint
+#   flow_week: lk_prev_week, lbl_week, lk_next_week, lk_this_week
+#   dg_grid (DataGrid, columns line + d1..d5; titles set at runtime) > rp_grid
+#     (RepeatingPanel, item template MultidayGridRow: lbl_line, lbl_dN + tb_dN)
+#   lbl_cost, lbl_grid_note, lk_clear_asm
 #   dd_partials, btn_save_partials, lbl_partials_hint
 #   tb_pause_to, tb_pause_why, btn_pause, btn_resume, lbl_pause_hint
 #   cb_done, lbl_done_hint
@@ -40,9 +44,9 @@ import anvil.server
 # =============================================================================
 
 HELP = """
-**How to read the grid.** One row: this work order. Past days show what was planned and what the assembly tablet counted; today shows what is on the board now; days marked *est.* are what the 06:30 run would propose with the assemblers you typed - nothing there is a commitment, and the page is redrawn every morning. *left* is pieces still to build: ordered minus the tablet count when there is one, otherwise minus the shares already planned on this release (an estimate).
+**How to read the grid.** The week, Monday to Friday (◀ ▶ for another week). Past days show what was planned and what the assembly tablet counted; today shows what is on the board now; days marked *est.* are what the 06:30 run would propose with the assemblers you typed - nothing there is a commitment, and the page is redrawn every morning. *left* (in the header) is pieces still to build: ordered minus the tablet count when there is one, otherwise minus the shares already planned on this release (an estimate).
 
-**Assemblers on this work order** is PC's one number. With it, the morning run gives this work order that many assembler-days of work (capacity / crew, about 165 in each), never more than what is left of the day's multi-day pool. It holds until you change it. Blank = the pool rule: the order takes what the pool allows, smallest line first. The other lines of the order keep the pool rule unless you put people on them too (open them from the links above).
+**Assemblers** is PC's number for each day, typed in the grid. With a number, the morning run gives this work order that many assembler-days of work (capacity / crew, about 165 in each), never more than what is left of the day's multi-day pool. A blank day carries the previous day's number (shown grey); 0 means nobody on it that day and nothing of it is planned; no number anywhere means the pool rule - the order takes what the pool allows, smallest line first. "Back to the pool rule" forgets every number. The other lines of the order keep the pool rule unless you put people on them too (open them from the links above).
 
 **Partials** and **Pause** are the order's: they apply to every line of it on the board. A paused order leaves the plan until the date and comes back first that morning; Resume ends it early. **Built (PC's word)** tells the engine and the retro this work order is done when the tablet has not said so.
 """
@@ -68,11 +72,15 @@ class multiday_order(multiday_orderTemplate):
       self.lk_plan.set_event_handler('click', self._go_plan)
     if hasattr(self, 'btn_refresh'):
       self.btn_refresh.set_event_handler('click', lambda **e: self.load())
-    if hasattr(self, 'btn_save_asm'):
-      self.btn_save_asm.set_event_handler('click', self._save_asm)
-    if hasattr(self, 'tb_assemblers'):
-      self.tb_assemblers.set_event_handler('change', self._cost_preview)
-      self.tb_assemblers.set_event_handler('pressed_enter', self._save_asm)
+    self.week_start = None                 # None = this week
+    if hasattr(self, 'lk_prev_week'):
+      self.lk_prev_week.set_event_handler('click', lambda **e: self._move_week('prev_week'))
+    if hasattr(self, 'lk_next_week'):
+      self.lk_next_week.set_event_handler('click', lambda **e: self._move_week('next_week'))
+    if hasattr(self, 'lk_this_week'):
+      self.lk_this_week.set_event_handler('click', lambda **e: self._move_week(None))
+    if hasattr(self, 'lk_clear_asm'):
+      self.lk_clear_asm.set_event_handler('click', self._clear_asm)
     if hasattr(self, 'btn_save_partials'):
       self.btn_save_partials.set_event_handler('click', self._save_partials)
     if hasattr(self, 'btn_pause'):
@@ -113,8 +121,13 @@ class multiday_order(multiday_orderTemplate):
     set_url_hash(f'md={self.order}-{self.item}')
     self.load()
 
+  def _move_week(self, which):
+    d = self.data or {}
+    self.week_start = d.get(which) if which else None
+    self.load()
+
   def load(self):
-    r = anvil.server.call('ship_plan_multiday_get', self.order, self.item)
+    r = anvil.server.call('ship_plan_multiday_get', self.order, self.item, week_start=self.week_start)
     if r.get('status') != 'success':
       if hasattr(self, 'lbl_title'):
         self.lbl_title.text = f'Multi-day work order {self.order}' + (f'-{self.item}' if self.item else '')
@@ -156,7 +169,7 @@ class multiday_order(multiday_orderTemplate):
     elif more is not None:
       more_txt = f"about {more} more day(s) est."
     else:
-      more_txt = f"more than {len(d.get('projection') or [])} days est."
+      more_txt = 'not done by the end of the week shown (est.)'
     wos = ln.get('work_orders') or []
     if hasattr(self, 'lbl_sub'):
       self.lbl_sub.text = (f"{float(ln.get('qty') or 0):g} pc open · {float(ln.get('inches') or 0):,.0f} in"
@@ -193,22 +206,18 @@ class multiday_order(multiday_orderTemplate):
     if len(sibs) > 3 and hasattr(self, 'lbl_sib_prompt'):
       self.lbl_sib_prompt.text += f" (first 3 shown)"
     if hasattr(self, 'lbl_grid_note'):
-      self.lbl_grid_note.text = ('est. = what the 06:30 run would propose with the assemblers typed below; not a commitment. '
-                                 'left = ordered - tablet count (fact) or - shares planned on this release (estimate). '
-                                 '(rel nnn) = planned on an earlier release of the same line.')
+      self.lbl_grid_note.text = ('assemblers: type a number per day (blank = carried from the day before, 0 = nobody). '
+                                 'est. = what the 06:30 run would propose with those numbers; not a commitment. '
+                                 '(rel nnn) = planned on an earlier release of the same line.  ')
     self._render_grid(d)
     # --- controls ---------------------------------------------------
     if hasattr(self, 'oc_controls'):
       self.oc_controls.visible = self.is_pc
-    if hasattr(self, 'tb_assemblers'):
-      a = ln.get('assemblers')
-      self.tb_assemblers.text = f"{float(a):g}" if a else ''
-    self._cost_preview()
-    if hasattr(self, 'lbl_asm_hint'):
-      when = ln.get('assemblers_set_on')
-      self.lbl_asm_hint.text = ((f"set {when}; " if when and ln.get('assemblers') else '')
-                                + 'holds until you change it · blank = pool rule · counts from the next 06:30 run'
-                                + (" · today's board is set; the star changes today's quantity" if self._on_board_today() else ''))
+    if hasattr(self, 'lbl_week'):
+      self.lbl_week.text = d.get('week_label') or ''
+    if hasattr(self, 'lk_clear_asm'):
+      self.lk_clear_asm.visible = bool(d.get('has_headcount')) and self.is_pc
+    self._cost_line(d)
     on_board = self._on_board_today()
     if hasattr(self, 'dd_partials'):
       self.dd_partials.selected_value = d.get('partials') or 'DECIDE'
@@ -240,25 +249,17 @@ class multiday_order(multiday_orderTemplate):
                                        else 'use it when the floor finished and the tablet is silent'))
 
   # ------------------------------------------------------------------
-  MAX_SLOTS = 8
+  SLOTS = ('d1', 'd2', 'd3', 'd4', 'd5')
 
   def _render_grid(self, d):
-    """The grid in a DataGrid (dg_grid) + MultidayGridRow Labels. Columns
-    are set here: today and the projection first, then the most recent
-    past plan days - eight at most, oldest left; widths come from the
-    designer (dg_grid's columns by id)."""
+    """The week grid in a DataGrid (dg_grid) + MultidayGridRow: columns are
+    the five weekdays (titles set here; widths from the designer); the
+    'assemblers' row carries a TextBox per day."""
     if not (hasattr(self, 'dg_grid') and hasattr(self, 'rp_grid')):
       return
     today = d.get('today') or ''
-    days = d.get('days') or []
-    ahead = [x for x in days if x['date'] >= today][:self.MAX_SLOTS]
-    past = [x for x in days if x['date'] < today]
-    room = self.MAX_SLOTS - len(ahead)
-    shown = (past[-room:] if room > 0 else []) + ahead
-    slots = {}
-    for i, x in enumerate(shown):
-      slots[x['date']] = f'd{i + 1}'
-    used = [slots[x['date']] for x in shown]
+    days = (d.get('days') or [])[:5]
+    self._slot_date = {}
     widths = {}
     for c in (self.dg_grid.columns or []):
       if c.get('width') not in (None, ''):
@@ -268,86 +269,106 @@ class multiday_order(multiday_orderTemplate):
       if cid in widths:
         c['width'] = widths[cid]
       return c
-    self.dg_grid.columns = [col('line', '')] + [col(slots[x['date']], x['label']) for x in shown] + [col('left', 'left')]
-    today_slot = slots.get(today)
+    cols = [col('line', '')]
+    for i, x in enumerate(days):
+      slot = self.SLOTS[i]
+      self._slot_date[slot] = x['date']
+      cols.append(col(slot, x['label']))
+    self.dg_grid.columns = cols
+    today_slot = next((sl for sl, dt in self._slot_date.items() if dt == today), None)
+    asm_by_day = d.get('asm_by_day') or {}
     items = []
     for r in (d.get('grid_rows') or []):
-      it = {'kind': r.get('kind'), 'label': r.get('label'), 'left': r.get('left'),
-            'used': used, 'today_slot': today_slot}
-      for x in shown:
-        it[slots[x['date']]] = (r.get('cells') or {}).get(x['date'])
+      it = {'kind': r.get('kind'), 'label': r.get('label'), 'today_slot': today_slot}
+      if r.get('kind') == 'asm':
+        it['asm'] = {sl: (asm_by_day.get(dt) or {}) for sl, dt in self._slot_date.items()}
+        it['on_asm'] = self._on_asm if self.is_pc else None
+      else:
+        for sl, dt in self._slot_date.items():
+          it[sl] = (r.get('cells') or {}).get(dt)
       items.append(it)
     self.rp_grid.items = items
-    hidden_past = len(past) - (len(shown) - len(ahead))
-    if hasattr(self, 'lbl_grid_note') and hidden_past > 0:
-      self.lbl_grid_note.text = f"{hidden_past} earlier plan day(s) not shown · " + self.lbl_grid_note.text
 
-  # ------------------------------------------------------------------
-  def _cost_preview(self, **event_args):
-    """The cost next to the number (concept §4), for the number in the box:
-    n assemblers = n x one assembler-day = share of the pool; what is left
-    of the crew and the day for everything else."""
-    if not hasattr(self, 'lbl_cost'):
+  def _on_asm(self, slot, text):
+    """A weekday cell changed: save that day's number (blank = no entry,
+    the previous day carries; 0 = nobody)."""
+    dt = (getattr(self, '_slot_date', None) or {}).get(slot)
+    if not dt:
       return
-    d = self.data or {}
-    pool = float(d.get('pool_inches') or 0)
-    asm_day = float(d.get('assembler_day_in') or 0)
-    cap = float(d.get('capacity_inches') or 0)
-    crew = float(d.get('crew') or 0)
-    txt = (self.tb_assemblers.text or '').strip() if hasattr(self, 'tb_assemblers') else ''
-    ln = d.get('line') or {}
-    per = (float(ln.get('inches') or 0) / float(ln.get('qty') or 1)) if float(ln.get('qty') or 0) > 0 else 0
-    if not txt:
-      self.lbl_cost.text = (f"Pool rule: up to {pool:,.0f} in a day for the whole order (about {int(pool / per) if per else 0} pieces of this line "
-                            f"if it had the pool to itself).")
-      return
-    try:
-      n = float(txt)
-    except Exception:
-      self.lbl_cost.text = 'A number, please (blank = pool rule).'
-      return
-    if n <= 0:
-      self.lbl_cost.text = f"0 = the pool rule: up to {pool:,.0f} in a day."
-      return
-    share = n * asm_day
-    capped = share > pool + 1e-9
-    share_eff = min(share, pool)
-    pct = (share_eff / pool * 100) if pool > 0 else 0
-    pcs = int(share_eff / per) if per else 0
-    rest_crew = max(0.0, crew - n)
-    rest_in = max(0.0, cap - share_eff)
-    rem_in = float(ln.get('remaining_inches') or 0)
-    days = int(-(-rem_in // share_eff)) if share_eff > 0 and rem_in > 0 else 0
-    self.lbl_cost.text = (f"{n:g} assembler(s) = {share:,.0f} in a day"
-                          + (f", capped at the pool ({pool:,.0f} in)" if capped else f" = {pct:,.0f}% of the multi-day pool")
-                          + f" ≈ {pcs} pieces of this line a day"
-                          + (f" → about {days} day(s) for the {float(ln.get('remaining') or 0):g} left" if days else '')
-                          + f" · {rest_crew:g} crew left for {rest_in:,.0f} in of other work.")
-
-  def _save_asm(self, **event_args):
-    if not hasattr(self, 'tb_assemblers'):
-      return
-    txt = (self.tb_assemblers.text or '').strip()
+    txt = (text or '').strip()
     if txt:
       try:
         n = float(txt)
       except Exception:
-        alert('Assemblers must be a number (blank clears it).')
+        alert('Assemblers must be a number (blank = carried from the day before, 0 = nobody).')
+        self.load()
         return
       if n < 0 or n > 50:
         alert('Assemblers: 0 to 50.')
+        self.load()
         return
-    d = self.data or {}
-    ln = d.get('line') or {}
-    r = anvil.server.call('ship_plan_multiday_plan_set', self.order, d.get('board_date') or d.get('today'),
+    ln = (self.data or {}).get('line') or {}
+    r = anvil.server.call('ship_plan_multiday_plan_set', self.order, dt,
                           assemblers=(txt if txt else ''), rel=ln.get('rel'), item=self.item)
     if r.get('status') != 'success':
       alert(r.get('message', 'Save failed'))
-      return
-    a = r.get('assemblers')
-    Notification(f"{self.order}-{self.item}: {('%g assembler(s) on it' % float(a)) if a is not None else 'pool rule (headcount cleared)'}",
-                 timeout=4).show()
+    else:
+      a = r.get('assemblers')
+      Notification(f"{self.order}-{self.item} {self._mdy(dt)}: "
+                   + (f"{float(a):g} assembler(s)" if a is not None else 'no entry - carries the day before'),
+                   timeout=3).show()
     self.load()
+
+  def _clear_asm(self, **event_args):
+    if not confirm(f"Forget every headcount on {self.order}-{self.item}? The pool rule applies again from the next 06:30 run."):
+      return
+    ln = (self.data or {}).get('line') or {}
+    r = anvil.server.call('ship_plan_multiday_plan_set', self.order, (self.data or {}).get('today'),
+                          rel=ln.get('rel'), item=self.item, clear_assemblers=True)
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Clear failed'))
+    else:
+      Notification(f"{self.order}-{self.item}: pool rule ({r.get('cleared')} day(s) cleared)", timeout=4).show()
+    self.load()
+
+  # ------------------------------------------------------------------
+  def _cost_line(self, d):
+    """The cost of the number on the first est. day (concept §4): n
+    assemblers = n x one assembler-day = share of the pool; what is left
+    of the crew and the day for everything else."""
+    if not hasattr(self, 'lbl_cost'):
+      return
+    ln = d.get('line') or {}
+    pool = float(d.get('pool_inches') or 0)
+    asm_day = float(d.get('assembler_day_in') or 0)
+    first_est = next((x for x in (d.get('days') or []) if x.get('kind') == 'est'), None)
+    a = ((d.get('asm_by_day') or {}).get(first_est['date']) or {}).get('value') if first_est else None
+    when = f" on {first_est['label'].replace(' est.', '')}" if first_est else ''
+    if ln.get('done'):
+      self.lbl_cost.text = 'Built - nothing left to plan.'
+      return
+    if not first_est:
+      self.lbl_cost.text = ('No day of this week is left to plan - use ▶ for next week.' if (d.get('days') or []) else '')
+      return
+    per = (float(ln.get('inches') or 0) / float(ln.get('qty') or 1)) if float(ln.get('qty') or 0) > 0 else 0
+    rem_in = float(ln.get('remaining_inches') or 0)
+    if a is None:
+      self.lbl_cost.text = (f"Pool rule{when}: the order takes up to {pool:,.0f} in a day, smallest line first"
+                            + (f" (about {int(pool / per)} pieces of this line if it had the pool to itself)." if per else '.'))
+      return
+    if a == 0:
+      self.lbl_cost.text = f"Nobody on it{when}: nothing of this work order is planned that day."
+      return
+    share = a * asm_day
+    capped = share > pool + 1e-9
+    share_eff = min(share, pool)
+    pcs = int(share_eff / per) if per else 0
+    days = int(-(-rem_in // share_eff)) if share_eff > 0 and rem_in > 0 else 0
+    self.lbl_cost.text = (f"{a:g} assembler(s){when} = {share:,.0f} in a day"
+                          + (f", capped at the pool ({pool:,.0f} in)" if capped else f" = {share_eff / pool * 100 if pool else 0:,.0f}% of the multi-day pool")
+                          + f" ≈ {pcs} pieces of this line a day"
+                          + (f" → about {days} day(s) for the {float(ln.get('remaining') or 0):g} left at that pace" if days else '')
+                          + f" · {float(d.get('crew_left') or 0):g} crew left for {float(d.get('inches_left_for_others') or 0):,.0f} in of other work.")
 
   # ------------------------------------------------------------------
   def _save_partials(self, **event_args):
