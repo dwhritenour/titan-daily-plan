@@ -9,7 +9,7 @@ from anvil import *
 # eight day slots 'd1'..'d8' (oldest left; the page picks which days fill
 # them), and 'left'. This row carries one Label per slot so the look is
 # edited in the designer, not in code (Dave, 10-27). Slots the page did not
-# use are hidden.
+# use are removed from the row (not hidden - see the note in the loop).
 #
 # item = {'kind': 'asm_planned' | 'asm_assigned' | 'line' | 'load' | 'tablet',
 #         'label': 'row label', 'd1'..'d8': 'cell text' or None,
@@ -40,7 +40,11 @@ class MultidayGridRow(MultidayGridRowTemplate):
       if lbl is None:
         continue
       if slot not in used:
-        lbl.visible = False
+        # 10-27: the page did not put this slot in dg_grid.columns, and a
+        # DataRowPanel shows any component whose column does not exist in a
+        # full-width band BELOW the cells - hidden or not, that band is the
+        # thick lavender rule Dave saw between rows. Take the Label out.
+        lbl.remove_from_parent()
         continue
       txt = item.get(slot)
       lbl.text = txt if txt not in (None, '') else '-'
