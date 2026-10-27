@@ -43,7 +43,8 @@ Anvil *editing* branch. The `published` branch is what shop-floor users run.
 - `client_code/<form>/__init__.py` — form logic (Python, runs in browser via Skulpt).
   Forms: `ship_plan` (the board; row templates `ShipPlanLineRow`,
   `ShipPlanCandidateRow`, `ShipPlanParamsPanel` under it), `retro`, `retro_review`
-  (`RetroReviewRow`, `RuleCandidateRow`), `orders_shipped`, `wo_completed`, `gates`.
+  (`RetroReviewRow`, `RuleCandidateRow`), `orders_shipped`, `wo_completed`, `gates`,
+  `multiday_order` (the Multi-day Order page, route `#md=<order>`).
 - `client_code/<form>/form_template.html` — EVERY form in this app is a custom-HTML
   form (no designer YAML). Safe to edit when the task says so; keep the Anvil
   slot/component markup intact.
@@ -63,7 +64,8 @@ Anvil *editing* branch. The `published` branch is what shop-floor users run.
   by the agent.
 - `theme/assets/theme.css`, `theme/parameters.yaml` — styling. Editable; see §4.
 - `anvil.yaml` — app config, dependencies, server config. Do not edit unless asked.
-- `.anvil_editor.yaml`, root `__init__.py` — Anvil boilerplate. Never touch.
+- `.anvil_editor.yaml`, root `__init__.py` — Anvil boilerplate. Never touch
+  (a SPEC that adds a form may include its one `unique_ids.forms` line).
 - Line endings: files are CRLF on disk, LF in git (`core.autocrlf=true`). Do not
   convert line endings and do not commit whole-file reformatting.
 
@@ -130,6 +132,8 @@ Anvil *editing* branch. The `published` branch is what shop-floor users run.
 1. `git pull origin master`.
 2. If a `SPEC.md` is referenced, read it fully before touching code. Implement
    it verbatim — no renaming, reformatting, or "improvements" beyond the spec.
+   Read exactly the file the request names (`SPEC.md`, `SPEC_pause.md`, ...); if
+   that file does not exist, STOP and say so — do not open a different spec.
    If a reference in the spec does not resolve (missing component, function,
    column), **report it; do not work around it.**
 3. Make the change. Run `python -m py_compile` on every edited `.py` file.

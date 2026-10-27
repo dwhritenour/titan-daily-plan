@@ -164,6 +164,16 @@ class ShipPlanCandidateRow(ShipPlanCandidateRowTemplate):
         self.btn_add_order.set_event_handler(
           'click', lambda **e: on_add_order(self.item))
 
+    # btn_multiday ('⧗', v1.7.1) - the Multi-day Order page, for a row that
+    # belongs to a multi-day order (started, paused or over the day line);
+    # PC and Sales alike - the page is read-only for Sales.
+    on_multiday = item.get('on_multiday')
+    if hasattr(self, 'btn_multiday'):
+      self.btn_multiday.visible = bool(on_multiday) and bool(item.get('multiday'))
+      if on_multiday:
+        self.btn_multiday.set_event_handler(
+          'click', lambda **e: on_multiday(self.item))
+
   # ---------------------------------------------------------------
   # 075: X06 helpers. The X06 note ALWAYS starts 'Due in YYYY-MM-DD'
   # or 'Due in (no ETA on PO)' (vw_pc_order_flags contract) — the row

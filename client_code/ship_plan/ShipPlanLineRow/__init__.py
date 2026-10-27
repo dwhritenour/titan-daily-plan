@@ -119,7 +119,7 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
         self.lbl_status.tooltip = (f"MULTI-DAY - today's share {md['share']:g} of {md['full']:g}, "
                                    f"day {md['day']} of about {md['about']}. Partials: "
                                    + {'OK': 'ship daily', 'COMPLETE': 'ships when complete'}.get(md.get('partials'), 'PC decides')
-                                   + '. The star sets the share, the partials rule and a pause.')
+                                   + '. The star sets today\'s share; ⧗ opens the Multi-day page (assemblers per day, partials, pause).')
       if md.get('paused_to'):
         chip_text = f"⏸ PAUSED → {md['paused_to']}"
         self.lbl_status.tooltip = (f"Paused by PC until {md['paused_to']}"
@@ -185,6 +185,15 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
       if on_priority:
         self.btn_priority.set_event_handler(
           'click', lambda **e: on_priority(self.item))
+
+    # btn_multiday ('⧗', v1.7.1) - the Multi-day Order page for the order;
+    # visible on every multi-day line (built, paused or sharing), PC and Sales.
+    on_multiday = item.get('on_multiday')
+    if hasattr(self, 'btn_multiday'):
+      self.btn_multiday.visible = bool(on_multiday) and bool(md)
+      if on_multiday:
+        self.btn_multiday.set_event_handler(
+          'click', lambda **e: on_multiday(self.item))
 
     # btn_confirm ('✓') is hand-added in the designer — guarded. Visible
     # only on Proposed lines for PC: one tap = Proposed -> Planned.

@@ -72,6 +72,9 @@ class ship_plan(ship_planTemplate):
     if _hash == 'gates':                    # 2026-10-09: what gets gated (handout)
       open_form('gates')
       return
+    if isinstance(_hash, str) and _hash.startswith('md='):   # v1.7.1: the Multi-day Order page
+      open_form('multiday_order', order=_hash[3:].strip())
+      return
 
     # --- role gate (Wk-2: Sales = read-only) -------------------------
     # TODO(Dave/Chuck): wire to the app's real role source, same pattern
@@ -251,6 +254,7 @@ class ship_plan(ship_planTemplate):
       it['on_add_order'] = self._add_order if self.is_pc else None
       it['on_release_hold'] = self._release_hold if self.is_pc else None   # 071
       it['on_add_due_in'] = self._add_due_in if self.is_pc else None        # 075
+      it['on_multiday'] = self._open_multiday                               # v1.7.1: the page
     self.rp_candidates.items = items
     # Header says what the list IS — gated-last / priority-first
     # (flag system 041), and exactly how much of the match survived
@@ -711,6 +715,7 @@ class ship_plan(ship_planTemplate):
       else:
         it['on_recalc'] = it['on_snooze'] = it['on_remove'] = None
         it['on_priority'] = it['on_confirm'] = it['on_resume'] = None
+      it['on_multiday'] = self._open_multiday          # v1.7.1: the page (read-only for Sales)
     self.rp_plan_lines.items = shown
 
   # =================================================================
@@ -992,7 +997,6 @@ class ship_plan(ship_planTemplate):
     else:
       pnl.add_component(Label(text='Note', bold=True))
     pnl.add_component(tb_note)
-    dd_partials = tb_pause_to = tb_pause_why = None
     if md and md.get('built'):
       pnl.add_component(Label(text='Built — awaiting shipment', bold=True))
       pnl.add_component(Label(text=(f"{order}: this line is built (tablet Complete). It rides on the plan at 0 in "
@@ -1001,45 +1005,19 @@ class ship_plan(ship_planTemplate):
     elif md:
       pnl.add_component(Label(text=f"Daily share — pieces of this line to build today (of {full:g} ordered)", bold=True))
       pnl.add_component(tb_qty)
-      pnl.add_component(Label(text=f"Multi-day order {order} — day {md['day']} of about {md['about']}", bold=True))
-      pnl.add_component(Label(text="When the day's pieces are done (applies to every line of the order):"))
-      dd_partials = DropDown(items=[('Not decided yet', 'DECIDE'),
-                                    ('Ship them that day', 'OK'),
-                                    ('Hold until the order is complete', 'COMPLETE')],
-                             selected_value=md.get('partials') or 'DECIDE')
-      pnl.add_component(dd_partials)
-      pnl.add_component(Label(text='Pause this order until (YYYY-MM-DD) — it comes back first on that morning. Leave empty for no pause.'))
-      tb_pause_to = TextBox(placeholder='YYYY-MM-DD')
-      tb_pause_why = TextBox(placeholder='why? (required to pause)')
-      pnl.add_component(tb_pause_to)
-      pnl.add_component(tb_pause_why)
+      # v1.7.1: the order-level decisions (assemblers per day, partials rule,
+      # pause / resume, built by PC's word) live on the Multi-day Order page
+      pnl.add_component(Label(text=f"Multi-day order {order} — day {md['day']} of about {md['about']} · partials: "
+                                   + {'OK': 'ship each day', 'COMPLETE': 'hold until complete'}.get(md.get('partials'), 'not decided yet'),
+                              bold=True))
+      pnl.add_component(Label(text=('Assemblers per day, the partials rule and a pause are set on the Multi-day page '
+                                    '(⧗ on the row) - one page for the whole order, every day.'), font_size=11))
     else:
       pnl.add_component(Label(text=f'Quantity to plan today (of {full:g} ordered) — this line only', bold=True))
       pnl.add_component(tb_qty)
     if not confirm(f"Priority — {line_label(item)}",
                    content=pnl):
       return
-    if md and dd_partials is not None:
-      new_mode = dd_partials.selected_value
-      pause_to = (tb_pause_to.text or '').strip()
-      pause_why = (tb_pause_why.text or '').strip()
-      if pause_to and not pause_why:
-        alert('A pause needs a reason. Nothing saved; open ★ again.')
-        return
-      if new_mode != (md.get('partials') or 'DECIDE') or pause_to:
-        rm = anvil.server.call('ship_plan_multiday_set', self.plan_date, order,
-                               partials=(new_mode if new_mode != (md.get('partials') or 'DECIDE') else None),
-                               pause_to=(pause_to or None), pause_reason=(pause_why or None))
-        if rm.get('status') != 'success':
-          alert(rm.get('message', 'Multi-day update failed'))
-          self.load_day()
-          return
-        Notification((f"{order}: paused to {rm['paused_to']}" if rm.get('paused_to')
-                      else f"{order}: partials = {rm.get('partials')}") + f" ({rm.get('n_lines')} line(s))",
-                     timeout=4).show()
-        if pause_to:
-          self.load_day()
-          return                           # the lines are Snoozed now; tier / reason no longer apply
     if (dd_reason.selected_value == 'OTHER'
         and not (tb_note.text or '').strip()):
       alert('"Other (see note)" needs the note — that IS the reason. '
@@ -1085,6 +1063,16 @@ class ship_plan(ship_planTemplate):
     if r.get('status') != 'success':
       alert(r.get('message', 'Priority change failed'))
     self.load_day()
+
+  def _open_multiday(self, item):
+    """v1.7.1 (step 3): the Multi-day Order page for the line's order -
+    lines down, days across, assemblers planned per day, partials, pause.
+    Deep link #md=<order> so the page can be shared from the meeting."""
+    order = item.get('nx_order_numb') or item.get('order')
+    if not order:
+      return
+    set_url_hash(f'md={order}')
+    open_form('multiday_order', order=order)
 
   def _resume_order(self, item):
     """v1.6 (step 3): end a multi-day pause early. The order is proposed
