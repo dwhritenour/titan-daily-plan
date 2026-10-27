@@ -2,12 +2,18 @@
   <anvil-component type="ColumnPanel" name="content_panel" container:slot="default">
     <anvil-component type="ColumnPanel" name="oc_header" prop:role="outlined-card" container:grid_position="MDHDRA,MDHDRB">
       <anvil-component type="FlowPanel" name="flow_header" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"0",null]}' container:grid_position="MDHDRC,MDHDRD">
-        <anvil-component type="Link" name="lk_plan" prop:text="← Daily Plan" prop:bold="true" prop:spacing='{"margin":["6",null,"0",null]}' prop:align="left"></anvil-component>
+        <anvil-component type="Link" name="lk_plan" prop:text="← Daily Plan" prop:bold="true" prop:spacing='{"margin":["6",null,"0",null]}'></anvil-component>
+        <anvil-component type="Label" name="lbl_title" prop:text="Multi-day work order" prop:bold="true" prop:font_size="22" prop:spacing='{"margin":["6",null,"0",null],"padding":["0","10","0","10"]}'></anvil-component>
+        <anvil-component type="Button" name="btn_refresh" prop:text="Refresh" prop:role="outlined-button"></anvil-component>
       </anvil-component>
-      <anvil-component type="Button" name="btn_refresh" prop:text="Refresh" prop:role="outlined-button" prop:align="right" container:grid_position="MDHDRC,KCFVVI"></anvil-component>
-      <anvil-component type="Label" name="lbl_title" prop:text="Multi-day order" prop:bold="true" prop:font_size="20" prop:spacing='{"margin":["6",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="JKOHNW,SHGFTO"></anvil-component>
       <anvil-component type="Label" name="lbl_sub" prop:font_size="13" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDHDRE,MDHDRF"></anvil-component>
       <anvil-component type="Label" name="lbl_paused" prop:font_size="13" prop:bold="true" prop:foreground="#B45309" prop:visible="false" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDHDRG,MDHDRH"></anvil-component>
+      <anvil-component type="FlowPanel" name="flow_siblings" prop:align="left" prop:vertical_align="center" prop:visible="false" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDHDRI,MDHDRJ">
+        <anvil-component type="Label" name="lbl_sib_prompt" prop:font_size="12" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+        <anvil-component type="Link" name="lk_sib1" prop:font_size="12" prop:bold="true" prop:visible="false" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+        <anvil-component type="Link" name="lk_sib2" prop:font_size="12" prop:bold="true" prop:visible="false" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+        <anvil-component type="Link" name="lk_sib3" prop:font_size="12" prop:bold="true" prop:visible="false" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+      </anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_grid" prop:role="outlined-card" container:grid_position="MDGRDA,MDGRDB">
       <anvil-component type="DataGrid" name="dg_grid" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="false" prop:columns='[{"id":"line","title":"","data_key":"line","width":"210"},{"id":"d1","title":"d1","data_key":"d1"},{"id":"d2","title":"d2","data_key":"d2"},{"id":"d3","title":"d3","data_key":"d3"},{"id":"d4","title":"d4","data_key":"d4"},{"id":"d5","title":"d5","data_key":"d5"},{"id":"d6","title":"d6","data_key":"d6"},{"id":"d7","title":"d7","data_key":"d7"},{"id":"d8","title":"d8","data_key":"d8"},{"id":"left","title":"left","data_key":"left","width":"70"}]' container:grid_position="MDGRDC,MDGRDD" container:full_width_row="true">
@@ -16,45 +22,36 @@
       <anvil-component type="Label" name="lbl_grid_note" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDGRDE,MDGRDF"></anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_controls" prop:role="outlined-card" container:grid_position="MDCTLA,MDCTLB">
-      <anvil-component type="Label" name="lbl_controls" prop:text="Decisions for this order (PC)" prop:bold="true" prop:spacing='{"margin":["5",null,"5",null],"padding":["0","10","0","0"]}' container:grid_position="MDCTLC,MDCTLD"></anvil-component>
-      <anvil-component type="FlowPanel" name="flow_day" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"5",null],"padding":["8","10","5","10"]}' prop:border="1px solid #000000" container:grid_position="MDCTLE,MDCTLF">
-        <anvil-component type="Label" name="lbl_day_prompt" prop:text="Assemblers planned on" prop:spacing='{"margin":["0",null,"0",null]}' prop:font_size="12"></anvil-component>
-        <anvil-component type="DropDown" name="dd_day" prop:font_size="12" container:width="200"></anvil-component>
-        <anvil-component type="TextBox" name="tb_assemblers" prop:placeholder="blank = pool" prop:role="outlined" prop:font_size="12" prop:margin='["0",null,null,null]' container:width="152.5"></anvil-component>
-        <anvil-component type="Button" name="btn_save_day" prop:text="Save" prop:role="outlined-button" prop:font_size="12" prop:spacing='{"margin":["0",null,"0",null],"padding":["4",null,"4",null]}'></anvil-component>
-        <anvil-component type="Label" name="lbl_day_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["5",null,"0",null]}'></anvil-component>
+      <anvil-component type="Label" name="lbl_controls" prop:text="Decisions (PC)" prop:bold="true" prop:spacing='{"margin":["5",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDCTLC,MDCTLD"></anvil-component>
+      <anvil-component type="FlowPanel" name="flow_asm" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDCTLE,MDCTLF">
+        <anvil-component type="Label" name="lbl_asm_prompt" prop:text="Assemblers on this work order" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+        <anvil-component type="TextBox" name="tb_assemblers" prop:placeholder="blank = pool" prop:role="outlined" container:width="120"></anvil-component>
+        <anvil-component type="Button" name="btn_save_asm" prop:text="Save" prop:role="outlined-button"></anvil-component>
       </anvil-component>
-      <anvil-component type="FlowPanel" name="flow_share" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"5",null],"padding":["5","10","5","10"]}' prop:border="1px solid #000000" container:grid_position="MDCTLG,MDCTLH">
-        <anvil-component type="Label" name="lbl_share_prompt" prop:text="Pieces of" prop:spacing='{"margin":["0",null,"0",null]}' prop:font_size="12"></anvil-component>
-        <anvil-component type="DropDown" name="dd_line" prop:font_size="12" container:width="260"></anvil-component>
-        <anvil-component type="Label" name="lbl_share_on" prop:text="on" prop:spacing='{"margin":["0",null,"0",null]}' prop:font_size="12"></anvil-component>
-        <anvil-component type="DropDown" name="dd_share_day" prop:font_size="12" container:width="200"></anvil-component>
-        <anvil-component type="TextBox" name="tb_share" prop:placeholder="blank = computed" prop:role="outlined" prop:font_size="12" container:width="140"></anvil-component>
-        <anvil-component type="Button" name="btn_save_share" prop:text="Save" prop:role="outlined-button" prop:font_size="12"></anvil-component>
-        <anvil-component type="Label" name="lbl_share_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["8",null,"0",null]}'></anvil-component>
-      </anvil-component>
-      <anvil-component type="FlowPanel" name="flow_partials" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"5",null],"padding":["5","10","5","10"]}' prop:border="1px solid #000000" container:grid_position="MDCTLI,MDCTLJ">
-        <anvil-component type="Label" name="lbl_partials_prompt" prop:text="When the day's pieces are done:" prop:spacing='{"margin":["0",null,"0",null]}' prop:font_size="12"></anvil-component>
-        <anvil-component type="DropDown" name="dd_partials" prop:font_size="12" container:width="260"></anvil-component>
-        <anvil-component type="Button" name="btn_save_partials" prop:text="Save" prop:role="outlined-button" prop:font_size="12"></anvil-component>
+      <anvil-component type="Label" name="lbl_cost" prop:font_size="14" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDCTLG,MDCTLH"></anvil-component>
+      <anvil-component type="Label" name="lbl_asm_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDCTLO,MDCTLP"></anvil-component>
+      <anvil-component type="FlowPanel" name="flow_partials" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDCTLI,MDCTLJ">
+        <anvil-component type="Label" name="lbl_partials_prompt" prop:text="When the day's pieces are done:" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+        <anvil-component type="DropDown" name="dd_partials" container:width="260"></anvil-component>
+        <anvil-component type="Button" name="btn_save_partials" prop:text="Save" prop:role="outlined-button"></anvil-component>
         <anvil-component type="Label" name="lbl_partials_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
       </anvil-component>
-      <anvil-component type="FlowPanel" name="flow_pause" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"5",null],"padding":["5","10","5","10"]}' prop:border="1px solid #000000" container:grid_position="MDCTLK,MDCTLL">
-        <anvil-component type="Label" name="lbl_pause_prompt" prop:text="Pause the order until" prop:spacing='{"margin":["0",null,"0",null]}' prop:font_size="12"></anvil-component>
-        <anvil-component type="TextBox" name="tb_pause_to" prop:placeholder="YYYY-MM-DD" prop:role="outlined" prop:font_size="12" container:width="130"></anvil-component>
-        <anvil-component type="TextBox" name="tb_pause_why" prop:placeholder="why? (required)" prop:role="outlined" prop:font_size="12" container:width="260"></anvil-component>
-        <anvil-component type="Button" name="btn_pause" prop:text="⏸ Pause" prop:role="outlined-button" prop:font_size="12"></anvil-component>
-        <anvil-component type="Button" name="btn_resume" prop:text="▶ Resume" prop:role="outlined-button" prop:visible="false" prop:font_size="12"></anvil-component>
-        <anvil-component type="Label" name="lbl_pause_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["8",null,"0",null]}'></anvil-component>
+      <anvil-component type="FlowPanel" name="flow_pause" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDCTLK,MDCTLL">
+        <anvil-component type="Label" name="lbl_pause_prompt" prop:text="Pause the order until" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
+        <anvil-component type="TextBox" name="tb_pause_to" prop:placeholder="YYYY-MM-DD" prop:role="outlined" container:width="130"></anvil-component>
+        <anvil-component type="TextBox" name="tb_pause_why" prop:placeholder="why? (required)" prop:role="outlined" container:width="260"></anvil-component>
+        <anvil-component type="Button" name="btn_pause" prop:text="⏸ Pause" prop:role="outlined-button"></anvil-component>
+        <anvil-component type="Button" name="btn_resume" prop:text="▶ Resume" prop:role="outlined-button" prop:visible="false"></anvil-component>
+        <anvil-component type="Label" name="lbl_pause_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
       </anvil-component>
-      <anvil-component type="FlowPanel" name="flow_done" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"5",null],"padding":["5","10","5","10"]}' prop:border="1px solid #000000" container:grid_position="MDCTLM,MDCTLN">
-        <anvil-component type="CheckBox" name="cb_done" prop:text="The order is built (PC's word - the tablet is silent)" prop:font_size="12"></anvil-component>
-        <anvil-component type="Label" name="lbl_done_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["5",null,"0",null]}' prop:italic="true"></anvil-component>
+      <anvil-component type="FlowPanel" name="flow_done" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDCTLM,MDCTLN">
+        <anvil-component type="CheckBox" name="cb_done" prop:text="This work order is built (PC's word - the tablet is silent)"></anvil-component>
+        <anvil-component type="Label" name="lbl_done_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
       </anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_help" prop:role="outlined-card" container:grid_position="MDHLPA,MDHLPB">
       <anvil-component type="RichText" name="rt_help" prop:format="markdown" prop:spacing='{"margin":["5",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDHLPC,MDHLPD"></anvil-component>
     </anvil-component>
   </anvil-component>
-  <anvil-component type="Label" name="lbl_app_title" prop:text="Titan Daily Plan — Multi-day Order" prop:bold="true" prop:font_size="26" prop:icon="fa:hourglass-half" container:slot="title"></anvil-component>
+  <anvil-component type="Label" name="lbl_app_title" prop:text="Titan Daily Plan — Multi-day Work Order" prop:bold="true" prop:font_size="26" prop:icon="fa:hourglass-half" container:slot="title"></anvil-component>
 </anvil-form>

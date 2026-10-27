@@ -1065,14 +1065,15 @@ class ship_plan(ship_planTemplate):
     self.load_day()
 
   def _open_multiday(self, item):
-    """v1.7.1 (step 3): the Multi-day Order page for the line's order -
-    lines down, days across, assemblers planned per day, partials, pause.
-    Deep link #md=<order> so the page can be shared from the meeting."""
+    """v1.8: the Multi-day Work Order page for the line - days across,
+    assemblers on it, the order's partials and pause. Deep link
+    #md=<order>-<item> so the page can be shared from the meeting."""
     order = item.get('nx_order_numb') or item.get('order')
     if not order:
       return
-    set_url_hash(f'md={order}')
-    open_form('multiday_order', order=order)
+    it = str(item.get('nx_item_no') or item.get('item') or '').strip()   # v1.8: the page is per work order
+    set_url_hash(f'md={order}-{it}' if it else f'md={order}')
+    open_form('multiday_order', order=order, item=(it or None))
 
   def _resume_order(self, item):
     """v1.6 (step 3): end a multi-day pause early. The order is proposed

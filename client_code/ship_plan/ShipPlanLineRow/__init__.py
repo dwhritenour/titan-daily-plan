@@ -119,7 +119,7 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
         self.lbl_status.tooltip = (f"MULTI-DAY - today's share {md['share']:g} of {md['full']:g}, "
                                    f"day {md['day']} of about {md['about']}. Partials: "
                                    + {'OK': 'ship daily', 'COMPLETE': 'ships when complete'}.get(md.get('partials'), 'PC decides')
-                                   + '. The star sets today\'s share; ⧗ opens the Multi-day page (assemblers per day, partials, pause).')
+                                   + '. The star sets today\'s share; ⧗ opens the Multi-day Work Order page (assemblers on it, partials, pause).')
       if md.get('paused_to'):
         chip_text = f"⏸ PAUSED → {md['paused_to']}"
         self.lbl_status.tooltip = (f"Paused by PC until {md['paused_to']}"

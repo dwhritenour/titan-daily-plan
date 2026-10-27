@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.7.2' # v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.8' # v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2522,7 +2522,19 @@ def _md_clause(note):
 
 
 def _mdkey(m):
-  return (m['nx_order_numb'], m['nx_rel_numb'], str(m['nx_item_no']))
+  """v1.8: order + ITEM. e21 re-releases an order when part of it ships
+  (602392: release 002 shipped 178, the rest came back as release 003, 10-27);
+  the work order, the day count, the headcount and the partials rule belong
+  to the item, not the release."""
+  return (m['nx_order_numb'], str(m['nx_item_no']))
+
+
+def _md_prior_qty(pr, rel):
+  """Shares planned on THIS release of the line (what is still open counts
+  against the current release only - an earlier release shipped)."""
+  if not pr:
+    return 0.0
+  return float((pr.get('qty_by_rel') or {}).get(rel or '', 0.0))
 
 
 def _md_lot(pieces):
@@ -2538,9 +2550,12 @@ def _md_round(pieces):
 
 def _md_prior_shares(cursor, plan_date):
   """Shares already planned for each line on EARLIER published plans:
-  {(order, rel, item): {'qty': sum, 'days': {plan_date, ...}}}. Until the
-  tablet count arrives (step 2) the engine assumes those shares were built
-  (Dave 2026-10-25). 45-day window; a line that shipped is no candidate."""
+  {(order, item): {'qty': sum over releases, 'qty_by_rel': {rel: sum},
+  'days': {plan_date, ...} over releases}}. Until the tablet count arrives
+  the engine assumes those shares were built (Dave 2026-10-25). 45-day
+  window; a line that shipped is no candidate. v1.8: keyed by item - the
+  days and the started state survive an e21 re-release; the quantity is
+  read per release (_md_prior_qty)."""
   cursor.execute("""
       SELECT pl.nx_order_numb, pl.nx_rel_numb, pl.nx_item_no, pl.plan_date, pl.qty_planned
       FROM dbo.pc_ship_plan_line pl
@@ -2552,9 +2567,12 @@ def _md_prior_shares(cursor, plan_date):
   """, (plan_date, plan_date, _MD_PRIOR_LIKE))
   out = {}
   for r in cursor.fetchall():
-    k = (r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))
-    e = out.setdefault(k, {'qty': 0.0, 'days': set()})
-    e['qty'] += float(r['qty_planned'] or 0)
+    k = (r['nx_order_numb'], str(r['nx_item_no']))
+    e = out.setdefault(k, {'qty': 0.0, 'qty_by_rel': {}, 'days': set()})
+    q = float(r['qty_planned'] or 0)
+    e['qty'] += q
+    rel = r['nx_rel_numb'] or ''
+    e['qty_by_rel'][rel] = e['qty_by_rel'].get(rel, 0.0) + q
     e['days'].add(r['plan_date'])
   return out
 
@@ -2583,7 +2601,7 @@ def _md_tablet_facts(cursor, orders, days_back=30):
   """v1.5.1: the Assembly tablet per e21 line of the given orders, from the
   floor taps of the last days_back days (Assign is the board, not the floor;
   v1.6.2: assembly operators only - the Screen kiosk shares the table):
-  {(order, rel, item): {'state': running | paused | done | None,
+  {(order, item): {'state': running | paused | done | None,
                         'count_total': pieces from Count taps (note 'pieces=N',
                         migration 118), 'done_at', 'first_start', 'last_tap'}}."""
   orders = [o for o in set(orders or []) if o]
@@ -2596,6 +2614,9 @@ def _md_tablet_facts(cursor, orders, days_back=30):
       FROM dbo.work_order_events e
       JOIN dbo.work_orders wo ON wo.work_order_id = e.work_order_id
       WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
+        -- v1.8: a work order that shipped / closed belongs to an earlier release
+        -- of the line (602392 rel 002, 10-27) - its taps are not the open line's
+        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
         AND e.event_type IN ('Start', 'Restart', 'Stop', 'Complete', 'Reopen', 'Count')
         AND e.event_at >= DATEADD(day, -%s, CAST(GETDATE() AS DATE))
         -- v1.6.2: work_order_events is shared with the Screen / Element kiosk (OP codes,
@@ -2607,7 +2628,7 @@ def _md_tablet_facts(cursor, orders, days_back=30):
   """, (tuple(orders), int(days_back)))
   out = {}
   for e in cursor.fetchall():
-    k = (e['o'], e['rel'] or '', str(e['item'] or ''))
+    k = (e['o'], str(e['item'] or ''))            # v1.8: item, not release
     t = out.setdefault(k, {'state': None, 'count_total': 0, 'done_at': None,
                            'first_start': None, 'last_tap': None})
     at = e['event_at']
@@ -2635,9 +2656,10 @@ def _md_note(c, ship_complete):
   """Board note for a day-sized share. MUST start 'SPLIT n of N · day d of
   about k' (the prior-share query, _system_prefix, set_qty and recalc read
   that clause). <= 200 chars."""
-  who = c.get('md_assemblers') or 'no assembler assigned yet'
-  if c.get('md_planned_asm'):                 # v1.7: PC's headcount sets the share
-    who = f"{float(c['md_planned_asm']):g} planned ({c.get('md_assemblers') or 'none assigned'})"
+  # v1.8: the headcount is this work order's; the assigned name is the
+  # Supervisor board's business and no longer printed here (Dave 10-27)
+  who = (f"{float(c['md_planned_asm']):g} assembler(s) planned" if c.get('md_planned_asm')
+         else 'pool share')
   mode = c.get('md_mode') or ('COMPLETE' if ship_complete else 'DECIDE')   # v1.6: PC's choice carries over
   tail = _MD_PARTIALS.get(mode, _MD_PARTIALS['DECIDE'])
   if c.get('md_check'):
@@ -2710,40 +2732,41 @@ def _md_assembler_day(cursor, cap):
 
 
 def _md_plan_rows(cursor, plan_date, orders):
-  """v1.7: PC's plan for the day from pc_multiday_plan (121):
-  {order: {'assemblers': n or None, 'done': bool, 'note': str,
-           'lines': {(rel, item): {'share': pcs or None, 'done': bool}}}}"""
+  """v1.8: PC's plan from pc_multiday_plan (121) as it stands for plan_date:
+  {order: {'assemblers': n or None (order-level, legacy v1.7), 'done': bool, 'note': str,
+           'lines': {item: {'assemblers': n or None, 'share': pcs or None, 'done': bool,
+                            'set_on': date}}}}
+  A WORK ORDER's headcount (line row, keyed by item - the release may change)
+  is the newest row dated on or before plan_date: 'two on this work order'
+  holds until PC changes it (Dave 10-27). A share override only counts on its
+  own day. done-by-PC on any earlier day counts."""
   orders = [o for o in set(orders or []) if o]
   if not orders:
     return {}
   cursor.execute("""
-      SELECT nx_order_numb, nx_rel_numb, nx_item_no, assemblers_planned, share_pcs, done_by_pc, note
+      SELECT nx_order_numb, nx_rel_numb, nx_item_no, plan_date, assemblers_planned, share_pcs, done_by_pc, note
       FROM dbo.pc_multiday_plan
-      WHERE plan_date = %s AND nx_order_numb IN %s
-  """, (plan_date, tuple(orders)))
+      WHERE plan_date <= %s AND plan_date >= DATEADD(day, -45, %s) AND nx_order_numb IN %s
+      ORDER BY plan_date, multiday_id
+  """, (plan_date, plan_date, tuple(orders)))
   out = {}
   for r in cursor.fetchall():
     e = out.setdefault(r['nx_order_numb'], {'assemblers': None, 'done': False, 'note': None, 'lines': {}})
+    same_day = (str(r['plan_date'])[:10] == plan_date.isoformat())
     if r['nx_rel_numb'] is None:
-      e['assemblers'] = float(r['assemblers_planned']) if r['assemblers_planned'] is not None else None
-      e['done'] = bool(r['done_by_pc'])
-      e['note'] = r['note']
+      if same_day:
+        e['assemblers'] = float(r['assemblers_planned']) if r['assemblers_planned'] is not None else None
+        e['note'] = r['note']
+      if r['done_by_pc']:
+        e['done'] = True
     else:
-      e['lines'][(r['nx_rel_numb'], str(r['nx_item_no']))] = {
-        'share': float(r['share_pcs']) if r['share_pcs'] is not None else None,
-        'done': bool(r['done_by_pc'])}
-  # done-by-PC on earlier days counts too (the order stays built)
-  cursor.execute("""
-      SELECT DISTINCT nx_order_numb, nx_rel_numb, nx_item_no FROM dbo.pc_multiday_plan
-      WHERE plan_date < %s AND plan_date >= DATEADD(day, -45, %s) AND done_by_pc = 1
-        AND nx_order_numb IN %s
-  """, (plan_date, plan_date, tuple(orders)))
-  for r in cursor.fetchall():
-    e = out.setdefault(r['nx_order_numb'], {'assemblers': None, 'done': False, 'note': None, 'lines': {}})
-    if r['nx_rel_numb'] is None:
-      e['done'] = True
-    else:
-      e['lines'].setdefault((r['nx_rel_numb'], str(r['nx_item_no'])), {'share': None, 'done': False})['done'] = True
+      le = e['lines'].setdefault(str(r['nx_item_no']), {'assemblers': None, 'share': None, 'done': False, 'set_on': None})
+      le['assemblers'] = float(r['assemblers_planned']) if r['assemblers_planned'] is not None else None   # newest wins
+      le['set_on'] = str(r['plan_date'])[:10]
+      if same_day:
+        le['share'] = float(r['share_pcs']) if r['share_pcs'] is not None else None
+      if r['done_by_pc']:
+        le['done'] = True
   return out
 
 
@@ -3003,8 +3026,10 @@ def ship_plan_multiday_plan_set(order, plan_date, assemblers=None, rel=None, ite
     new_share = (None if (share is not None and share <= 0) else share) if share is not None else (row['share_pcs'] if row else None)
     new_done = (1 if done else 0) if done is not None else (int(row['done_by_pc']) if row else 0)
     new_note = (note[:200] if note is not None else (row['note'] if row else None))
-    if rel is not None:
-      new_asm = None                       # headcount is an order-level fact
+    # v1.8: the headcount is a WORK ORDER fact (line row); an order-level row
+    # keeps only done / note
+    if rel is None and asm is not None:
+      new_asm = None
     if row:
       cursor.execute("""
           UPDATE dbo.pc_multiday_plan
@@ -3018,8 +3043,14 @@ def ship_plan_multiday_plan_set(order, plan_date, assemblers=None, rel=None, ite
               (nx_order_numb, plan_date, nx_rel_numb, nx_item_no, assemblers_planned, share_pcs, done_by_pc, note, set_by)
           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
       """, (order, plan_date, rel, item, new_asm, new_share, new_done, new_note, actor))
-    what = (f"assemblers {new_asm if new_asm is not None else 'pool'}" if rel is None
-            else f"share {new_share if new_share is not None else 'computed'}") + (', done' if new_done else '')
+    if done is False and item is not None:
+      # v1.8: un-marking clears PC's 'built' on every row of the line (any day, any release)
+      cursor.execute("""
+          UPDATE dbo.pc_multiday_plan SET done_by_pc = 0, set_by = %s, set_at = GETDATE()
+          WHERE nx_order_numb = %s AND nx_item_no = %s AND done_by_pc = 1
+      """, (actor, order, item))
+    what = (f"assemblers {new_asm if new_asm is not None else 'pool'}" if rel is not None
+            else 'order row') + (f", share {new_share:g}" if new_share is not None else '') + (', done' if new_done else (', not done' if done is False else ''))
     _log_event(cursor, plan_date, order, None, 'ParamChange',
                old_value=(f"asm {row['assemblers_planned']} share {row['share_pcs']} done {row['done_by_pc']}" if row else None),
                new_value=what[:200], actor=actor,
@@ -3056,80 +3087,86 @@ def _md_day_list(plan_rows, projection, today):
   return days
 
 
-def _md_grid_rows(order, lines, rem0, plan_rows, pc_rows, taps, wos, projection, today, asm_day, pool):
-  """v1.7.2: the Multi-day Order page grid as DATA - one dict per row
-  ({'kind', 'label', 'cells': {date: text}, 'left'}) for the page's
-  DataGrid / row template (Labels, editable in the designer, Dave 10-27).
-  Lines down, days across: past plan days (planned / counted), today (on
+def _md_grid_rows(line, rem0, plan_rows, line_asm, taps, projection, today, pool):
+  """v1.8: the Multi-day Work Order page grid as DATA for ONE work order -
+  one dict per row ({'kind', 'label', 'cells': {date: text}, 'left'}) for
+  the page's DataGrid / row template (Labels, Dave 10-27). Days across:
+  past plan days (planned / counted, any release of the item), today (on
   the board), the projection (est.), then what is left."""
   def dkey(v):
     return str(v)[:10]
   day_list = _md_day_list(plan_rows, projection, today)
   days = [x['date'] for x in day_list]
   tkey = today.isoformat()
-  pc_asm = {dkey(r['plan_date']): r['assemblers_planned'] for r in pc_rows if r['nx_rel_numb'] is None}
-  proj_asm = {pr['plan_date']: pr['assemblers_planned'] for pr in projection}
-  assigned = sorted({w['assigned_assembler'] for w in wos if w.get('assigned_assembler')})
-  # per line per day: planned pieces (plan rows) / counted (taps) / projected
+  item = str(line['nx_item_no'])
   planned = {}
   for r in plan_rows:
-    if r['line_status'] in ('Planned', 'Proposed', 'Confirmed', 'Snoozed'):
-      planned[(r['nx_rel_numb'], str(r['nx_item_no']), dkey(r['plan_date']))] = r
+    if r['line_status'] in ('Planned', 'Proposed', 'Confirmed', 'Snoozed') and str(r['nx_item_no']) == item:
+      planned[dkey(r['plan_date'])] = r
   counted, tapped = {}, {}
   for t in taps:
-    k = (t['rel'], str(t['item']), dkey(t['d']))
-    tapped.setdefault(k, []).append(t['event_type'])
+    if str(t['item']) != item:
+      continue
+    d = dkey(t['d'])
+    tapped.setdefault(d, []).append(t['event_type'])
     if t['event_type'] == 'Count':
       m = re.search(r'pieces\s*=\s*(\d+)', t.get('note') or '', re.I)
       if m:
-        counted[k] = counted.get(k, 0) + int(m.group(1))
+        counted[d] = counted.get(d, 0) + int(m.group(1))
   proj = {}
   for pr in projection:
     for l in pr['lines']:
-      proj[(l['rel'], str(l['item']), pr['plan_date'])] = l
+      if str(l['item']) == item:
+        proj[pr['plan_date']] = l
   rows = []
-  rows.append({'kind': 'asm_planned', 'label': 'assemblers planned', 'left': '',
-               'cells': {d: (f"{float(pc_asm[d]):g}" if pc_asm.get(d) is not None
-                             else (f"{float(proj_asm[d]):g}" if proj_asm.get(d) else 'pool')) for d in days}})
-  rows.append({'kind': 'asm_assigned', 'label': 'assemblers assigned', 'left': '',
-               'cells': {d: ('+'.join(assigned) or '-') for d in days}})
-  for l in lines:
-    k2 = (l['nx_rel_numb'], str(l['nx_item_no']))
-    r0 = rem0[k2]
-    cells = {}
-    for d in days:
-      p = planned.get(k2 + (d,))
-      c = counted.get(k2 + (d,))
-      pj = proj.get(k2 + (d,))
-      if p is not None:
-        md = _md_parse_note(p.get('priority_note'))
-        if md and md.get('built'):
-          txt = 'built'
-        else:
-          txt = f"{float(p['qty_planned']):g} planned" + (' (on board)' if d == tkey else '')
-        if p['line_status'] == 'Snoozed':
-          txt = 'paused'
-        if c is not None:
-          txt += f" / {c} counted"
-      elif pj is not None:
-        txt = f"~{float(pj['pieces']):g}" + (' (PC)' if pj.get('override') else '')
+  asm_cells = {}
+  for d in days:
+    p = planned.get(d)
+    if d > tkey:
+      asm_cells[d] = (f"{line_asm:g}" if line_asm else 'pool')
+    elif p is None:
+      asm_cells[d] = '-'
+    else:                                   # what the note said that day (v1.8 / v1.7 wording)
+      mm = re.search(r' · (\d+(?:\.\d+)?) (?:assembler\(s\) planned|planned \()', p.get('priority_note') or '')
+      asm_cells[d] = f"{float(mm.group(1)):g}" if mm else 'pool'
+  rows.append({'kind': 'asm_planned', 'label': 'assemblers on it', 'left': '', 'cells': asm_cells})
+  cells = {}
+  for d in days:
+    p = planned.get(d)
+    c = counted.get(d)
+    pj = proj.get(d)
+    if p is not None:
+      md = _md_parse_note(p.get('priority_note'))
+      if md and md.get('built'):
+        txt = 'built'
       else:
-        txt = '-'
-      cells[d] = txt
-    rows.append({'kind': 'line', 'rel': l['nx_rel_numb'], 'item': str(l['nx_item_no']),
-                 'label': f"-{l['nx_item_no']} {l['nx_sku']} ({float(l['qty'] or 0):g} pc)",
-                 'cells': cells, 'left': ('built' if r0['done'] else f"{r0['remaining']:g}")})
+        txt = f"{float(p['qty_planned']):g} planned" + (' (on board)' if d == tkey else '')
+      if p['line_status'] == 'Snoozed':
+        txt = 'paused'
+      if p.get('nx_rel_numb') and p['nx_rel_numb'] != line['nx_rel_numb']:
+        txt += f" (rel {p['nx_rel_numb']})"
+      if c is not None:
+        txt += f" / {c} counted"
+    elif pj is not None:
+      txt = f"~{float(pj['pieces']):g}" + (' (PC)' if pj.get('override') else '')
+    else:
+      txt = '-'
+    cells[d] = txt
+  rows.append({'kind': 'line', 'rel': line['nx_rel_numb'], 'item': item,
+               'label': f"{line['nx_sku']} ({float(line['qty'] or 0):g} pc open)",
+               'cells': cells, 'left': ('built' if rem0['done'] else f"{rem0['remaining']:g}")})
   loads = {}
   for d in days:
-    v = sum(float(planned[k]['load_inches'] or 0) for k in planned if k[2] == d)
-    if v == 0 and d > tkey:
-      v = next((pr['inches'] for pr in projection if pr['plan_date'] == d), 0.0)
+    p = planned.get(d)
+    v = float(p['load_inches'] or 0) if p else 0.0
+    if v == 0 and d > tkey and proj.get(d):
+      v = float(proj[d]['inches'])
     loads[d] = f"{v:,.0f}" + (' est.' if d > tkey else '')
-  left_in = sum(v['remaining'] * v['per_piece'] for v in rem0.values())
-  rows.append({'kind': 'load', 'label': 'load (in)', 'cells': loads, 'left': f"{left_in:,.0f}"})
+  rows.append({'kind': 'load', 'label': 'load (in)', 'cells': loads,
+               'left': f"{rem0['remaining'] * rem0['per_piece']:,.0f}"})
   tap_cells = {}
   for d in days:
-    ev = [e for k, v in tapped.items() if k[2] == d for e in v]
+    ev = tapped.get(d, [])
     tap_cells[d] = (', '.join(f"{ev.count(x)} {x}" for x in ('Start', 'Count', 'Stop', 'Restart', 'Complete') if ev.count(x))
                     or ('no tap' if d <= tkey else '-'))
   rows.append({'kind': 'tablet', 'label': 'tablet (assembly)', 'cells': tap_cells, 'left': ''})
@@ -3147,13 +3184,14 @@ def _md_grid_markdown(day_list, rows):
 
 
 @anvil.server.callable
-def ship_plan_multiday_get(order, days_ahead=5, days_back=10):
-  """v1.7: everything the Multi-day Order page shows for one order: the
-  lines, the past plan days (share planned, assembly taps / counts), today,
-  PC's plan rows, assigned assemblers, and a PROJECTION of the next business
-  days drawn with the engine's arithmetic (assemblers planned x one
-  assembler-day, pool-capped; lot rounding; one cut line per day). Nothing
-  here is a commitment - the 06:30 run decides."""
+def ship_plan_multiday_get(order, item=None, days_ahead=5, days_back=10):
+  """v1.8: everything the Multi-day WORK ORDER page shows for one line of a
+  sales order (item; the release may change under it): the line, its
+  siblings (links), the past plan days (share planned, assembly taps /
+  counts), today, PC's headcount, and a PROJECTION of the next business
+  days drawn with the engine's arithmetic (per-work-order headcount x one
+  assembler-day, pool rule for the rest, pool as the ceiling; lot rounding).
+  Nothing here is a commitment - the 06:30 run decides."""
   conn = get_connection()
   try:
     cursor = conn.cursor()
@@ -3174,9 +3212,15 @@ def ship_plan_multiday_get(order, days_ahead=5, days_back=10):
     lines = [serialize_row(r) for r in cursor.fetchall()]
     if not lines:
       return {'status': 'error', 'message': f'{order}: no open lines in the feed.'}
+    item = str(item).strip() if item not in (None, '') else None
+    line = next((l for l in lines if str(l['nx_item_no']) == item), None) if item else None
+    if line is None:
+      if item:
+        return {'status': 'error', 'message': f'{order}-{item}: not an open line of the order.'}
+      line = max(lines, key=lambda l: float(l['work_inches'] or 0))   # no item given: the biggest line
+      item = str(line['nx_item_no'])
     cursor.execute("SELECT TOP 1 RTRIM(nx_order_type) AS t FROM dbo.sales_orders_due WHERE nx_order_numb = %s", (order,))
     otype = (cursor.fetchone() or {}).get('t')
-    # past + today plan rows for the order
     cursor.execute("""
         SELECT pl.plan_date, pl.nx_rel_numb, pl.nx_item_no, pl.qty_planned, pl.load_inches, pl.line_status,
                pl.priority_note, h.plan_status
@@ -3185,9 +3229,6 @@ def ship_plan_multiday_get(order, days_ahead=5, days_back=10):
         ORDER BY pl.plan_date
     """, (order, int(days_back), today, nb))
     plan_rows = [serialize_row(r) for r in cursor.fetchall()]
-    # v1.7.1: the projection starts on the first day WITHOUT a plan (today's
-    # board already says what today is); capacity for it is the roster
-    # estimate, the same basis the 06:30 run plans with
     last_planned = max([date.fromisoformat(str(r['plan_date'])[:10]) for r in plan_rows
                         if r['line_status'] in ('Planned', 'Proposed', 'Confirmed')] or [today - timedelta(days=1)])
     start = _next_business_day(max(nb, last_planned + timedelta(days=1)))
@@ -3205,15 +3246,7 @@ def ship_plan_multiday_get(order, days_ahead=5, days_back=10):
     pz = cursor.fetchone()
     paused = ({'to': str(pz['snooze_to_date'])[:10],
                'reason': (_md_parse_note(pz['priority_note']) or {}).get('pause_reason')} if pz else None)
-    # PC's plan rows (today .. ahead)
-    cursor.execute("""
-        SELECT plan_date, nx_rel_numb, nx_item_no, assemblers_planned, share_pcs, done_by_pc, note, set_by, set_at
-        FROM dbo.pc_multiday_plan
-        WHERE nx_order_numb = %s AND plan_date >= DATEADD(day, -%s, %s)
-        ORDER BY plan_date
-    """, (order, int(days_back), today))
-    pc_rows = [serialize_row(r) for r in cursor.fetchall()]
-    # assembly taps per line per day
+    mp = (_md_plan_rows(cursor, nb, [order]) or {}).get(order) or {'assemblers': None, 'done': False, 'lines': {}}
     cursor.execute("""
         SELECT wo.sales_order_rel AS rel, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
                CAST(e.event_at AS DATE) AS d, e.event_type, e.operator, e.note
@@ -3221,6 +3254,7 @@ def ship_plan_multiday_get(order, days_ahead=5, days_back=10):
         JOIN dbo.work_orders wo ON wo.work_order_id = e.work_order_id
         LEFT JOIN dbo.assembly_operators ao ON ao.operator_code = e.operator AND ao.department_id = 1
         WHERE wo.sales_order_number = %s AND wo.status <> 'Cancelled'
+          AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
           AND e.event_type IN ('Start', 'Restart', 'Stop', 'Complete', 'Reopen', 'Count')
           AND (ao.operator_code IS NOT NULL OR e.note LIKE 'dept=Assembly%%')
           AND e.event_at >= DATEADD(day, -%s, %s)
@@ -3229,88 +3263,100 @@ def ship_plan_multiday_get(order, days_ahead=5, days_back=10):
     taps = [serialize_row(r) for r in cursor.fetchall()]
     cursor.execute("""
         SELECT sales_order_rel AS rel, CAST(sales_order_line AS VARCHAR(10)) AS item,
-               assigned_assembler, status, work_order_number
+               work_order_number, status
         FROM dbo.work_orders WHERE sales_order_number = %s AND status <> 'Cancelled'
+          AND status NOT LIKE 'Shipped%%' AND status NOT LIKE 'Closed%%' AND status NOT LIKE 'Invoiced%%'
     """, (order,))
     wos = [serialize_row(r) for r in cursor.fetchall()]
     tab = _md_tablet_facts(cursor, [order])
     prior = _md_prior_shares(cursor, nb + timedelta(days=1))
     modes = _md_order_modes(cursor, nb)
-    # --- projection ----------------------------------------------------
-    pc_by_day = {}
-    for r in pc_rows:
-      d = str(r['plan_date'])[:10]
-      e = pc_by_day.setdefault(d, {'assemblers': None, 'done': False, 'lines': {}})
-      if r['nx_rel_numb'] is None:
-        e['assemblers'] = r['assemblers_planned']; e['done'] = bool(r['done_by_pc'])
-      else:
-        e['lines'][(r['nx_rel_numb'], str(r['nx_item_no']))] = {'share': r['share_pcs'], 'done': bool(r['done_by_pc'])}
+    # --- state of every line (the projection needs the whole order) ---------
     rem = {}
     for l in lines:
-      k = (l['nx_rel_numb'], str(l['nx_item_no']))
+      it = str(l['nx_item_no'])
       need = float(l['qty'] or 0)
-      t = tab.get((order, l['nx_rel_numb'], str(l['nx_item_no']))) or {}
-      pr = prior.get((order, l['nx_rel_numb'], str(l['nx_item_no'])))
-      built = float(t.get('count_total') or 0) or (float(pr['qty']) if pr else 0.0)
-      done = (t.get('state') == 'done') or any(x.get('lines', {}).get(k, {}).get('done') or x.get('done') for x in pc_by_day.values())
+      t = tab.get((order, it)) or {}
+      pr = prior.get((order, it))
+      prior_q = _md_prior_qty(pr, l['nx_rel_numb'])
+      built = float(t.get('count_total') or 0) or prior_q
+      lp = (mp.get('lines') or {}).get(it) or {}
+      done = (t.get('state') == 'done') or bool(mp.get('done')) or bool(lp.get('done'))
       per = (float(l['work_inches'] or 0) / need) if need > 0 else 0.0
-      rem[k] = {'remaining': 0.0 if done else max(0.0, need - built), 'per_piece': per, 'done': done,
-                'built_basis': ('tablet count' if t.get('count_total') else ('tablet Complete' if t.get('state') == 'done' else ('PC' if done else ('earlier shares' if pr else 'nothing'))))}
-    rem0 = {k: dict(v) for k, v in rem.items()}       # v1.7.1: the line list shows the state BEFORE projecting
+      rem[it] = {'remaining': 0.0 if done else max(0.0, need - built), 'per_piece': per, 'done': done,
+                 'asm': (float(lp['assemblers']) if (lp.get('assemblers') or 0) > 0 else None),
+                 'asm_set_on': lp.get('set_on'),
+                 'days_planned': sorted(str(d)[:10] for d in (pr['days'] if pr else [])),
+                 'built_basis': ('tablet count' if t.get('count_total') else ('tablet Complete' if t.get('state') == 'done'
+                                 else ('PC' if done else ('earlier shares' if prior_q else 'nothing'))))}
+    rem0 = {k: dict(v) for k, v in rem.items()}
     projection, d, n = [], start, 0
     while n < int(days_ahead) and any(v['remaining'] >= 1 for v in rem.values()):
       ds = d.isoformat()
-      pc = pc_by_day.get(ds) or {}
-      asm = pc.get('assemblers')
-      budget = min(pool, float(asm) * asm_day) if (asm and asm_day > 0) else pool
       todays, take_in, cut = [], 0.0, False
-      for k, v in sorted(rem.items(), key=lambda kv: kv[1]['remaining'] * kv[1]['per_piece']):
+      order_keys = sorted(rem.items(), key=lambda kv: (0 if kv[1]['asm'] else 1, kv[1]['remaining'] * kv[1]['per_piece']))
+      for it, v in order_keys:
         if v['remaining'] < 1 or v['per_piece'] <= 0:
           continue
-        ov = (pc.get('lines') or {}).get(k, {}).get('share')
-        if ov is not None:
-          pcs = min(v['remaining'], float(ov))
+        left = pool - take_in
+        if v['asm'] and asm_day > 0:
+          share_in = min(v['asm'] * asm_day, max(0.0, left))
+          pcs = _md_round(share_in / v['per_piece'])
+          if pcs < 1 and left > 0:
+            pcs = min(v['remaining'], float(_md_lot(v['remaining'])))
+          if v['remaining'] - pcs < _md_lot(v['remaining']) and v['remaining'] * v['per_piece'] <= left * 1.15:
+            pcs = v['remaining']
+          pcs = min(pcs, v['remaining'])
         elif cut:
           continue
+        elif v['remaining'] * v['per_piece'] <= left + 1e-9:
+          pcs = v['remaining']
         else:
-          left = budget - take_in
-          if v['remaining'] * v['per_piece'] <= left + 1e-9:
+          cut = True
+          pcs = _md_round(left / v['per_piece'])
+          if v['remaining'] - pcs < _md_lot(v['remaining']) and v['remaining'] * v['per_piece'] <= left * 1.15:
             pcs = v['remaining']
-          else:
-            cut = True
-            pcs = _md_round(left / v['per_piece'])
-            if v['remaining'] - pcs < _md_lot(v['remaining']) and v['remaining'] * v['per_piece'] <= left * 1.15:
-              pcs = v['remaining']
         if pcs < 1:
           continue
-        todays.append({'rel': k[0], 'item': k[1], 'pieces': pcs, 'inches': round(pcs * v['per_piece'], 1),
-                       'override': ov is not None})
+        todays.append({'item': it, 'pieces': pcs, 'inches': round(pcs * v['per_piece'], 1), 'override': False})
         take_in += pcs * v['per_piece']
         v['remaining'] -= pcs
-      projection.append({'plan_date': ds, 'assemblers_planned': asm, 'budget_inches': round(budget, 1),
-                         'inches': round(take_in, 1), 'lines': todays, 'estimate': True})
+      projection.append({'plan_date': ds, 'inches': round(take_in, 1), 'lines': todays, 'estimate': True})
       n += 1
       d = _next_business_day(d + timedelta(days=1))
-    left_in = sum(v['remaining'] * v['per_piece'] for v in rem.values())
-    day_list = _md_day_list(plan_rows, projection, today)
-    grid_rows = _md_grid_rows(order, lines, rem0, plan_rows, pc_rows, taps, wos, projection, today, asm_day, pool)
+    r0 = rem0[item]
+    my_proj_days = sum(1 for pr in projection if any(l['item'] == item for l in pr['lines']))
+    left_in = r0['remaining'] * r0['per_piece']
+    day_list = _md_day_list([r for r in plan_rows if str(r['nx_item_no']) == item], projection, today)
+    grid_rows = _md_grid_rows(line, r0, plan_rows, r0['asm'], taps, projection, today, pool)
+    share_in = (min(pool, r0['asm'] * asm_day) if r0['asm'] else pool)
+    crew = float(cap.get('effective_crew') or 0)
+    siblings = [{'rel': l['nx_rel_numb'], 'item': str(l['nx_item_no']), 'sku': l['nx_sku'],
+                 'qty': float(l['qty'] or 0), 'inches': float(l['work_inches'] or 0),
+                 'remaining': rem0[str(l['nx_item_no'])]['remaining'], 'done': rem0[str(l['nx_item_no'])]['done'],
+                 'asm': rem0[str(l['nx_item_no'])]['asm']}
+                for l in lines if str(l['nx_item_no']) != item]
     return {'status': 'success', 'order': order, 'order_type': otype,
-            'customer': _customer_label(lines[0].get('nx_cust_name'), lines[0].get('nx_cust_city'),
-                                        lines[0].get('nx_cust_state'), lines[0].get('nx_shipto_code')),
-            'ship_by': lines[0].get('ship_by'), 'partials': modes.get(order) or 'DECIDE',
-            'lines': [{'rel': l['nx_rel_numb'], 'item': l['nx_item_no'], 'sku': l['nx_sku'], 'desc': l.get('nx_sku_desc'),
-                       'qty': float(l['qty'] or 0), 'inches': float(l['work_inches'] or 0),
-                       'remaining': rem0[(l['nx_rel_numb'], str(l['nx_item_no']))]['remaining'],
-                       'built_basis': rem0[(l['nx_rel_numb'], str(l['nx_item_no']))]['built_basis'],
-                       'done': rem0[(l['nx_rel_numb'], str(l['nx_item_no']))]['done'],
-                       'assigned': [w['assigned_assembler'] for w in wos if w['rel'] == l['nx_rel_numb'] and w['item'] == str(l['nx_item_no']) and w.get('assigned_assembler')]}
-                      for l in lines],
-            'plan_rows': plan_rows, 'pc_rows': pc_rows, 'taps': taps, 'work_orders': wos,
+            'customer': _customer_label(line.get('nx_cust_name'), line.get('nx_cust_city'),
+                                        line.get('nx_cust_state'), line.get('nx_shipto_code')),
+            'ship_by': line.get('ship_by'), 'partials': modes.get(order) or 'DECIDE',
+            'line': {'rel': line['nx_rel_numb'], 'item': item, 'sku': line['nx_sku'], 'desc': line.get('nx_sku_desc'),
+                     'qty': float(line['qty'] or 0), 'inches': float(line['work_inches'] or 0),
+                     'remaining': r0['remaining'], 'remaining_inches': round(left_in, 1),
+                     'built_basis': r0['built_basis'], 'done': r0['done'],
+                     'assemblers': r0['asm'], 'assemblers_set_on': r0['asm_set_on'],
+                     'days_planned': r0['days_planned'], 'day_no': len(r0['days_planned']) + 1,
+                     'work_orders': [w['work_order_number'] for w in wos if w['item'] == item]},
+            'siblings': siblings,
             'pool_inches': round(pool, 1), 'assembler_day_in': round(asm_day, 1),
-            'crew': cap.get('effective_crew'), 'capacity_inches': round(cap_in, 1),
-            'projection': projection, 'remaining_inches': round(left_in, 1),
-            'days_left_est': len(projection) if left_in <= 0.5 else None,
-            'paused': paused, 'today': today.isoformat(), 'board_date': nb.isoformat(),
+            'crew': crew, 'capacity_inches': round(cap_in, 1),
+            'share_inches': round(share_in, 1), 'share_pct_of_pool': round(100.0 * share_in / pool, 0) if pool > 0 else None,
+            'crew_left': round(max(0.0, crew - (r0['asm'] or 0)), 1),
+            'inches_left_for_others': round(max(0.0, cap_in - share_in), 0),
+            'days_more_est': my_proj_days if left_in <= 0.5 or my_proj_days < int(days_ahead) else None,
+            'projection': projection, 'paused': paused, 'today': today.isoformat(), 'board_date': nb.isoformat(),
+            'on_board': any(str(r['plan_date'])[:10] == nb.isoformat() and r['line_status'] in ('Planned', 'Proposed', 'Confirmed')
+                            for r in plan_rows),
             'projection_start': start.isoformat(),
             'days': day_list, 'grid_rows': grid_rows, 'grid_md': _md_grid_markdown(day_list, grid_rows)}
   except Exception as e:
@@ -3340,18 +3386,18 @@ def _md_candidate_text(cursor, rows):
   max_line = cap * ap['fill_pct'] * ap['max_line_pct']
   by_order, started_orders = {}, {}
   for r in rows:
-    k = (r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))
+    k = (r['nx_order_numb'], str(r['nx_item_no']))          # v1.8: item key
     gk = (r['nx_order_numb'], str(r.get('ship_by_date') or '')[:10])
     by_order[gk] = by_order.get(gk, 0.0) + float(r.get('load_inches') or 0)
     pr = prior.get(k)
     if pr:
       e = started_orders.setdefault(r['nx_order_numb'], {'qty': 0.0, 'full': 0.0, 'first': None})
-      e['qty'] += pr['qty']; e['full'] += float(r.get('qty_open') or 0)
+      e['qty'] += _md_prior_qty(pr, r['nx_rel_numb']); e['full'] += float(r.get('qty_open') or 0)
       d0 = min(pr['days'])
       e['first'] = d0 if e['first'] is None or d0 < e['first'] else e['first']
   out = {}
   for r in rows:
-    k = (r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))
+    k = (r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))   # the caller's key (row identity)
     o = r['nx_order_numb']
     gk = (o, str(r.get('ship_by_date') or '')[:10])
     if o in paused:
@@ -3979,11 +4025,12 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
         day_no = len(gdays) + 1
         budget = max(0.0, min(md_pool - md_used, target - used))
         mp = md_plan.get(order) or {}
-        planned_asm = mp.get('assemblers')
-        if planned_asm and asm_day > 0:
-          # v1.7: PC planned a headcount -> share = assemblers x one
-          # assembler-day, never more than what is left of the pool
-          budget = max(0.0, min(budget, planned_asm * asm_day))
+        # v1.8: the headcount is PER WORK ORDER (Dave 10-27: an assembler works
+        # one work order at a time). A line with people gets its own share -
+        # assemblers x one assembler-day - first; lines nobody was put on keep
+        # the pool rule with what is left; the pool is the ceiling on the order.
+        planned_asm = sum(float(lp.get('assemblers') or 0) for lp in (mp.get('lines') or {}).values()
+                          if (lp.get('assemblers') or 0) > 0 and not lp.get('done')) or None
         if not started and budget < 0.25 * md_pool and not planned_asm:
           # a NEW multi-day order does not start on the scraps of the pool
           # (a 17-piece day 1 is a trickle, not a start); it waits its turn
@@ -4001,7 +4048,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
           li = float(m.get('load_inches') or 0)
           pr = md_prior.get(_mdkey(m))
           m['md_full'] = need
-          m['md_prior'] = float(pr['qty']) if pr else 0.0
+          m['md_prior'] = _md_prior_qty(pr, m['nx_rel_numb'])   # v1.8: this release's shares only
           m['md_days'] = sorted(pr['days']) if pr else []
           if need <= 0 or li <= 0:
             continue                          # zero-touch sibling: rides as today
@@ -4014,7 +4061,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
             m['md_prior'] = float(t['count_total'])
           else:
             remaining = max(0.0, need - m['md_prior'])
-          lp = (mp.get('lines') or {}).get((m['nx_rel_numb'], str(m['nx_item_no']))) or {}
+          lp = (mp.get('lines') or {}).get(str(m['nx_item_no'])) or {}
           pc_done = bool(mp.get('done')) or bool(lp.get('done'))
           if t.get('state') == 'done' or pc_done or remaining < 1:
             m['md_done'] = True               # built (tablet / PC) or shares cover it: visible at 0 in
@@ -4023,14 +4070,35 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
             m['load_inches'] = 0.0
             continue
           m['md_share_override'] = lp.get('share')     # v1.7: PC typed pieces for this line today
+          m['md_line_asm'] = float(lp['assemblers']) if (lp.get('assemblers') or 0) > 0 else None   # v1.8
           work.append((m, remaining, per_piece))
           rem_total_in += remaining * per_piece
-        work.sort(key=lambda t: t[1] * t[2])  # least remaining load first
+        # v1.8: work orders WITH a headcount first (their own share), then the
+        # pool rule for the rest, least remaining load first
+        work.sort(key=lambda t: (0 if t[0].get('md_line_asm') else 1, t[1] * t[2]))
         take_in, taken, cut = 0.0, [], False
         for m, remaining, per_piece in work:
           left = budget - take_in
           if m.get('md_share_override') is not None:
             pieces = min(remaining, float(m['md_share_override']))   # v1.7: PC's number wins the arithmetic
+            if pieces < 1:
+              m['md_wait'] = True
+              continue
+            m['md_qty'] = pieces
+            m['load_inches'] = round(pieces * per_piece, 2)
+            take_in += m['load_inches']
+            taken.append(m)
+            continue
+          if m.get('md_line_asm') and asm_day > 0:
+            # v1.8: n assemblers on this work order = n assembler-days of it,
+            # rounded down to a lot, at least one lot, never over the pool left
+            share_in = min(m['md_line_asm'] * asm_day, max(0.0, left))
+            pieces = _md_round(share_in / per_piece) if per_piece > 0 else 0.0
+            if pieces < 1 and left > 0:
+              pieces = min(remaining, float(_md_lot(remaining)))
+            if remaining - pieces < _md_lot(remaining) and remaining * per_piece <= left * 1.15:
+              pieces = remaining
+            pieces = min(pieces, remaining)
             if pieces < 1:
               m['md_wait'] = True
               continue
@@ -4082,14 +4150,22 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
                              'started': started, 'day': day_no})
           split_needed.extend(members)
           continue
-        day_rate = (min(md_pool, planned_asm * asm_day) if (planned_asm and asm_day > 0) else md_pool)
-        about = (day_no - 1) + max(1, int(-(-rem_total_in // day_rate))) if day_rate > 0 else day_no
+        # v1.8: about = the slowest work order - a line with people runs at its
+        # own rate; the rest share whatever the pool leaves (in parallel)
+        hc_in = sum(float(m.get('md_line_asm') or 0) * asm_day for m, r_, pp in work if m.get('md_line_asm'))
+        rest_rate = max(1.0, md_pool - min(hc_in, md_pool)) if md_pool > 0 else 1.0
+        rest_in = sum(r_ * pp for m, r_, pp in work if not m.get('md_line_asm'))
+        days_left = [int(-(-rest_in // rest_rate))] if rest_in > 0 else []
+        for m, r_, pp in work:
+          if m.get('md_line_asm') and asm_day > 0:
+            days_left.append(int(-(-(r_ * pp) // min(md_pool, m['md_line_asm'] * asm_day))))
+        about = (day_no - 1) + max(1, max(days_left) if days_left else 1)
         for m in members:
           m['multiday'] = True
           m['md_day'] = day_no
           m['md_about'] = about
           m['md_assemblers'] = md_asm.get(order)
-          m['md_planned_asm'] = planned_asm
+          m['md_planned_asm'] = m.get('md_line_asm')     # v1.8: this work order's headcount
           m['md_mode'] = md_modes.get(order)
           m['md_started'] = started
           m['group_inches'] = take_in
