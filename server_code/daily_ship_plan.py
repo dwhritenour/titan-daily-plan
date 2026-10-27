@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.7.1' # v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.7.2' # v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -3056,19 +3056,17 @@ def _md_day_list(plan_rows, projection, today):
   return days
 
 
-def _md_grid_markdown(order, lines, rem0, plan_rows, pc_rows, taps, wos, projection, today, asm_day, pool):
-  """v1.7.1: the Multi-day Order page grid as a markdown table (the page's
-  RichText renders it; the gates page uses the same device). Lines down,
-  days across: past plan days (planned / counted), today (on the board),
-  the projection (est.), then what is left."""
+def _md_grid_rows(order, lines, rem0, plan_rows, pc_rows, taps, wos, projection, today, asm_day, pool):
+  """v1.7.2: the Multi-day Order page grid as DATA - one dict per row
+  ({'kind', 'label', 'cells': {date: text}, 'left'}) for the page's
+  DataGrid / row template (Labels, editable in the designer, Dave 10-27).
+  Lines down, days across: past plan days (planned / counted), today (on
+  the board), the projection (est.), then what is left."""
   def dkey(v):
     return str(v)[:10]
   day_list = _md_day_list(plan_rows, projection, today)
   days = [x['date'] for x in day_list]
-  labels = {x['date']: x['label'] for x in day_list}
   tkey = today.isoformat()
-  def dlabel(d):
-    return labels[d]
   pc_asm = {dkey(r['plan_date']): r['assemblers_planned'] for r in pc_rows if r['nx_rel_numb'] is None}
   proj_asm = {pr['plan_date']: pr['assemblers_planned'] for pr in projection}
   assigned = sorted({w['assigned_assembler'] for w in wos if w.get('assigned_assembler')})
@@ -3089,17 +3087,16 @@ def _md_grid_markdown(order, lines, rem0, plan_rows, pc_rows, taps, wos, project
   for pr in projection:
     for l in pr['lines']:
       proj[(l['rel'], str(l['item']), pr['plan_date'])] = l
-  head = '| | ' + ' | '.join(dlabel(d) for d in days) + ' | left |'
-  sep = '|---|' + '---|' * len(days) + '---|'
-  rows = [head, sep]
-  rows.append('| assemblers planned | ' + ' | '.join(
-    (f"{float(pc_asm[d]):g}" if pc_asm.get(d) is not None else (f"{float(proj_asm[d]):g}" if proj_asm.get(d) else 'pool'))
-    for d in days) + ' | |')
-  rows.append('| assemblers assigned | ' + ' | '.join(('+'.join(assigned) or '-') for d in days) + ' | |')
+  rows = []
+  rows.append({'kind': 'asm_planned', 'label': 'assemblers planned', 'left': '',
+               'cells': {d: (f"{float(pc_asm[d]):g}" if pc_asm.get(d) is not None
+                             else (f"{float(proj_asm[d]):g}" if proj_asm.get(d) else 'pool')) for d in days}})
+  rows.append({'kind': 'asm_assigned', 'label': 'assemblers assigned', 'left': '',
+               'cells': {d: ('+'.join(assigned) or '-') for d in days}})
   for l in lines:
     k2 = (l['nx_rel_numb'], str(l['nx_item_no']))
     r0 = rem0[k2]
-    cells = []
+    cells = {}
     for d in days:
       p = planned.get(k2 + (d,))
       c = counted.get(k2 + (d,))
@@ -3118,24 +3115,35 @@ def _md_grid_markdown(order, lines, rem0, plan_rows, pc_rows, taps, wos, project
         txt = f"~{float(pj['pieces']):g}" + (' (PC)' if pj.get('override') else '')
       else:
         txt = '-'
-      cells.append(txt)
-    left = 'built' if r0['done'] else f"{r0['remaining']:g}"
-    rows.append(f"| -{l['nx_item_no']} {l['nx_sku']} ({float(l['qty'] or 0):g} pc) | " + ' | '.join(cells) + f" | {left} |")
-  # load row
-  loads = []
+      cells[d] = txt
+    rows.append({'kind': 'line', 'rel': l['nx_rel_numb'], 'item': str(l['nx_item_no']),
+                 'label': f"-{l['nx_item_no']} {l['nx_sku']} ({float(l['qty'] or 0):g} pc)",
+                 'cells': cells, 'left': ('built' if r0['done'] else f"{r0['remaining']:g}")})
+  loads = {}
   for d in days:
     v = sum(float(planned[k]['load_inches'] or 0) for k in planned if k[2] == d)
     if v == 0 and d > tkey:
       v = next((pr['inches'] for pr in projection if pr['plan_date'] == d), 0.0)
-    loads.append(f"{v:,.0f}" + (' est.' if d > tkey else ''))
+    loads[d] = f"{v:,.0f}" + (' est.' if d > tkey else '')
   left_in = sum(v['remaining'] * v['per_piece'] for v in rem0.values())
-  rows.append('| load (in) | ' + ' | '.join(loads) + f" | {left_in:,.0f} |")
-  tap_cells = []
+  rows.append({'kind': 'load', 'label': 'load (in)', 'cells': loads, 'left': f"{left_in:,.0f}"})
+  tap_cells = {}
   for d in days:
     ev = [e for k, v in tapped.items() if k[2] == d for e in v]
-    tap_cells.append(', '.join(f"{ev.count(x)} {x}" for x in ('Start', 'Count', 'Stop', 'Restart', 'Complete') if ev.count(x)) or ('no tap' if d <= tkey else '-'))
-  rows.append('| tablet (assembly) | ' + ' | '.join(tap_cells) + ' | |')
-  return '\n'.join(rows)
+    tap_cells[d] = (', '.join(f"{ev.count(x)} {x}" for x in ('Start', 'Count', 'Stop', 'Restart', 'Complete') if ev.count(x))
+                    or ('no tap' if d <= tkey else '-'))
+  rows.append({'kind': 'tablet', 'label': 'tablet (assembly)', 'cells': tap_cells, 'left': ''})
+  return rows
+
+
+def _md_grid_markdown(day_list, rows):
+  """v1.7.2: the same grid as a markdown table (server console / texts)."""
+  days = [x['date'] for x in day_list]
+  out = ['| | ' + ' | '.join(x['label'] for x in day_list) + ' | left |',
+         '|---|' + '---|' * len(days) + '---|']
+  for r in rows:
+    out.append(f"| {r['label']} | " + ' | '.join(r['cells'].get(d, '-') for d in days) + f" | {r['left']} |")
+  return '\n'.join(out)
 
 
 @anvil.server.callable
@@ -3284,6 +3292,8 @@ def ship_plan_multiday_get(order, days_ahead=5, days_back=10):
       n += 1
       d = _next_business_day(d + timedelta(days=1))
     left_in = sum(v['remaining'] * v['per_piece'] for v in rem.values())
+    day_list = _md_day_list(plan_rows, projection, today)
+    grid_rows = _md_grid_rows(order, lines, rem0, plan_rows, pc_rows, taps, wos, projection, today, asm_day, pool)
     return {'status': 'success', 'order': order, 'order_type': otype,
             'customer': _customer_label(lines[0].get('nx_cust_name'), lines[0].get('nx_cust_city'),
                                         lines[0].get('nx_cust_state'), lines[0].get('nx_shipto_code')),
@@ -3302,8 +3312,7 @@ def ship_plan_multiday_get(order, days_ahead=5, days_back=10):
             'days_left_est': len(projection) if left_in <= 0.5 else None,
             'paused': paused, 'today': today.isoformat(), 'board_date': nb.isoformat(),
             'projection_start': start.isoformat(),
-            'days': _md_day_list(plan_rows, projection, today),
-            'grid_md': _md_grid_markdown(order, lines, rem0, plan_rows, pc_rows, taps, wos, projection, today, asm_day, pool)}
+            'days': day_list, 'grid_rows': grid_rows, 'grid_md': _md_grid_markdown(day_list, grid_rows)}
   except Exception as e:
     return {'status': 'error', 'message': f'Multi-day page load failed: {e}'}
   finally:

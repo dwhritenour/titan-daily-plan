@@ -4,7 +4,7 @@ import anvil.server
 
 
 # =============================================================================
-# multiday_order - the Multi-day Order page (v1.7.1, step 3 of the multi-day
+# multiday_order - the Multi-day Order page (v1.7.1 / v1.7.2, step 3 of the multi-day
 # build; concept daily-plan-multiday-order-page-concept.md, decisions of
 # 2026-10-27).
 #
@@ -16,7 +16,7 @@ import anvil.server
 # word); the star on the board keeps the one-line, one-day edits (tier,
 # reason, note, today's quantity).
 #
-# The client computes nothing: the grid (markdown), the day list, the
+# The client computes nothing: the grid rows, the day list, the
 # projection and the labels all come from ship_plan_multiday_get. Writes:
 #   ship_plan_multiday_plan_set   assemblers per day, share per line-day,
 #                                 done (pc_multiday_plan, migration 121)
@@ -27,7 +27,8 @@ import anvil.server
 #
 # Designer components (custom-HTML form; hasattr-guarded like the others):
 #   lk_plan, lbl_title, btn_refresh, lbl_sub, lbl_paused
-#   rt_grid (RichText, markdown), lbl_grid_note
+#   dg_grid (DataGrid, columns set at runtime) > rp_grid (RepeatingPanel,
+#     item template MultidayGridRow: lbl_line, lbl_d1..lbl_d8, lbl_left), lbl_grid_note
 #   dd_day, tb_assemblers, btn_save_day, lbl_day_hint
 #   dd_line, dd_share_day, tb_share, btn_save_share, lbl_share_hint
 #   dd_partials, btn_save_partials, lbl_partials_hint
@@ -158,13 +159,11 @@ class multiday_order(multiday_orderTemplate):
       if pz:
         self.lbl_paused.text = (f"⏸ PAUSED to {pz.get('to')}" + (f": {pz.get('reason')}" if pz.get('reason') else '')
                                 + ' - it comes back first that morning.')
-    if hasattr(self, 'rt_grid'):
-      self.rt_grid.format = 'markdown'
-      self.rt_grid.content = d.get('grid_md') or '(no grid)'
     if hasattr(self, 'lbl_grid_note'):
       self.lbl_grid_note.text = ('est. = what the 06:30 run would propose with the assemblers planned; not a commitment. '
                                  'left = ordered - tablet count (fact) or - shares planned (estimate). '
                                  + ' · '.join(f"-{l['item']}: {l.get('built_basis')}" for l in lines))
+    self._render_grid(d)
     # --- controls ---------------------------------------------------
     if hasattr(self, 'oc_controls'):
       self.oc_controls.visible = self.is_pc
@@ -227,6 +226,51 @@ class multiday_order(multiday_orderTemplate):
                                        else 'the engine rides the order at 0 in and the retro records PC-reported'))
 
   # ------------------------------------------------------------------
+  MAX_SLOTS = 8
+
+  def _render_grid(self, d):
+    """v1.7.2: the grid in a DataGrid (dg_grid) + MultidayGridRow Labels.
+    Columns are set here: the days that fit the eight slots - today and
+    the projection first, then the most recent past plan days - oldest
+    left; the row template hides the slots not used."""
+    if not (hasattr(self, 'dg_grid') and hasattr(self, 'rp_grid')):
+      return
+    today = d.get('today') or ''
+    days = d.get('days') or []
+    ahead = [x for x in days if x['date'] >= today][:self.MAX_SLOTS]
+    past = [x for x in days if x['date'] < today]
+    room = self.MAX_SLOTS - len(ahead)
+    shown = (past[-room:] if room > 0 else []) + ahead
+    slots = {}
+    for i, x in enumerate(shown):
+      slots[x['date']] = f'd{i + 1}'
+    used = [slots[x['date']] for x in shown]
+    # widths come from the designer (dg_grid's columns by id); only the
+    # titles and the set of visible slots are decided here
+    widths = {}
+    for c in (self.dg_grid.columns or []):
+      if c.get('width') not in (None, ''):
+        widths[c.get('id')] = c.get('width')
+    def col(cid, title):
+      c = {'id': cid, 'title': title, 'data_key': cid}
+      if cid in widths:
+        c['width'] = widths[cid]
+      return c
+    cols = [col('line', '')] + [col(slots[x['date']], x['label']) for x in shown] + [col('left', 'left')]
+    self.dg_grid.columns = cols
+    today_slot = slots.get(today)
+    items = []
+    for r in (d.get('grid_rows') or []):
+      it = {'kind': r.get('kind'), 'label': r.get('label'), 'left': r.get('left'),
+            'used': used, 'today_slot': today_slot}
+      for x in shown:
+        it[slots[x['date']]] = (r.get('cells') or {}).get(x['date'])
+      items.append(it)
+    self.rp_grid.items = items
+    hidden_past = len(past) - (len(shown) - len(ahead))
+    if hasattr(self, 'lbl_grid_note') and hidden_past > 0:
+      self.lbl_grid_note.text = f"{hidden_past} earlier plan day(s) not shown · " + self.lbl_grid_note.text
+
   def _day_change(self, **event_args):
     """Prefill the headcount box with what PC planned for the chosen day."""
     if not (hasattr(self, 'dd_day') and hasattr(self, 'tb_assemblers')):

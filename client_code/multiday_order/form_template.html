@@ -10,7 +10,9 @@
       <anvil-component type="Label" name="lbl_paused" prop:font_size="13" prop:bold="true" prop:foreground="#B45309" prop:visible="false" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDHDRG,MDHDRH"></anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_grid" prop:role="outlined-card" container:grid_position="MDGRDA,MDGRDB">
-      <anvil-component type="RichText" name="rt_grid" prop:format="markdown" prop:spacing='{"margin":["5",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDGRDC,MDGRDD"></anvil-component>
+      <anvil-component type="DataGrid" name="dg_grid" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="false" prop:columns='[{"id":"line","title":"","data_key":"line","width":"230"},{"id":"d1","title":"d1","data_key":"d1"},{"id":"d2","title":"d2","data_key":"d2"},{"id":"d3","title":"d3","data_key":"d3"},{"id":"d4","title":"d4","data_key":"d4"},{"id":"d5","title":"d5","data_key":"d5"},{"id":"d6","title":"d6","data_key":"d6"},{"id":"d7","title":"d7","data_key":"d7"},{"id":"d8","title":"d8","data_key":"d8"},{"id":"left","title":"left","data_key":"left","width":"70"}]' container:grid_position="MDGRDC,MDGRDD" container:full_width_row="true">
+        <anvil-component type="RepeatingPanel" name="rp_grid" prop:item_template="Titan_Daily_Plan_v1_0.multiday_order.MultidayGridRow" prop:margin='["0",null,"0",null]'></anvil-component>
+      </anvil-component>
       <anvil-component type="Label" name="lbl_grid_note" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDGRDE,MDGRDF"></anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_controls" prop:role="outlined-card" container:grid_position="MDCTLA,MDCTLB">
