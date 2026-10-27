@@ -66,7 +66,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.7.3'   # 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.7.4'   # 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 # retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
@@ -523,8 +523,8 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                          AND wo.completed_at >= %s THEN 1 ELSE 0 END) AS done_since,
                MAX(CASE WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END)   AS touched,
                -- 1.7.3: which room tapped (OP = Screen / Element kiosk, ASM = Assembly tablet)
-               MAX(CASE WHEN e.operator IN (SELECT operator_code FROM dbo.assembly_operators WHERE department_id = 1)
-                          OR e.note LIKE 'dept=Assembly%%' THEN 2
+               -- 1.7.4: via the ao join - SQL Server refuses a subquery inside MAX (06:30 10-27 failed)
+               MAX(CASE WHEN ao.operator_code IS NOT NULL OR e.note LIKE 'dept=Assembly%%' THEN 2
                         WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END) AS touched_by,
                MAX(wo.status) AS wo_status
         FROM dbo.work_orders wo
@@ -532,6 +532,8 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                ON e.work_order_id = wo.work_order_id
               AND e.event_type IN ('Start','Restart','Stop','Complete','Count')   -- 1.7.1: floor taps only; Assign is the Supervisor board (10-23: 36 lines read WORKED on bulk assigns)
               AND CAST(e.event_at AS DATE) = %s
+        LEFT JOIN dbo.assembly_operators ao
+               ON ao.operator_code = e.operator AND ao.department_id = 1
         WHERE wo.status <> 'Cancelled'
         GROUP BY wo.sales_order_number, wo.sales_order_rel, wo.sales_order_line, wo.part_number
     """, (plan_date, plan_date))
