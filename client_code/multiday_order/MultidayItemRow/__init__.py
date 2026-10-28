@@ -37,7 +37,7 @@ class MultidayItemRow(MultidayItemRowTemplate):
     on_load = it.get('on_load')
     if cur:
       self.lk_load.text = 'shown'
-      self.lk_load.enabled = False
+      # self.lk_load.enabled = False
       self.lk_load.foreground = MUTED
     elif on_load:
       self.lk_load.text = 'Load'
