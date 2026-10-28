@@ -188,7 +188,7 @@ class multiday_order(multiday_orderTemplate):
       self.lbl_sub.text = (f"{float(ln.get('qty') or 0):g} pc open · {float(ln.get('inches') or 0):,.0f} in"
                            f" · {float(ln.get('remaining') or 0):g} pc / {float(ln.get('remaining_inches') or 0):,.0f} in left ({ln.get('built_basis')})"
                            f" · day {ln.get('day_no')} · {more_txt}"
-                           + (f" · WO {', '.join(wos)}" if wos else '')
+                           + (f" · {', '.join(wos)}" if wos else '')
                            + (f" · crew now: {ln.get('crew_who')} ({int(ln.get('crew_n') or 0)})" if ln.get('crew_who') else ' · nobody assigned yet')
                            + f" · pool {pool:,.0f} in/day · one assembler-day ≈ {asm_day:,.0f} in"
                            + (f" (crew {float(crew):g})" if crew else '') + f" · partials: {partials}")
