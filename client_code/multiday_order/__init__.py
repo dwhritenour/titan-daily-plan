@@ -32,7 +32,7 @@ import anvil.server
 #   ship_plan_multiday_resume     end a snooze early (this work order)
 #
 # Designer components (custom-HTML form; hasattr-guarded like the others):
-#   lk_plan, lbl_title, btn_refresh, lbl_sub, lbl_paused
+#   lk_plan, lbl_title, lbl_title2 (SKU · customer · ship-by), btn_refresh, lbl_sub, lbl_paused
 #   oc_items: lbl_items_title, dg_items > rp_items (item template MultidayItemRow:
 #     lbl_item, lbl_sku, lbl_open, lbl_left, lbl_status, lbl_asm, lk_load), lbl_items_note
 #   flow_week: lk_prev_week, lbl_week, lk_next_week, lk_this_week
@@ -154,10 +154,15 @@ class multiday_order(multiday_orderTemplate):
     today = d.get('today') or ''
     ship_by = str(d.get('ship_by') or '')[:10]
     late = bool(ship_by) and ship_by < today
+    # title on two lines (Dave 10-28): the work order, then SKU · customer · ship-by
+    line2 = (f"{ln.get('sku')}" + (f" · {d['customer']}" if d.get('customer') else '')
+             + (f" · ship-by {self._mdy(ship_by)}" + (' (late)' if late else '') if ship_by else ''))
     if hasattr(self, 'lbl_title'):
-      self.lbl_title.text = (f"Multi-day work order {d['order']}-{ln.get('item')} · {ln.get('sku')}"
-                             + (f" · {d['customer']}" if d.get('customer') else '')
-                             + (f" · ship-by {self._mdy(ship_by)}" + (' (late)' if late else '') if ship_by else ''))
+      self.lbl_title.text = f"Multi-day work order {d['order']}-{ln.get('item')}"
+    if hasattr(self, 'lbl_title2'):
+      self.lbl_title2.text = line2
+    elif hasattr(self, 'lbl_title'):
+      self.lbl_title.text += ' · ' + line2
     pool = float(d.get('pool_inches') or 0)
     asm_day = float(d.get('assembler_day_in') or 0)
     crew = d.get('crew')
