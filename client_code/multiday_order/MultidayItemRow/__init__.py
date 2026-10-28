@@ -36,9 +36,11 @@ class MultidayItemRow(MultidayItemRowTemplate):
     self.lbl_asm.foreground = '' if a is not None else MUTED
     on_load = it.get('on_load')
     if cur:
+      # a Link has no 'enabled' (Anvil): leave it with no click handler
       self.lk_load.text = 'shown'
-      # self.lk_load.enabled = False
+      self.lk_load.bold = False
       self.lk_load.foreground = MUTED
+      self.lk_load.tooltip = 'this is the work order on the page'
     elif on_load:
       self.lk_load.text = 'Load'
       self.lk_load.tooltip = 'show this work order on the page'
