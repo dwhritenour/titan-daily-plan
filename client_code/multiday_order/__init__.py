@@ -70,6 +70,9 @@ class multiday_order(multiday_orderTemplate):
     self.order = order
     self.item = (str(item).strip() if item not in (None, '') else None)
     self.data = None
+    # 10-28 (Dave): the page opened scrolled to wherever the board was; go to
+    # the top once the form is on screen (open_form keeps the scroll offset)
+    self.set_event_handler('show', self._to_top)
     if hasattr(self, 'lk_plan'):
       self.lk_plan.set_event_handler('click', self._go_plan)
     if hasattr(self, 'btn_refresh'):
@@ -107,6 +110,12 @@ class multiday_order(multiday_orderTemplate):
     self.load()
 
   # ------------------------------------------------------------------
+  def _to_top(self, **event_args):
+    try:
+      (self.lk_plan if hasattr(self, 'lk_plan') else self).scroll_into_view(smooth=False)
+    except Exception:
+      pass
+
   def _go_plan(self, **event_args):
     set_url_hash('')
     open_form('ship_plan')
