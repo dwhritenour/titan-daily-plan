@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.9.2' # v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.9.2.1' # v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -3338,7 +3338,7 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
     tab = _md_tablet_facts(cursor, [order])
     prior = _md_prior_shares(cursor, nb + timedelta(days=1))
     modes = _md_order_modes(cursor, nb)
-    crew = _md_crew(cursor, [order])                     # v1.9.2 (124): the board's crew per line
+    crew_map = _md_crew(cursor, [order])                 # v1.9.2 (124): the board's crew per line
     # --- state of every line (the projection needs the whole order) ---------
     rem = {}
     for l in lines:
@@ -3438,7 +3438,7 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
         status = f"started {r_['days_planned'][0][5:7].lstrip('0')}/{r_['days_planned'][0][8:10].lstrip('0')}, not on the board today"
       else:
         status = 'not started'
-      cw = crew.get((order, it)) or {'n': 0, 'who': ''}
+      cw = crew_map.get((order, it)) or {'n': 0, 'who': ''}
       items.append({'rel': l['nx_rel_numb'], 'item': it, 'sku': l['nx_sku'], 'desc': l.get('nx_sku_desc'),
                     'qty': float(l['qty'] or 0), 'inches': float(l['work_inches'] or 0),
                     'remaining': r_['remaining'], 'done': r_['done'], 'status': status,
@@ -3455,8 +3455,8 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
                      'built_basis': r0['built_basis'], 'done': r0['done'],
                      'days_planned': r0['days_planned'], 'day_no': len(r0['days_planned']) + 1,
                      'work_orders': [w['work_order_number'] for w in wos if w['item'] == item],
-                     'crew_n': (crew.get((order, item)) or {}).get('n', 0),
-                     'crew_who': (crew.get((order, item)) or {}).get('who', '')},
+                     'crew_n': (crew_map.get((order, item)) or {}).get('n', 0),
+                     'crew_who': (crew_map.get((order, item)) or {}).get('who', '')},
             'siblings': siblings, 'items': items, 'multiday_share_pct': round(100.0 * ap['multiday_share_pct'], 0),
             'week_start': monday.isoformat(), 'week_label': f"week of {monday:%m/%d}",
             'prev_week': (monday - timedelta(days=7)).isoformat(), 'next_week': (monday + timedelta(days=7)).isoformat(),
