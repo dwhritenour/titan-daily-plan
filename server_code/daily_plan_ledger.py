@@ -40,7 +40,7 @@ except Exception:                       # module not pasted yet: done_inches sta
 # Migration 069. Shadow mode: the text goes to DAILY_PLAN_LEDGER (Dave).
 # =============================================================================
 
-_LEDGER_VERSION = 'ledger-1.0.0'
+_LEDGER_VERSION = 'ledger-1.1.0'
 _ACTIVE_PLAN = ('Planned', 'Confirmed', 'Proposed')
 
 
@@ -212,12 +212,15 @@ def _ledger_day(cursor, plan_date, lp, actor):
       notes.append(f"shipped: {sh.get('message', 'error')}")
   except Exception as e:
     notes.append(f'shipped: {e}'[:120])
-  done = None
+  done = n_done_floor = None
   if wo_completed_get_day is not None:
     try:
       dn = wo_completed_get_day(plan_date)
       if dn.get('status') == 'success':
-        done = _f((dn.get('totals') or {}).get('actual_inches'), 0.0)
+        td = dn.get('totals') or {}
+        done = _f(td.get('actual_inches'), 0.0)
+        n_done_floor = int(dn.get('n_done_floor') if dn.get('n_done_floor') is not None
+                           else (td.get('n_done_floor') or td.get('n') or 0))
     except Exception as e:
       notes.append(f'done: {e}'[:120])
 
@@ -261,7 +264,7 @@ def _ledger_day(cursor, plan_date, lp, actor):
     'shipped_inches': _r1(shipped), 'shipped_planned_inches': _r1(shipped_planned),
     'shipped_unplanned_inches': _r1(shipped_unplanned),
     'n_shipped_lines': n_ship, 'n_shipped_zero': n_zero, 'n_shipped_no_estimate': n_noest,
-    'done_inches': _r1(done), 'ship_feed_loaded': 1 if feed_loaded else 0,
+    'done_inches': _r1(done), 'n_done_floor': n_done_floor, 'ship_feed_loaded': 1 if feed_loaded else 0,
     'daily_ratio': daily_ratio, 'attainment_pct': attainment, 'attendance_pct': attendance,
     'plan_load_pct': plan_load, 'efficiency_used': round(lp['efficiency'], 3),
     'implied_efficiency': implied_eff, 'tolerance_pct': lp['tolerance_pct'],

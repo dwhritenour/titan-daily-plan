@@ -45,43 +45,79 @@ _DONE_STATUSES = ('Complete', 'Shipped - Verify', 'Invoiced - Verify', 'Closed -
 _ACTIVE_PLAN = ('Planned', 'Confirmed', 'Proposed')
 
 _ROWS_SQL = """
+WITH first_complete AS (
+    SELECT e.work_order_id, MIN(e.event_at) AS first_at
+    FROM   dbo.work_order_events e
+    WHERE  e.event_type = 'Complete'
+    GROUP  BY e.work_order_id
+),
+wo AS (
+    SELECT w.work_order_id, w.work_order_number,
+           LTRIM(RTRIM(w.sales_order_number))                    AS nx_order_numb,
+           LTRIM(RTRIM(w.sales_order_rel))                       AS nx_rel_numb,
+           LTRIM(RTRIM(CAST(w.sales_order_line AS VARCHAR(10)))) AS nx_item_no,
+           w.part_number AS nx_sku, w.sku_desc,
+           COALESCE(w.wo_override_qty, w.quantity)               AS wo_qty,
+           w.status, w.completed_by, w.assigned_assembler, w.completed_at,
+           fc.first_at AS floor_complete_at,
+           CAST(fc.first_at AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS datetime) AS done_at
+    FROM   first_complete fc
+    JOIN   dbo.work_orders w ON w.work_order_id = fc.work_order_id
+    WHERE  CAST(fc.first_at AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS date) = %s
+)
 SELECT wo.work_order_id, wo.work_order_number, wo.nx_order_numb, wo.nx_rel_numb, wo.nx_item_no,
-       wo.nx_sku, wo.sku_desc, wo.qty, wo.status, wo.completed_by, wo.assigned_assembler,
-       wo.completed_at, wo.floor_complete_at, wo.shipped_detected_at, wo.done_at,
+       wo.nx_sku, wo.sku_desc,
+       COALESCE(so.nx_qty_ordered, snap.qty_open, pl.qty_planned, wo.wo_qty) AS qty,
+       COALESCE(so.nx_qty_ordered, snap.qty_open, pl.qty_planned)            AS qty_ordered,
+       wo.wo_qty, so.part_type,
+       wo.status, wo.completed_by, wo.assigned_assembler,
+       wo.completed_at, wo.floor_complete_at, CAST(NULL AS datetime) AS shipped_detected_at, wo.done_at,
        snap.load_inches AS snap_load, snap.was_planned, snap.flag_codes, snap.tier AS snap_tier,
+       CASE WHEN snap2.load_inches IS NULL THEN NULL
+            WHEN ISNULL(snap2.qty_open, 0) > 0
+            THEN snap2.load_inches * COALESCE(so.nx_qty_ordered, wo.wo_qty) / snap2.qty_open
+            ELSE snap2.load_inches END                                       AS snap2_load,
+       snap2.was_planned AS was_planned2, snap2.flag_codes AS flag_codes2,
        pl.load_inches AS plan_load, pl.line_status, pl.tier AS plan_tier
-FROM (
-  SELECT w.work_order_id, w.work_order_number,
-         w.sales_order_number AS nx_order_numb, w.sales_order_rel AS nx_rel_numb,
-         LTRIM(RTRIM(CAST(w.sales_order_line AS VARCHAR(10)))) AS nx_item_no,
-         w.part_number AS nx_sku, w.sku_desc,
-         COALESCE(w.wo_override_qty, w.quantity) AS qty, w.status,
-         w.completed_by, w.assigned_assembler, w.completed_at,
-         fc.event_at AS floor_complete_at, sh.detected_at AS shipped_detected_at, d.done_at
-  FROM dbo.work_orders w
-  OUTER APPLY (SELECT MIN(e.event_at) AS event_at FROM dbo.work_order_events e
-               WHERE e.work_order_id = w.work_order_id AND e.event_type = 'Complete') fc
-  OUTER APPLY (SELECT MIN(c.detected_at) AS detected_at FROM dbo.work_order_changes c
-               WHERE c.work_order_id = w.work_order_id
-                 AND c.change_type IN ('SO_Shipped', 'SO_Invoiced')) sh
-  CROSS APPLY (SELECT MIN(t) AS done_at
-               FROM (VALUES (w.completed_at), (fc.event_at), (sh.detected_at)) v(t)
-               WHERE t IS NOT NULL) d
-  WHERE w.status IN ('Complete', 'Shipped - Verify', 'Invoiced - Verify', 'Closed - Verify')
-) wo
+FROM wo
+OUTER APPLY (
+    SELECT TOP 1 u.nx_qty_ordered, u.part_type
+    FROM (
+        SELECT 1 AS src, ISNULL(s.nx_qty_ordered, s.nx_qty_balance_due) AS nx_qty_ordered,
+               RTRIM(s.nx_part_type) AS part_type
+        FROM dbo.sales_orders_due s
+        WHERE LTRIM(RTRIM(s.nx_order_numb)) = wo.nx_order_numb
+          AND LTRIM(RTRIM(s.nx_rel_numb))   = wo.nx_rel_numb
+          AND LTRIM(RTRIM(CAST(s.nx_item_no AS VARCHAR(10)))) = wo.nx_item_no
+        UNION ALL
+        SELECT 2 AS src, s2.nx_qty_ordered, RTRIM(s2.nx_part_type) AS part_type
+        FROM dbo.sales_orders_ship s2
+        WHERE LTRIM(RTRIM(s2.nx_order_numb)) = wo.nx_order_numb
+          AND LTRIM(RTRIM(s2.nx_rel_numb))   = wo.nx_rel_numb
+          AND LTRIM(RTRIM(CAST(s2.nx_item_no AS VARCHAR(10)))) = wo.nx_item_no
+    ) u
+    ORDER BY u.src
+) so
 LEFT JOIN dbo.pc_plan_flag_snapshot snap
        ON snap.plan_date = %s
       AND snap.revision_no = (SELECT MAX(x.revision_no) FROM dbo.pc_plan_flag_snapshot x
                               WHERE x.plan_date = %s)
-      AND snap.nx_order_numb = wo.nx_order_numb
-      AND snap.nx_rel_numb   = wo.nx_rel_numb
-      AND snap.nx_item_no    = wo.nx_item_no
+      AND LTRIM(RTRIM(snap.nx_order_numb)) = wo.nx_order_numb
+      AND LTRIM(RTRIM(snap.nx_rel_numb))   = wo.nx_rel_numb
+      AND LTRIM(RTRIM(snap.nx_item_no))    = wo.nx_item_no
+LEFT JOIN dbo.pc_plan_flag_snapshot snap2
+       ON snap.nx_order_numb IS NULL
+      AND snap2.plan_date = %s
+      AND snap2.revision_no = (SELECT MAX(x.revision_no) FROM dbo.pc_plan_flag_snapshot x
+                               WHERE x.plan_date = %s)
+      AND LTRIM(RTRIM(snap2.nx_order_numb)) = wo.nx_order_numb
+      AND snap2.nx_sku = wo.nx_sku
+      AND ISNULL(snap2.nx_rel_numb, '') = ''
 LEFT JOIN dbo.pc_ship_plan_line pl
        ON pl.plan_date = %s
-      AND pl.nx_order_numb = wo.nx_order_numb
-      AND pl.nx_rel_numb   = wo.nx_rel_numb
-      AND pl.nx_item_no    = wo.nx_item_no
-WHERE wo.done_at >= %s AND wo.done_at < %s
+      AND LTRIM(RTRIM(pl.nx_order_numb)) = wo.nx_order_numb
+      AND LTRIM(RTRIM(pl.nx_rel_numb))   = wo.nx_rel_numb
+      AND LTRIM(RTRIM(pl.nx_item_no))    = wo.nx_item_no
 ORDER BY wo.done_at, wo.nx_order_numb, wo.nx_rel_numb, wo.nx_item_no
 """
 
@@ -104,7 +140,6 @@ def wo_completed_get_day(day):
   published-plan header, the completed work orders in the order they were
   done with a running total, and the totals."""
   day = _parse_date(day)
-  nxt = day + timedelta(days=1)
   conn = get_connection()
   try:
     cursor = conn.cursor()
@@ -121,7 +156,7 @@ def wo_completed_get_day(day):
         WHERE plan_date = %s AND line_status IN ('Planned', 'Confirmed', 'Proposed')
     """, (day,))
     p = cursor.fetchone() or {}
-    cursor.execute(_ROWS_SQL, (day, day, day, day, nxt))
+    cursor.execute(_ROWS_SQL, (day, day, day, day, day, day))
     raw = [serialize_row(r) for r in cursor.fetchall()]
   except Exception as e:
     return {'status': 'error', 'message': f'Completed load error: {e}'}
@@ -130,27 +165,34 @@ def wo_completed_get_day(day):
 
   rows, running = [], 0.0
   tot = {'n': 0, 'n_floor': 0, 'n_e21': 0, 'n_zero': 0, 'n_no_estimate': 0,
+         'n_done_floor': 0, 'n_done_no_estimate': 0,
          'actual_inches': 0.0, 'actual_planned_inches': 0.0, 'actual_unplanned_inches': 0.0,
          'n_planned_done': 0}
   for r in raw:
     load = r.get('snap_load')
+    was_planned = r.get('was_planned')
+    codes = r.get('flag_codes')
+    if load is None and r.get('snap2_load') is not None:
+      load, was_planned, codes = r['snap2_load'], r.get('was_planned2'), r.get('flag_codes2')
     if load is None:
       load = r.get('plan_load')
-    codes = ',' + (r.get('flag_codes') or '') + ','
-    zero = (',C03,' in codes) or (load is not None and float(load) == 0.0
-                                  and r.get('flag_codes') is not None)
+    ctxt = ',' + (codes or '') + ','
+    zero = (',C03,' in ctxt) or (load is not None and float(load) == 0.0 and codes is not None) \
+    or ((r.get('part_type') or '') in ('CV', 'BV', 'MS') and load is None)
+    r['was_planned'] = was_planned
     state = _plan_state(r)
     on_plan = state in ('Planned', 'Stretch')
-    basis = ('floor' if r.get('floor_complete_at') else
-             'e21' if r.get('shipped_detected_at') else 'completed_at')
+    basis = 'floor'
     tot['n'] += 1
-    tot['n_floor' if basis == 'floor' else 'n_e21'] += 1
+    tot['n_floor'] += 1
+    tot['n_done_floor'] += 1
     if on_plan:
       tot['n_planned_done'] += 1
     if zero:
       tot['n_zero'] += 1
     elif load is None:
       tot['n_no_estimate'] += 1
+      tot['n_done_no_estimate'] += 1
     else:
       running += float(load)
       tot['actual_inches'] += float(load)
@@ -175,5 +217,8 @@ def wo_completed_get_day(day):
           'stretch_inches': round(float(p.get('stretch_inches') or 0), 1),
           'n_plan_lines': int(p.get('n_lines') or 0),
           'pct_of_plan': (round(tot['actual_inches'] / planned * 100.0, 1) if planned else None),
+          'done_inches': tot['actual_inches'],
+          'n_done_floor': tot['n_done_floor'],
+          'n_done_no_estimate': tot['n_done_no_estimate'],
           'totals': tot,
           'rows': rows}
