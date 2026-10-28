@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.9.1' # v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.9.2' # v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2578,23 +2578,36 @@ def _md_prior_shares(cursor, plan_date):
 
 
 def _md_assemblers(cursor, orders):
-  """{order: 'ASM9+ASM3'} - assemblers the PC app / Supervisor board has on
-  the order's open work orders. Read as a fact (one owner per table, 074);
-  shown on the note, not used in the share in this iteration."""
+  """{order: 'ASM9*+ASM3'} - the crew the Supervisor board has on the order's
+  open work orders (work_order_assemblers, Chuck's 124: lead * + helpers;
+  v1.9.2). Read as a fact (one owner per table, 074). See _md_crew for the
+  per-line counts the note and the page use."""
+  crew = _md_crew(cursor, orders)
+  out = {}
+  for (o, it), c in crew.items():
+    if c['who']:
+      out.setdefault(o, []).append(c['who'])
+  return {o: '+'.join(sorted(set('+'.join(v).split('+')))) for o, v in out.items()}
+
+
+def _md_crew(cursor, orders):
+  """v1.9.2 (124): {(order, item): {'n': assigned now, 'who': 'ASM9*+ASM3'}}
+  from work_order_assemblers on the line's OPEN work orders (shipped / closed
+  work orders belong to an earlier release). * = lead."""
   orders = [o for o in set(orders or []) if o]
   if not orders:
     return {}
   cursor.execute("""
-      SELECT sales_order_number AS o, assigned_assembler AS a
-      FROM dbo.work_orders
-      WHERE sales_order_number IN %s AND completed_at IS NULL
-        AND NULLIF(LTRIM(RTRIM(assigned_assembler)), '') IS NOT NULL
-      GROUP BY sales_order_number, assigned_assembler
+      SELECT wo.sales_order_number AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+             COUNT(a.woa_id) AS n,
+             STRING_AGG(a.operator_code + CASE WHEN a.is_lead = 1 THEN '*' ELSE '' END, '+') AS who
+      FROM dbo.work_orders wo
+      JOIN dbo.work_order_assemblers a ON a.work_order_id = wo.work_order_id AND a.removed_at IS NULL
+      WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
+        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
+      GROUP BY wo.sales_order_number, wo.sales_order_line
   """, (tuple(orders),))
-  out = {}
-  for r in cursor.fetchall():
-    out.setdefault(r['o'], []).append(str(r['a']).strip())
-  return {o: '+'.join(sorted(v)) for o, v in out.items()}
+  return {(r['o'], str(r['item'])): {'n': int(r['n'] or 0), 'who': r['who'] or ''} for r in cursor.fetchall()}
 
 
 def _md_tablet_facts(cursor, orders, days_back=30):
@@ -2660,6 +2673,9 @@ def _md_note(c, ship_complete):
   # Supervisor board's business and no longer printed here (Dave 10-27)
   who = (f"{float(c['md_planned_asm']):g} assembler(s) planned" if c.get('md_planned_asm')
          else 'pool share')
+  cw = c.get('md_crew') or {}
+  if cw.get('n'):                            # v1.9.2 (124): the board's crew beside PC's number
+    who += f" / {cw['n']} assigned"
   mode = c.get('md_mode') or ('COMPLETE' if ship_complete else 'DECIDE')   # v1.6: PC's choice carries over
   tail = _MD_PARTIALS.get(mode, _MD_PARTIALS['DECIDE'])
   if c.get('md_check'):
@@ -3322,6 +3338,7 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
     tab = _md_tablet_facts(cursor, [order])
     prior = _md_prior_shares(cursor, nb + timedelta(days=1))
     modes = _md_order_modes(cursor, nb)
+    crew = _md_crew(cursor, [order])                     # v1.9.2 (124): the board's crew per line
     # --- state of every line (the projection needs the whole order) ---------
     rem = {}
     for l in lines:
@@ -3421,11 +3438,12 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
         status = f"started {r_['days_planned'][0][5:7].lstrip('0')}/{r_['days_planned'][0][8:10].lstrip('0')}, not on the board today"
       else:
         status = 'not started'
+      cw = crew.get((order, it)) or {'n': 0, 'who': ''}
       items.append({'rel': l['nx_rel_numb'], 'item': it, 'sku': l['nx_sku'], 'desc': l.get('nx_sku_desc'),
                     'qty': float(l['qty'] or 0), 'inches': float(l['work_inches'] or 0),
                     'remaining': r_['remaining'], 'done': r_['done'], 'status': status,
                     'multiday': bool(r_['days_planned']) or float(l['work_inches'] or 0) > max_line + 1e-9,
-                    'asm': a, 'current': it == item})
+                    'asm': a, 'crew_n': cw['n'], 'crew_who': cw['who'], 'current': it == item})
     siblings = [x for x in items if not x['current']]
     return {'status': 'success', 'order': order, 'order_type': otype,
             'customer': _customer_label(line.get('nx_cust_name'), line.get('nx_cust_city'),
@@ -3436,7 +3454,9 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
                      'remaining': r0['remaining'], 'remaining_inches': round(left_in, 1),
                      'built_basis': r0['built_basis'], 'done': r0['done'],
                      'days_planned': r0['days_planned'], 'day_no': len(r0['days_planned']) + 1,
-                     'work_orders': [w['work_order_number'] for w in wos if w['item'] == item]},
+                     'work_orders': [w['work_order_number'] for w in wos if w['item'] == item],
+                     'crew_n': (crew.get((order, item)) or {}).get('n', 0),
+                     'crew_who': (crew.get((order, item)) or {}).get('who', '')},
             'siblings': siblings, 'items': items, 'multiday_share_pct': round(100.0 * ap['multiday_share_pct'], 0),
             'week_start': monday.isoformat(), 'week_label': f"week of {monday:%m/%d}",
             'prev_week': (monday - timedelta(days=7)).isoformat(), 'next_week': (monday + timedelta(days=7)).isoformat(),
@@ -3960,6 +3980,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
     if md_prior or md_tab:
       group_order.sort(key=lambda gk: 0 if _md_started(gk) else 1)
     md_asm = _md_assemblers(cursor, md_orders) if md_pool > 0 else {}
+    md_crew = _md_crew(cursor, md_orders) if md_pool > 0 else {}       # v1.9.2 (124): per line
     md_modes = _md_order_modes(cursor, plan_date) if md_pool > 0 else {}   # v1.6
     md_plan = _md_plan_rows(cursor, plan_date, md_orders) if md_pool > 0 else {}   # v1.7 (121)
     asm_day = _md_assembler_day(cursor, cap) if md_pool > 0 else 0.0
@@ -4265,6 +4286,7 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
           m['md_about'] = about
           m['md_assemblers'] = md_asm.get(order)
           m['md_planned_asm'] = m.get('md_line_asm')     # v1.8: this work order's headcount
+          m['md_crew'] = md_crew.get(_mdkey(m))           # v1.9.2: who the board put on it (124)
           m['md_mode'] = md_modes.get(order)
           m['md_started'] = started
           m['group_inches'] = take_in

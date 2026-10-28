@@ -31,9 +31,15 @@ class MultidayItemRow(MultidayItemRowTemplate):
     self.lbl_left.text = 'built' if it.get('done') else f"{float(it.get('remaining') or 0):g}"
     self.lbl_status.text = it.get('status') or ''
     self.lbl_status.foreground = '' if md else MUTED
+    # planned / assigned (124): PC's number for today, then the crew the
+    # Supervisor board put on it (* = lead)
     a = it.get('asm')
-    self.lbl_asm.text = (f"{float(a):g}" if a is not None else ('pool' if md else '-'))
-    self.lbl_asm.foreground = '' if a is not None else MUTED
+    n = int(it.get('crew_n') or 0)
+    planned_txt = (f"{float(a):g}" if a is not None else ('pool' if md else '-'))
+    self.lbl_asm.text = f"{planned_txt} / {n}"
+    self.lbl_asm.foreground = ('#C62828' if (a is not None and n < float(a)) else ('' if (a is not None or n) else MUTED))
+    self.lbl_asm.tooltip = ('planned / assigned' + (f" · assigned: {it.get('crew_who')}" if it.get('crew_who') else ' · nobody assigned yet')
+                            + (' · short of the instruction' if (a is not None and n < float(a)) else ''))
     on_load = it.get('on_load')
     if cur:
       # a Link has no 'enabled' (Anvil): leave it with no click handler

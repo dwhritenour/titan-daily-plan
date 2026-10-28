@@ -189,6 +189,7 @@ class multiday_order(multiday_orderTemplate):
                            f" · {float(ln.get('remaining') or 0):g} pc / {float(ln.get('remaining_inches') or 0):,.0f} in left ({ln.get('built_basis')})"
                            f" · day {ln.get('day_no')} · {more_txt}"
                            + (f" · WO {', '.join(wos)}" if wos else '')
+                           + (f" · crew now: {ln.get('crew_who')} ({int(ln.get('crew_n') or 0)})" if ln.get('crew_who') else ' · nobody assigned yet')
                            + f" · pool {pool:,.0f} in/day · one assembler-day ≈ {asm_day:,.0f} in"
                            + (f" (crew {float(crew):g})" if crew else '') + f" · partials: {partials}")
     pz = d.get('paused')
@@ -206,7 +207,7 @@ class multiday_order(multiday_orderTemplate):
     if hasattr(self, 'lbl_items_title'):
       self.lbl_items_title.text = f"Work orders on sales order {d['order']} ({len(items)})"
     if hasattr(self, 'lbl_items_note'):
-      self.lbl_items_note.text = ('⧗ = multi-day (over the day line, or started). Load shows that work order here. '
+      self.lbl_items_note.text = ('⧗ = multi-day (over the day line, or started). Assemblers = planned / assigned (Supervisor board, * = lead; red when short). Load shows that work order here. '
                                   f"Big orders get up to {float(d.get('multiday_share_pct') or 0):g}% of a day "
                                   f"(about {pool:,.0f} in) between them - the multi-day pool, set in Parameters.")
     if hasattr(self, 'lbl_grid_note'):

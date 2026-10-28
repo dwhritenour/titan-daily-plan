@@ -66,7 +66,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.7.4'   # 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.8'   # 1.8 (124): every multi-day row says the crew - PC's headcount vs the Supervisor board's assignment (work_order_assemblers); 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 # retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
@@ -205,6 +205,61 @@ def _md_plan_lines(cursor, plan_date):
       'paused_to': (pm.group(1) if pm else None) if r['line_status'] == 'Snoozed' else None,
       'pause_reason': (pm.group(2).strip() if pm else '') if r['line_status'] == 'Snoozed' else ''}
   return out
+
+
+def _md_crew(cursor, plan_date, lines):
+  """retro-1.8 (124): the crew on each multi-day line AS OF plan_date -
+  {(order, item): {'planned': n or None, 'assigned': m, 'who': 'ASM9*+ASM3'}}.
+  planned = PC's headcount (pc_multiday_plan, newest number on or before the
+  day - the engine's carry rule); assigned = work_order_assemblers rows on the
+  line's open work orders that were active that day (* = lead)."""
+  orders = sorted({k[0] for k in lines})
+  if not orders:
+    return {}
+  cursor.execute("""
+      SELECT p.nx_order_numb, p.nx_item_no, p.assemblers_planned
+      FROM dbo.pc_multiday_plan p
+      WHERE p.nx_rel_numb IS NOT NULL AND p.assemblers_planned IS NOT NULL
+        AND p.nx_order_numb IN %s AND p.plan_date <= %s
+        AND p.multiday_id = (SELECT TOP 1 q.multiday_id FROM dbo.pc_multiday_plan q
+                             WHERE q.nx_order_numb = p.nx_order_numb AND q.nx_item_no = p.nx_item_no
+                               AND q.nx_rel_numb IS NOT NULL AND q.assemblers_planned IS NOT NULL
+                               AND q.plan_date <= %s
+                             ORDER BY q.plan_date DESC, q.set_at DESC)
+  """, (tuple(orders), plan_date, plan_date))
+  out = {}
+  for r in cursor.fetchall():
+    out[(r['nx_order_numb'], str(r['nx_item_no']))] = {'planned': float(r['assemblers_planned']), 'assigned': 0, 'who': ''}
+  cursor.execute("""
+      SELECT wo.sales_order_number AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+             COUNT(a.woa_id) AS n,
+             STRING_AGG(a.operator_code + CASE WHEN a.is_lead = 1 THEN '*' ELSE '' END, '+') AS who
+      FROM dbo.work_orders wo
+      JOIN dbo.work_order_assemblers a ON a.work_order_id = wo.work_order_id
+      WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
+        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
+        AND a.assigned_at < DATEADD(day, 1, CAST(%s AS DATE))
+        AND (a.removed_at IS NULL OR a.removed_at >= CAST(%s AS DATE))
+      GROUP BY wo.sales_order_number, wo.sales_order_line
+  """, (tuple(orders), plan_date, plan_date))
+  for r in cursor.fetchall():
+    e = out.setdefault((r['o'], str(r['item'])), {'planned': None, 'assigned': 0, 'who': ''})
+    e['assigned'] = int(r['n'] or 0)
+    e['who'] = r['who'] or ''
+  return out
+
+
+def _md_crew_txt(crew, lkey):
+  """' · crew: 2 planned / 1 assigned (ASM9*)' or '' - the words for the row."""
+  c = crew.get((lkey[0], lkey[2])) if crew else None
+  if not c or (c.get('planned') is None and not c.get('assigned')):
+    return ''
+  p = c.get('planned')
+  txt = ' · crew: ' + (f"{p:g} planned" if p is not None else 'no headcount set')
+  txt += f" / {c.get('assigned') or 0} assigned" + (f" ({c['who']})" if c.get('who') else '')
+  if p is not None and c.get('assigned', 0) < p:
+    txt += ' - short of the instruction'
+  return txt
 
 
 def _md_count(note):
@@ -551,6 +606,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
     # --- retro-1.7: the day's multi-day lines and what the tablet says ----
     md_lines = _md_plan_lines(cursor, plan_date)
     tablet = _md_tablet(cursor, plan_date) if md_lines else {}
+    md_crew = _md_crew(cursor, plan_date, md_lines) if md_lines else {}     # retro-1.8 (124)
     # yesterday's SLOW rows: a second SLOW day earns the question
     slow_before = set()
     if md_lines:
@@ -759,6 +815,7 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                      question=(f"Multi-day order {_line_txt(s)} ({dk}, share {share:,.0f}) was on "
                                f"{_fmt_day(plan_date)}'s plan and the tablet shows no Start. "
                                "Was it started? If not, what stopped it?"))
+        row['explanation'] = (row.get('explanation') or '') + _md_crew_txt(md_crew, lkey)   # retro-1.8
       elif worked:
         row.update(case='WORKED', expected='WORKED_ON', observed=True, resolution='EXPLAINED',
                    explanation=base + f"; work order {w['wo_status']}"
