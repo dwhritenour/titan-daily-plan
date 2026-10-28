@@ -121,10 +121,10 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
                                    + {'OK': 'ship daily', 'COMPLETE': 'ships when complete'}.get(md.get('partials'), 'PC decides')
                                    + '. The star sets today\'s share; ⧗ opens the Multi-day Work Order page (assemblers on it, partials, pause).')
       if md.get('paused_to'):
-        chip_text = f"⏸ PAUSED → {md['paused_to']}"
-        self.lbl_status.tooltip = (f"Paused by PC until {md['paused_to']}"
+        chip_text = f"⏰ SNOOZED → {md['paused_to']}"      # v1.9.1: Dave's word (the transfer app's)
+        self.lbl_status.tooltip = (f"Snoozed by PC until {md['paused_to']}"
                                    + (f": {md['pause_reason']}" if md.get('pause_reason') else '')
-                                   + '. It comes back first on that morning; Resume ends it early.')
+                                   + '. This work order comes back first that morning; ▶ resumes it early.')
     if item.get('is_rush'):              # 091: rush lane - same glyph as the flags
       chip_text = '⚡ ' + chip_text
       self.lbl_status.tooltip = ('RUSH — expedited ship method, due by the next '
@@ -171,7 +171,7 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     if status == 'Snoozed' and md and md.get('paused_to') and on_resume:
       self.btn_snooze.visible = True
       self.btn_snooze.text = '▶'
-      self.btn_snooze.tooltip = 'Resume the paused order'
+      self.btn_snooze.tooltip = 'Resume the snoozed work order'
       self.btn_snooze.set_event_handler('click', lambda **e: on_resume(self.item))
     if on_remove:
       self.btn_remove.set_event_handler('click',

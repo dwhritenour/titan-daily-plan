@@ -7,6 +7,7 @@ unique_ids:
     multiday_order: '1793111156561.3645510838954326'
     multiday_order.MultidayGridRow: '1793114685847.2861106539059400'
     multiday_order.MultidayGridRow.ItemTemplate1: '1793124012940842615315477.6182'
+    multiday_order.MultidayItemRow: '1793141180332.4536302538735958'
     orders_shipped: '1789562439811.5732998725787588'
     retro: '1788879784060.18872695407259166'
     retro.RetroQuestionRow: '1788879812252.9801282246177007'

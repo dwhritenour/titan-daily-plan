@@ -1080,12 +1080,14 @@ class ship_plan(ship_planTemplate):
     first on the next morning run (today's lines keep their Snoozed row)."""
     order = item['nx_order_numb']
     md = item.get('md') or {}
+    it = str(item.get('nx_item_no') or '')
     tb = TextBox(placeholder='note (optional)')
-    if not confirm(f"Resume {order} (paused to {md.get('paused_to') or '?'})? "
+    if not confirm(f"Resume {order}-{it} (snoozed to {md.get('paused_to') or '?'})? "
                    "It is proposed first on the next morning run.",
                    content=tb):
       return
-    r = anvil.server.call('ship_plan_multiday_resume', order, note=(tb.text or '').strip() or None)
+    r = anvil.server.call('ship_plan_multiday_resume', order, note=(tb.text or '').strip() or None,
+                          item=(it or None))                 # v1.9.1: this work order only
     if r.get('status') != 'success':
       alert(r.get('message', 'Resume failed'))
     else:

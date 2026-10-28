@@ -8,12 +8,6 @@
       <anvil-component type="Label" name="lbl_title" prop:text="Multi-day work order" prop:bold="true" prop:font_size="20" prop:spacing='{"margin":["6",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="JKOHNW,SHGFTO"></anvil-component>
       <anvil-component type="Label" name="lbl_sub" prop:font_size="13" prop:spacing='{"margin":["0",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDHDRE,MDHDRF"></anvil-component>
       <anvil-component type="Label" name="lbl_paused" prop:font_size="13" prop:bold="true" prop:foreground="#B45309" prop:visible="false" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDHDRG,MDHDRH"></anvil-component>
-      <anvil-component type="FlowPanel" name="flow_siblings" prop:align="left" prop:vertical_align="center" prop:visible="false" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDHDRI,MDHDRJ">
-        <anvil-component type="Label" name="lbl_sib_prompt" prop:font_size="12" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
-        <anvil-component type="Link" name="lk_sib1" prop:font_size="12" prop:bold="true" prop:visible="false" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
-        <anvil-component type="Link" name="lk_sib2" prop:font_size="12" prop:bold="true" prop:visible="false" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
-        <anvil-component type="Link" name="lk_sib3" prop:font_size="12" prop:bold="true" prop:visible="false" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
-      </anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_grid" prop:role="outlined-card" container:grid_position="MDGRDA,MDGRDB">
       <anvil-component type="FlowPanel" name="flow_week" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"0",null],"padding":["0","10","0","10"]}' container:grid_position="MDGRDG,MDGRDH">
@@ -32,7 +26,7 @@
       </anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_controls" prop:role="outlined-card" container:grid_position="MDCTLA,MDCTLB">
-      <anvil-component type="Label" name="lbl_controls" prop:text="Decisions for this order (PC)" prop:bold="true" prop:spacing='{"margin":["5",null,"5",null],"padding":["0","10","0","0"]}' container:grid_position="MDCTLC,MDCTLD"></anvil-component>
+      <anvil-component type="Label" name="lbl_controls" prop:text="Decisions (PC)" prop:bold="true" prop:spacing='{"margin":["5",null,"5",null],"padding":["0","10","0","0"]}' container:grid_position="MDCTLC,MDCTLD"></anvil-component>
       <anvil-component type="FlowPanel" name="flow_partials" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"5",null],"padding":["5","10","5","10"]}' prop:border="1px solid #000000" container:grid_position="MDCTLI,MDCTLJ">
         <anvil-component type="Label" name="lbl_partials_prompt" prop:text="When the day's pieces are done:" prop:spacing='{"margin":["0",null,"0",null]}' prop:font_size="12"></anvil-component>
         <anvil-component type="DropDown" name="dd_partials" prop:font_size="12" container:width="260"></anvil-component>
@@ -40,17 +34,24 @@
         <anvil-component type="Label" name="lbl_partials_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
       </anvil-component>
       <anvil-component type="FlowPanel" name="flow_pause" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"5",null],"padding":["5","10","5","10"]}' prop:border="1px solid #000000" container:grid_position="MDCTLK,MDCTLL">
-        <anvil-component type="Label" name="lbl_pause_prompt" prop:text="Pause the order until" prop:spacing='{"margin":["0",null,"0",null]}' prop:font_size="12"></anvil-component>
+        <anvil-component type="Label" name="lbl_pause_prompt" prop:text="Snooze work order until" prop:spacing='{"margin":["0",null,"0",null]}' prop:font_size="12"></anvil-component>
         <anvil-component type="TextBox" name="tb_pause_to" prop:placeholder="YYYY-MM-DD" prop:role="outlined" prop:font_size="12" container:width="130"></anvil-component>
         <anvil-component type="TextBox" name="tb_pause_why" prop:placeholder="why? (required)" prop:role="outlined" prop:font_size="12" container:width="260"></anvil-component>
-        <anvil-component type="Button" name="btn_pause" prop:text="⏸ Pause" prop:role="outlined-button" prop:font_size="12"></anvil-component>
-        <anvil-component type="Button" name="btn_resume" prop:text="▶ Resume" prop:role="outlined-button" prop:visible="false" prop:font_size="12"></anvil-component>
+        <anvil-component type="Button" name="btn_pause" prop:text="Snooze" prop:role="outlined-button" prop:font_size="12"></anvil-component>
+        <anvil-component type="Button" name="btn_resume" prop:text="Resume" prop:role="outlined-button" prop:visible="false" prop:font_size="12"></anvil-component>
         <anvil-component type="Label" name="lbl_pause_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["8",null,"0",null]}'></anvil-component>
       </anvil-component>
       <anvil-component type="FlowPanel" name="flow_done" prop:align="left" prop:vertical_align="center" prop:spacing='{"margin":["5",null,"5",null],"padding":["5","10","5","10"]}' prop:border="1px solid #000000" container:grid_position="MDCTLM,MDCTLN">
         <anvil-component type="CheckBox" name="cb_done" prop:text="This work order is built (PC's word - the tablet is silent)" prop:font_size="12"></anvil-component>
         <anvil-component type="Label" name="lbl_done_hint" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["5",null,"0",null]}' prop:italic="true"></anvil-component>
       </anvil-component>
+    </anvil-component>
+    <anvil-component type="ColumnPanel" name="oc_items" prop:role="outlined-card" container:grid_position="MDITMA,MDITMB">
+      <anvil-component type="Label" name="lbl_items_title" prop:text="Work orders on this sales order" prop:bold="true" prop:spacing='{"margin":["5",null,"0",null],"padding":["0","10","0","0"]}' container:grid_position="MDITMC,MDITMD"></anvil-component>
+      <anvil-component type="DataGrid" name="dg_items" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="false" prop:columns='[{"id":"item","title":"Item","data_key":"item","width":"70"},{"id":"sku","title":"SKU","data_key":"sku"},{"id":"open","title":"Open","data_key":"open","width":"70"},{"id":"left","title":"Left","data_key":"left","width":"70"},{"id":"status","title":"Status","data_key":"status","width":"220"},{"id":"asm","title":"Assemblers today","data_key":"asm","width":"120"},{"id":"load","title":"","data_key":"load","width":"70"}]' container:grid_position="MDITME,MDITMF" container:full_width_row="true">
+        <anvil-component type="RepeatingPanel" name="rp_items" prop:item_template="Titan_Daily_Plan_v1_0.multiday_order.MultidayItemRow" prop:margin='["0",null,"0",null]'></anvil-component>
+      </anvil-component>
+      <anvil-component type="Label" name="lbl_items_note" prop:font_size="11" prop:foreground="#595959" prop:spacing='{"margin":["0",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDITMG,MDITMH"></anvil-component>
     </anvil-component>
     <anvil-component type="ColumnPanel" name="oc_help" prop:role="outlined-card" container:grid_position="MDHLPA,MDHLPB">
       <anvil-component type="RichText" name="rt_help" prop:format="markdown" prop:spacing='{"margin":["5",null,"5",null],"padding":["0","10","0","10"]}' container:grid_position="MDHLPC,MDHLPD"></anvil-component>

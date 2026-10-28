@@ -15,24 +15,26 @@ import anvil.server
 # day carries the previous number, 0 = nobody, no number anywhere = the pool
 # rule. The 'pieces' row shows what was planned / counted, what is on the
 # board today, and what the 06:30 run would propose ("est.") with those
-# numbers. The other lines of the same order are links under the header -
-# never on the same grid (an assembler works one work order at a time).
+# numbers. The other lines of the same sales order are a grid under the
+# controls with a Load link (v1.9.1) - never rows on the week grid (an
+# assembler works one work order at a time).
 #
-# PC decides here: the headcount per day, the order's PARTIALS rule, PAUSE /
-# RESUME (the order's), and BUILT on PC's word (this work order). Today's
-# quantity on the board is still the star's.
+# PC decides here: the headcount per day, the sales order's PARTIALS rule,
+# SNOOZE / RESUME (this work order, v1.9.1), and BUILT on PC's word (this
+# work order). Today's quantity on the board is still the star's.
 #
 # The client computes nothing: the grid rows, the day list, the projection,
 # the cost sentence and the labels all come from ship_plan_multiday_get.
 # Writes:
 #   ship_plan_multiday_plan_set   assemblers (line row, that day), done,
 #                                 clear_assemblers (back to the pool rule)
-#   ship_plan_multiday_set        partials rule / pause (the notes, Snoozed)
-#   ship_plan_multiday_resume     end a pause early
+#   ship_plan_multiday_set        partials rule (the order) / snooze (this work order)
+#   ship_plan_multiday_resume     end a snooze early (this work order)
 #
 # Designer components (custom-HTML form; hasattr-guarded like the others):
 #   lk_plan, lbl_title, btn_refresh, lbl_sub, lbl_paused
-#   flow_siblings: lbl_sib_prompt, lk_sib1..lk_sib3 (the order's other lines)
+#   oc_items: lbl_items_title, dg_items > rp_items (item template MultidayItemRow:
+#     lbl_item, lbl_sku, lbl_open, lbl_left, lbl_status, lbl_asm, lk_load), lbl_items_note
 #   flow_week: lk_prev_week, lbl_week, lk_next_week, lk_this_week
 #   dg_grid (DataGrid, columns line + d1..d5; titles set at runtime) > rp_grid
 #     (RepeatingPanel, item template MultidayGridRow: lbl_line, lbl_dN + tb_dN)
@@ -48,7 +50,7 @@ HELP = """
 
 **Assemblers** is PC's number for each day, typed in the grid. With a number, the morning run gives this work order that many assembler-days of work (capacity / crew, about 165 in each), never more than what is left of the day's multi-day pool. A blank day carries the previous day's number (shown grey); 0 means nobody on it that day and nothing of it is planned; no number anywhere means the pool rule - the order takes what the pool allows, smallest line first. "Back to the pool rule" forgets every number. The other lines of the order keep the pool rule unless you put people on them too (open them from the links above).
 
-**Partials** and **Pause** are the order's: they apply to every line of it on the board. A paused order leaves the plan until the date and comes back first that morning; Resume ends it early. **Built (PC's word)** tells the engine and the retro this work order is done when the tablet has not said so.
+**Partials** is the sales order's rule - it applies to every line of it on the board. **Snooze** is this work order's: it leaves the plan until the date and comes back first that morning; Resume ends it early. The grid at the bottom lists every work order of the sales order; Load shows one here. **Built (PC's word)** tells the engine and the retro this work order is done when the tablet has not said so.
 """
 
 
@@ -89,14 +91,10 @@ class multiday_order(multiday_orderTemplate):
       self.btn_resume.set_event_handler('click', self._resume)
     if hasattr(self, 'cb_done'):
       self.cb_done.set_event_handler('change', self._done_change)
-    for n in (1, 2, 3):
-      lk = getattr(self, f'lk_sib{n}', None)
-      if lk is not None:
-        lk.set_event_handler('click', self._open_sibling)
     if hasattr(self, 'dd_partials'):
-      self.dd_partials.items = [('Not decided yet', 'DECIDE'),
-                                ('Ship them that day', 'OK'),
-                                ('Hold until the order is complete', 'COMPLETE')]
+      self.dd_partials.items = [('Not decided yet - Sales to confirm', 'DECIDE'),
+                                ('Ship them that day - partials okay', 'OK'),
+                                ('Hold until the order is complete - no partials', 'COMPLETE')]
     if hasattr(self, 'rt_help'):
       self.rt_help.format = 'markdown'
       self.rt_help.content = HELP
@@ -113,11 +111,12 @@ class multiday_order(multiday_orderTemplate):
     set_url_hash('')
     open_form('ship_plan')
 
-  def _open_sibling(self, sender, **event_args):
-    it = getattr(sender, 'tag', None)
-    if not it:
+  def _load_item(self, item):
+    """Load (v1.9.1): the grid of the order's work orders swaps the page to
+    another line of the same sales order."""
+    if not item:
       return
-    self.item = str(it)
+    self.item = str(item)
     set_url_hash(f'md={self.order}-{self.item}')
     self.load()
 
@@ -182,29 +181,20 @@ class multiday_order(multiday_orderTemplate):
     if hasattr(self, 'lbl_paused'):
       self.lbl_paused.visible = bool(pz)
       if pz:
-        self.lbl_paused.text = (f"⏸ PAUSED to {pz.get('to')}" + (f": {pz.get('reason')}" if pz.get('reason') else '')
-                                + ' - the order comes back first that morning.')
-    # the order's other lines: links, never on this grid
-    sibs = d.get('siblings') or []
-    if hasattr(self, 'flow_siblings'):
-      self.flow_siblings.visible = bool(sibs)
-    if hasattr(self, 'lbl_sib_prompt'):
-      self.lbl_sib_prompt.text = (f"{d['order']} also has {len(sibs)} other work order(s):" if sibs else '')
-    for n in (1, 2, 3):
-      lk = getattr(self, f'lk_sib{n}', None)
-      if lk is None:
-        continue
-      if n <= len(sibs):
-        sb = sibs[n - 1]
-        lk.visible = True
-        lk.tag = sb['item']
-        lk.text = (f"-{sb['item']} {sb['sku']} · {float(sb['qty']):g} pc · {float(sb['inches']):,.0f} in"
-                   + (' · built' if sb.get('done') else f" · {float(sb['remaining']):g} left")
-                   + (f" · {float(sb['asm']):g} assembler(s)" if sb.get('asm') else ' · pool') + '  ')
-      else:
-        lk.visible = False
-    if len(sibs) > 3 and hasattr(self, 'lbl_sib_prompt'):
-      self.lbl_sib_prompt.text += f" (first 3 shown)"
+        self.lbl_paused.text = (f"⏰ SNOOZED to {pz.get('to')}" + (f": {pz.get('reason')}" if pz.get('reason') else '')
+                                + ' - this work order comes back first that morning.')
+    # v1.9.1: every work order of the sales order in the grid under the controls
+    items = d.get('items') or []
+    for it in items:
+      it['on_load'] = self._load_item
+    if hasattr(self, 'rp_items'):
+      self.rp_items.items = items
+    if hasattr(self, 'lbl_items_title'):
+      self.lbl_items_title.text = f"Work orders on sales order {d['order']} ({len(items)})"
+    if hasattr(self, 'lbl_items_note'):
+      self.lbl_items_note.text = ('⧗ = multi-day (over the day line, or started). Load shows that work order here. '
+                                  f"Big orders get up to {float(d.get('multiday_share_pct') or 0):g}% of a day "
+                                  f"(about {pool:,.0f} in) between them - the multi-day pool, set in Parameters.")
     if hasattr(self, 'lbl_grid_note'):
       self.lbl_grid_note.text = ('assemblers: type a number per day (blank = carried from the day before, 0 = nobody). '
                                  'est. = what the 06:30 run would propose with those numbers; not a commitment. '
@@ -237,9 +227,9 @@ class multiday_order(multiday_orderTemplate):
     if hasattr(self, 'btn_resume'):
       self.btn_resume.visible = bool(pz)
     if hasattr(self, 'lbl_pause_hint'):
-      self.lbl_pause_hint.text = ('paused - Resume brings the order back on the next 06:30 run' if pz
-                                  else (f"the whole order {d['order']} leaves the plan until that date and comes back first" if on_board
-                                        else 'pause applies to an order on the board'))
+      self.lbl_pause_hint.text = ('snoozed - Resume brings this work order back on the next 06:30 run' if pz
+                                  else ('this work order leaves the plan until that date and comes back first; the order\'s other lines carry on' if on_board
+                                        else 'snooze applies to a work order on the board'))
     if hasattr(self, 'cb_done'):
       self.cb_done.checked = bool(ln.get('done'))
       self.cb_done.enabled = ln.get('built_basis') != 'tablet Complete'
@@ -391,14 +381,14 @@ class multiday_order(multiday_orderTemplate):
     if not why:
       alert('A pause needs a reason.')
       return
-    if not confirm(f"Pause the whole order {self.order} until {to}? Its lines leave today's plan; it comes back first that morning."):
+    if not confirm(f"Snooze work order {self.order}-{self.item} until {to}? It leaves today's plan and comes back first that morning."):
       return
     r = anvil.server.call('ship_plan_multiday_set', self.data.get('board_date'), self.order,
-                          pause_to=to, pause_reason=why)
+                          pause_to=to, pause_reason=why, item=self.item)
     if r.get('status') != 'success':
-      alert(r.get('message', 'Pause failed'))
+      alert(r.get('message', 'Snooze failed'))
       return
-    Notification(f"{self.order}: paused to {r.get('paused_to')} ({r.get('n_lines')} line(s))", timeout=5).show()
+    Notification(f"{self.order}-{self.item}: snoozed to {r.get('paused_to')}", timeout=5).show()
     if hasattr(self, 'tb_pause_to'):
       self.tb_pause_to.text = ''
     if hasattr(self, 'tb_pause_why'):
@@ -408,14 +398,14 @@ class multiday_order(multiday_orderTemplate):
   def _resume(self, **event_args):
     pz = (self.data or {}).get('paused') or {}
     tb = TextBox(placeholder='note (optional)')
-    if not confirm(f"Resume {self.order} (paused to {pz.get('to') or '?'})? It is proposed first on the next morning run.",
+    if not confirm(f"Resume {self.order}-{self.item} (snoozed to {pz.get('to') or '?'})? It is proposed first on the next morning run.",
                    content=tb):
       return
-    r = anvil.server.call('ship_plan_multiday_resume', self.order, note=(tb.text or '').strip() or None)
+    r = anvil.server.call('ship_plan_multiday_resume', self.order, note=(tb.text or '').strip() or None, item=self.item)
     if r.get('status') != 'success':
       alert(r.get('message', 'Resume failed'))
       return
-    Notification(r.get('message') or f'{self.order} resumed', timeout=5).show()
+    Notification(r.get('message') or f'{self.order}-{self.item} resumed', timeout=5).show()
     self.load()
 
   # ------------------------------------------------------------------

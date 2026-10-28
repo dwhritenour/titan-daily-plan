@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.9' # v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.9.1' # v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2867,7 +2867,7 @@ def ship_plan_set_qty(plan_date, order, rel, item, qty, why=None):
 
 
 @anvil.server.callable
-def ship_plan_multiday_set(plan_date, order, partials=None, pause_to=None, pause_reason=None):
+def ship_plan_multiday_set(plan_date, order, partials=None, pause_to=None, pause_reason=None, item=None):
   """v1.6 (step 3, decisions 5 and 6): PC's two multi-day decisions for an
   ORDER, from the star of any of its lines.
   partials: 'OK' (ship each day's pieces) / 'COMPLETE' (hold until the
@@ -2881,7 +2881,9 @@ def ship_plan_multiday_set(plan_date, order, partials=None, pause_to=None, pause
     first in line (started order). The note keeps its SPLIT clause and
     gains ' · PAUSED to <date>: <reason>'. Logged as Snoozed / ReasonSet.
     The paused lines stay Snoozed on this plan day (Resume does not revive
-    them today - the plan line's PK is taken; tomorrow's run proposes anew)."""
+    them today - the plan line's PK is taken; tomorrow's run proposes anew).
+  v1.9.1 (Dave 10-27): a snooze is per WORK ORDER - pass item and only that
+    line of the order is snoozed; partials stay the sales order's."""
   plan_date = _parse_date(plan_date)
   actor = _current_actor()
   partials = (partials or '').strip().upper() or None
@@ -2901,10 +2903,13 @@ def ship_plan_multiday_set(plan_date, order, partials=None, pause_to=None, pause
         FROM dbo.pc_ship_plan_line
         WHERE plan_date = %s AND nx_order_numb = %s AND line_status IN %s
           AND (priority_note LIKE %s OR priority_note LIKE %s)
-    """, (plan_date, order, ('Planned', 'Proposed', 'Confirmed'), _MD_PRIOR_LIKE, _MD_DONE_PREFIX + '%'))
+          AND (%s IS NULL OR nx_item_no = %s)
+    """, (plan_date, order, ('Planned', 'Proposed', 'Confirmed'), _MD_PRIOR_LIKE, _MD_DONE_PREFIX + '%',
+          item, item))
     lines = cursor.fetchall()
     if not lines:
-      return {'status': 'error', 'message': f'{order} has no multi-day line on {plan_date}.'}
+      return {'status': 'error', 'message': (f'{order}-{item} is not a multi-day line on {plan_date}.' if item
+                                             else f'{order} has no multi-day line on {plan_date}.')}
     changed = []
     for l in lines:
       note = l['priority_note'] or ''
@@ -2929,7 +2934,7 @@ def ship_plan_multiday_set(plan_date, order, partials=None, pause_to=None, pause
         """, (pause_to, new, actor, plan_date, order, l['nx_rel_numb'], l['nx_item_no']))
         _log_event(cursor, plan_date, order, l['nx_sku'], 'Snoozed',
                    old_value=l['line_status'], new_value=pause_to.isoformat(), actor=actor,
-                   note=('PAUSED (multi-day): ' + pause_reason.strip())[:400],
+                   note=('SNOOZED (multi-day work order): ' + pause_reason.strip())[:400],
                    rel=l['nx_rel_numb'], item=l['nx_item_no'])
       elif new != note:
         cursor.execute("""
@@ -2952,11 +2957,11 @@ def ship_plan_multiday_set(plan_date, order, partials=None, pause_to=None, pause
 
 
 @anvil.server.callable
-def ship_plan_multiday_resume(order, note=None):
+def ship_plan_multiday_resume(order, note=None, item=None):
   """v1.6: end a pause early. The paused lines (Snoozed with a PAUSED clause,
   any plan day) get snooze_to_date = yesterday so they no longer block the
   order; the next morning run proposes it first (not today: the day's
-  lines keep their Snoozed row)."""
+  lines keep their Snoozed row). v1.9.1: with item, that work order only."""
   actor = _current_actor()
   conn = get_connection()
   try:
@@ -2966,10 +2971,11 @@ def ship_plan_multiday_resume(order, note=None):
         FROM dbo.pc_ship_plan_line
         WHERE nx_order_numb = %s AND line_status = 'Snoozed' AND priority_note LIKE %s
           AND ISNULL(snooze_to_date, plan_date) >= CAST(GETDATE() AS DATE)
-    """, (order, '% · PAUSED%'))
+          AND (%s IS NULL OR nx_item_no = %s)
+    """, (order, '% · PAUSED%', item, item))
     rows = cursor.fetchall()
     if not rows:
-      return {'status': 'error', 'message': f'{order} is not paused.'}
+      return {'status': 'error', 'message': (f'{order}-{item} is not snoozed.' if item else f'{order} is not snoozed.')}
     for l in rows:
       new = _MD_PAUSED_RE.sub(f" · RESUMED {date.today().isoformat()}", l['priority_note'] or '')[:200]
       cursor.execute("""
@@ -2984,7 +2990,7 @@ def ship_plan_multiday_resume(order, note=None):
                  rel=l['nx_rel_numb'], item=l['nx_item_no'])
     conn.commit()
     return {'status': 'success', 'order': order, 'n_lines': len(rows),
-            'message': f'{order} resumed - it is proposed first on the next morning run.'}
+            'message': f"{order}{('-' + item) if item else ''} resumed - it is proposed first on the next morning run."}
   except Exception as e:
     conn.rollback()
     return {'status': 'error', 'message': f'Resume failed: {e}'}
@@ -3258,14 +3264,16 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
     pool = target * ap['multiday_share_pct']
     asm_day = _md_assembler_day(cursor, cap)
     cursor.execute("""
-        SELECT TOP 1 snooze_to_date, priority_note FROM dbo.pc_ship_plan_line
+        SELECT nx_item_no, MAX(snooze_to_date) AS to_date, MAX(priority_note) AS note
+        FROM dbo.pc_ship_plan_line
         WHERE nx_order_numb = %s AND line_status = 'Snoozed' AND priority_note LIKE %s
           AND ISNULL(snooze_to_date, plan_date) >= CAST(GETDATE() AS DATE)
-        ORDER BY snooze_to_date DESC
+        GROUP BY nx_item_no
     """, (order, '% · PAUSED%'))
-    pz = cursor.fetchone()
-    paused = ({'to': str(pz['snooze_to_date'])[:10],
-               'reason': (_md_parse_note(pz['priority_note']) or {}).get('pause_reason')} if pz else None)
+    snoozed = {str(r['nx_item_no']): {'to': str(r['to_date'])[:10],
+                                      'reason': (_md_parse_note(r['note']) or {}).get('pause_reason')}
+               for r in cursor.fetchall()}                 # v1.9.1: per work order
+    paused = snoozed.get(item)
     # PC's headcount rows for the order: per item, per day; a day without an
     # entry carries the previous number; 0 = nobody; none at all = pool rule
     cursor.execute("""
@@ -3391,11 +3399,34 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
     share_in = (min(pool, a_now * asm_day) if a_now else (0.0 if a_now == 0 else pool))
     crew = float(cap.get('effective_crew') or 0)
     my_days = [pr['plan_date'] for pr in projection if any(l['item'] == item for l in pr['lines'])]
-    siblings = [{'rel': l['nx_rel_numb'], 'item': str(l['nx_item_no']), 'sku': l['nx_sku'],
-                 'qty': float(l['qty'] or 0), 'inches': float(l['work_inches'] or 0),
-                 'remaining': rem0[str(l['nx_item_no'])]['remaining'], 'done': rem0[str(l['nx_item_no'])]['done'],
-                 'asm': asm_eff(str(l['nx_item_no']), nb.isoformat())[0]}
-                for l in lines if str(l['nx_item_no']) != item]
+    # v1.9.1: every open line of the sales order, for the grid under the
+    # controls (Load swaps the page to that work order)
+    max_line = target * ap['max_line_pct']
+    on_board_today = {}
+    for r in plan_rows:
+      if str(r['plan_date'])[:10] == nb.isoformat() and r['line_status'] in ('Planned', 'Proposed', 'Confirmed'):
+        on_board_today[str(r['nx_item_no'])] = float(r['qty_planned'] or 0)
+    items = []
+    for l in lines:
+      it = str(l['nx_item_no'])
+      r_ = rem0[it]
+      a, _w = asm_eff(it, nb.isoformat())
+      if r_['done']:
+        status = 'built'
+      elif it in snoozed:
+        status = f"snoozed to {snoozed[it]['to']}"
+      elif it in on_board_today:
+        status = f"on the board today: {on_board_today[it]:g} pc"
+      elif r_['days_planned']:
+        status = f"started {r_['days_planned'][0][5:7].lstrip('0')}/{r_['days_planned'][0][8:10].lstrip('0')}, not on the board today"
+      else:
+        status = 'not started'
+      items.append({'rel': l['nx_rel_numb'], 'item': it, 'sku': l['nx_sku'], 'desc': l.get('nx_sku_desc'),
+                    'qty': float(l['qty'] or 0), 'inches': float(l['work_inches'] or 0),
+                    'remaining': r_['remaining'], 'done': r_['done'], 'status': status,
+                    'multiday': bool(r_['days_planned']) or float(l['work_inches'] or 0) > max_line + 1e-9,
+                    'asm': a, 'current': it == item})
+    siblings = [x for x in items if not x['current']]
     return {'status': 'success', 'order': order, 'order_type': otype,
             'customer': _customer_label(line.get('nx_cust_name'), line.get('nx_cust_city'),
                                         line.get('nx_cust_state'), line.get('nx_shipto_code')),
@@ -3406,7 +3437,7 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
                      'built_basis': r0['built_basis'], 'done': r0['done'],
                      'days_planned': r0['days_planned'], 'day_no': len(r0['days_planned']) + 1,
                      'work_orders': [w['work_order_number'] for w in wos if w['item'] == item]},
-            'siblings': siblings,
+            'siblings': siblings, 'items': items, 'multiday_share_pct': round(100.0 * ap['multiday_share_pct'], 0),
             'week_start': monday.isoformat(), 'week_label': f"week of {monday:%m/%d}",
             'prev_week': (monday - timedelta(days=7)).isoformat(), 'next_week': (monday + timedelta(days=7)).isoformat(),
             'asm_by_day': asm_by_day, 'has_headcount': bool(hist.get(item)),
@@ -3436,13 +3467,13 @@ def _md_candidate_text(cursor, rows):
   nb = _next_business_day()
   prior = _md_prior_shares(cursor, nb + timedelta(days=1))
   cursor.execute("""
-      SELECT nx_order_numb, MAX(snooze_to_date) AS to_date, MAX(priority_note) AS note
+      SELECT nx_order_numb, nx_item_no, MAX(snooze_to_date) AS to_date, MAX(priority_note) AS note
       FROM dbo.pc_ship_plan_line
       WHERE line_status = 'Snoozed' AND priority_note LIKE %s
         AND ISNULL(snooze_to_date, plan_date) >= CAST(GETDATE() AS DATE)
-      GROUP BY nx_order_numb
+      GROUP BY nx_order_numb, nx_item_no
   """, ('% · PAUSED%',))
-  paused = {r['nx_order_numb']: r for r in cursor.fetchall()}
+  paused = {(r['nx_order_numb'], str(r['nx_item_no'])): r for r in cursor.fetchall()}   # v1.9.1: per work order
   ap = _agent_params(cursor)
   cap = float(_capacity_for(cursor, nb, prefer_estimate=True).get('capacity_inches_effective') or 0)
   max_line = cap * ap['fill_pct'] * ap['max_line_pct']
@@ -3462,10 +3493,10 @@ def _md_candidate_text(cursor, rows):
     k = (r['nx_order_numb'], r['nx_rel_numb'], str(r['nx_item_no']))   # the caller's key (row identity)
     o = r['nx_order_numb']
     gk = (o, str(r.get('ship_by_date') or '')[:10])
-    if o in paused:
-      p = paused[o]
+    if (o, str(r['nx_item_no'])) in paused:
+      p = paused[(o, str(r['nx_item_no']))]
       md = _md_parse_note(p['note']) or {}
-      out[k] = (f"multi-day · PAUSED to {str(p['to_date'])[:10]}"
+      out[k] = (f"multi-day · SNOOZED to {str(p['to_date'])[:10]}"
                 + (f": {md.get('pause_reason')}" if md.get('pause_reason') else ''))
     elif o in started_orders:
       e = started_orders[o]
