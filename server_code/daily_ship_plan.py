@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.9.2.1' # v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.10' # v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2611,43 +2611,36 @@ def _md_crew(cursor, orders):
 
 
 def _md_tablet_facts(cursor, orders, days_back=30):
-  """v1.5.1: the Assembly tablet per e21 line of the given orders, from the
-  floor taps of the last days_back days (Assign is the board, not the floor;
-  v1.6.2: assembly operators only - the Screen kiosk shares the table):
+  """v1.5.1: the Assembly tablet per e21 line of the given orders:
   {(order, item): {'state': running | paused | done | None,
-                        'count_total': pieces from Count taps (note 'pieces=N',
-                        migration 118), 'done_at', 'first_start', 'last_tap'}}."""
+                   'count_total': pieces from Count taps (note 'pieces=N', 118),
+                   'pct': work_orders.assembly_progress (25 / 50 / 75 / 100) or None,
+                   'who': the last assembler who tapped, 'done_at', 'first_start',
+                   'last_tap'}}.
+  v1.10 (10-29): the Assembler app (Chuck, 120) does not write work_order_events -
+  it writes dbo.assembly_so_events PER SALES ORDER (Start / Stop / Restart /
+  Complete, auto-stops at clock-out) and work_orders.assembly_progress in
+  quarters; its Complete stamps the order's work orders 100 / Complete. So:
+    1. work_order_events ASSEMBLY taps (kept - Count would arrive here, 118);
+    2. assembly_so_events of the order -> every OPEN line of the order (the tap
+       cannot say which line; a Complete older than the line's work order belongs
+       to an earlier release and is ignored);
+    3. assembly_progress of the open work orders (100 = built);
+    4. the Assemble routing step completed from the floor (pc_wo_routing_step_events;
+       none yet - the tablet does not call sp_pc_complete_step; ready for the day it does).
+  Shipped / closed / invoiced work orders belong to an earlier release (v1.8)."""
   orders = [o for o in set(orders or []) if o]
   if not orders:
     return {}
-  cursor.execute("""
-      SELECT wo.sales_order_number AS o, wo.sales_order_rel AS rel,
-             CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
-             e.event_type, e.event_at, e.note
-      FROM dbo.work_order_events e
-      JOIN dbo.work_orders wo ON wo.work_order_id = e.work_order_id
-      WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
-        -- v1.8: a work order that shipped / closed belongs to an earlier release
-        -- of the line (602392 rel 002, 10-27) - its taps are not the open line's
-        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
-        AND e.event_type IN ('Start', 'Restart', 'Stop', 'Complete', 'Reopen', 'Count')
-        AND e.event_at >= DATEADD(day, -%s, CAST(GETDATE() AS DATE))
-        -- v1.6.2: work_order_events is shared with the Screen / Element kiosk (OP codes,
-        -- dbo.screen_operators, tapping since June). Only an ASSEMBLY operator's tap is an
-        -- assembly fact: a screen Complete is the element, not the valve (597535, 10-26).
-        AND (e.operator IN (SELECT operator_code FROM dbo.assembly_operators WHERE department_id = 1)
-             OR e.note LIKE 'dept=Assembly%%')
-      ORDER BY e.event_at, e.event_id
-  """, (tuple(orders), int(days_back)))
   out = {}
-  for e in cursor.fetchall():
-    k = (e['o'], str(e['item'] or ''))            # v1.8: item, not release
-    t = out.setdefault(k, {'state': None, 'count_total': 0, 'done_at': None,
-                           'first_start': None, 'last_tap': None})
-    at = e['event_at']
+  def rec(k):
+    return out.setdefault(k, {'state': None, 'count_total': 0, 'done_at': None,
+                              'first_start': None, 'last_tap': None, 'pct': None, 'who': None})
+  def tap(t, typ, at, who=None):
     d = at.date() if isinstance(at, datetime) else at
     t['last_tap'] = d
-    typ = e['event_type']
+    if who:
+      t['who'] = who
     if typ in ('Start', 'Restart', 'Reopen'):
       t['state'] = 'running'
       t['first_start'] = t['first_start'] or d
@@ -2656,12 +2649,88 @@ def _md_tablet_facts(cursor, orders, days_back=30):
     elif typ == 'Complete':
       t['state'] = 'done'
       t['done_at'] = at
-    elif typ == 'Count':
+  # 1. the work-order table (assembly operators only; the Screen kiosk shares it, v1.6.2)
+  cursor.execute("""
+      SELECT wo.sales_order_number AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+             e.event_type, e.event_at, e.note, e.operator
+      FROM dbo.work_order_events e
+      JOIN dbo.work_orders wo ON wo.work_order_id = e.work_order_id
+      WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
+        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
+        AND e.event_type IN ('Start', 'Restart', 'Stop', 'Complete', 'Reopen', 'Count')
+        AND e.event_at >= DATEADD(day, -%s, CAST(GETDATE() AS DATE))
+        AND (e.operator IN (SELECT operator_code FROM dbo.assembly_operators WHERE department_id = 1)
+             OR e.note LIKE 'dept=Assembly%%')
+      ORDER BY e.event_at, e.event_id
+  """, (tuple(orders), int(days_back)))
+  for e in cursor.fetchall():
+    t = rec((e['o'], str(e['item'] or '')))
+    if e['event_type'] == 'Count':
       mm = re.search(r'pieces\s*=\s*(\d+)', e['note'] or '', re.I) or re.match(r'\s*(\d+)\s*$', e['note'] or '')
       if mm:
         t['count_total'] += int(mm.group(1))
         if t['state'] is None:
           t['state'] = 'running'
+      t['last_tap'] = e['event_at'].date() if isinstance(e['event_at'], datetime) else e['event_at']
+    else:
+      tap(t, e['event_type'], e['event_at'], e.get('operator'))
+  # 2. the Assembler app's own table, per sales order -> every open line of the order
+  cursor.execute("""
+      SELECT LTRIM(RTRIM(wo.sales_order_number)) AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+             a.event_type, a.event_time AS event_at, a.operator_code, a.note,
+             -- a Complete is this line's only if the work order existed and the app closed it
+             -- (100 / Complete); otherwise it was an earlier release's (588987: 09-14 taps, 140/150 open)
+             CASE WHEN a.event_type = 'Complete'
+                   AND ((wo.created_at IS NOT NULL AND a.event_time < wo.created_at)
+                        OR NOT (ISNULL(wo.assembly_progress, 0) >= 100 OR wo.status = 'Complete'))
+                  THEN 1 ELSE 0 END AS stale
+      FROM dbo.assembly_so_events a
+      JOIN dbo.work_orders wo ON LTRIM(RTRIM(wo.sales_order_number)) = LTRIM(RTRIM(a.sales_order_number))
+      WHERE LTRIM(RTRIM(a.sales_order_number)) IN %s AND wo.status <> 'Cancelled'
+        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
+        AND a.event_type IN ('Start', 'Restart', 'Stop', 'Complete')
+        AND a.event_time >= DATEADD(day, -%s, CAST(GETDATE() AS DATE))
+      ORDER BY a.event_time, a.event_id
+  """, (tuple(orders), int(days_back)))
+  for e in cursor.fetchall():
+    if e['stale']:
+      continue
+    tap(rec((e['o'], str(e['item'] or ''))), e['event_type'], e['event_at'], e.get('operator_code'))
+  # 3. progress in quarters on the open work orders (100 = built)
+  cursor.execute("""
+      SELECT LTRIM(RTRIM(sales_order_number)) AS o, CAST(sales_order_line AS VARCHAR(10)) AS item,
+             MAX(assembly_progress) AS pct
+      FROM dbo.work_orders
+      WHERE sales_order_number IN %s AND status <> 'Cancelled' AND assembly_progress IS NOT NULL
+        AND status NOT LIKE 'Shipped%%' AND status NOT LIKE 'Closed%%' AND status NOT LIKE 'Invoiced%%'
+        AND status <> 'Complete'          -- a closed earlier release at 100 is not the open line's progress
+      GROUP BY LTRIM(RTRIM(sales_order_number)), CAST(sales_order_line AS VARCHAR(10))
+  """, (tuple(orders),))
+  for r in cursor.fetchall():
+    t = rec((r['o'], str(r['item'] or '')))
+    t['pct'] = int(r['pct'] or 0)
+    if t['pct'] >= 100 and t['state'] != 'done':
+      t['state'] = 'done'
+    elif t['pct'] > 0 and t['state'] is None:
+      t['state'] = 'running'
+  # 4. the Assemble routing step closed from the floor (none yet, 10-29)
+  cursor.execute("""
+      SELECT LTRIM(RTRIM(wo.sales_order_number)) AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+             MIN(ev.event_at) AS done_at, MIN(ev.event_by) AS who
+      FROM dbo.pc_wo_routing_step_events ev
+      JOIN dbo.pc_wo_routing_steps s ON s.wo_step_id = ev.wo_step_id
+      JOIN dbo.pc_departments d ON d.department_id = s.department_id
+      JOIN dbo.work_orders wo ON wo.work_order_id = s.work_order_id
+      WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
+        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
+        AND d.department_name = 'Assemble' AND ev.event_type = 'Complete'
+        AND ev.event_by NOT LIKE 'AUTO%%' AND ev.event_by NOT LIKE 'migration%%'
+      GROUP BY LTRIM(RTRIM(wo.sales_order_number)), CAST(wo.sales_order_line AS VARCHAR(10))
+  """, (tuple(orders),))
+  for r in cursor.fetchall():
+    t = rec((r['o'], str(r['item'] or '')))
+    if t['state'] != 'done':
+      tap(t, 'Complete', r['done_at'], r.get('who'))
   return out
 
 
@@ -3151,10 +3220,10 @@ def _md_grid_rows(line, rem0, plan_rows, asm_cells, taps, projection, day_list, 
       planned[dkey(r['plan_date'])] = r
   counted, tapped = {}, {}
   for t in taps:
-    if str(t['item']) != item:
+    if t.get('item') is not None and str(t['item']) != item:
       continue
     d = dkey(t['d'])
-    tapped.setdefault(d, []).append(t['event_type'])
+    tapped.setdefault(d, []).append((t.get('operator') or '?', t['event_type']))   # v1.10: who, what
     if t['event_type'] == 'Count':
       m = re.search(r'pieces\s*=\s*(\d+)', t.get('note') or '', re.I)
       if m:
@@ -3202,9 +3271,13 @@ def _md_grid_rows(line, rem0, plan_rows, asm_cells, taps, projection, day_list, 
   tap_cells = {}
   for d in days:
     ev = tapped.get(d, [])
-    tap_cells[d] = (', '.join(f"{ev.count(x)} {x}" for x in ('Start', 'Count', 'Stop', 'Restart', 'Complete') if ev.count(x))
+    by = {}
+    for who, typ in ev:                       # v1.10: 'ASM9 start, stop / ASM3 complete'
+      by.setdefault(who, []).append(typ.lower())
+    tap_cells[d] = (' / '.join(f"{who} {', '.join(x for i, x in enumerate(ts) if x not in ts[:i])}" for who, ts in by.items())
                     or ('no tap' if d <= tkey else '-'))
-  rows.append({'kind': 'tablet', 'label': 'tablet (assembly)', 'cells': tap_cells})
+  pct = (rem0.get('pct') if isinstance(rem0, dict) else None)
+  rows.append({'kind': 'tablet', 'label': 'tablet (assembly)' + (f" · {int(pct)}% built" if pct else ''), 'cells': tap_cells})
   return rows
 
 
@@ -3314,9 +3387,19 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
         if hd <= d:
           v, when = hv, hd
       return v, when
+    # v1.10: the Assembler app taps PER SALES ORDER (assembly_so_events) - the grid's
+    # tablet row shows the order's trail (item None = every line); Count taps per
+    # work order (work_order_events, 118) would still land here with an item.
     cursor.execute("""
-        SELECT wo.sales_order_rel AS rel, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
-               CAST(e.event_at AS DATE) AS d, e.event_type, e.operator, e.note
+        SELECT CAST(NULL AS VARCHAR(10)) AS item, CAST(a.event_time AS DATE) AS d,
+               a.event_type, a.operator_code AS operator, a.note
+        FROM dbo.assembly_so_events a
+        WHERE LTRIM(RTRIM(a.sales_order_number)) = %s
+          AND a.event_type IN ('Start', 'Restart', 'Stop', 'Complete')
+          AND a.event_time >= %s
+        UNION ALL
+        SELECT CAST(wo.sales_order_line AS VARCHAR(10)) AS item, CAST(e.event_at AS DATE) AS d,
+               e.event_type, e.operator, e.note
         FROM dbo.work_order_events e
         JOIN dbo.work_orders wo ON wo.work_order_id = e.work_order_id
         LEFT JOIN dbo.assembly_operators ao ON ao.operator_code = e.operator AND ao.department_id = 1
@@ -3325,8 +3408,8 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
           AND e.event_type IN ('Start', 'Restart', 'Stop', 'Complete', 'Reopen', 'Count')
           AND (ao.operator_code IS NOT NULL OR e.note LIKE 'dept=Assembly%%')
           AND e.event_at >= %s
-        ORDER BY e.event_at
-    """, (order, lo))
+        ORDER BY d
+    """, (order, lo, order, lo))
     taps = [serialize_row(r) for r in cursor.fetchall()]
     cursor.execute("""
         SELECT sales_order_rel AS rel, CAST(sales_order_line AS VARCHAR(10)) AS item,
@@ -3347,13 +3430,15 @@ def ship_plan_multiday_get(order, item=None, week_start=None, days_back=10):
       t = tab.get((order, it)) or {}
       pr = prior.get((order, it))
       prior_q = _md_prior_qty(pr, l['nx_rel_numb'])
-      built = float(t.get('count_total') or 0) or prior_q
+      pct = t.get('pct')
+      built = float(t.get('count_total') or 0) or (need * float(pct) / 100.0 if pct else 0.0) or prior_q   # v1.10: quarters
       done = (t.get('state') == 'done') or bool(pc_done.get(None)) or bool(pc_done.get(it))
       per = (float(l['work_inches'] or 0) / need) if need > 0 else 0.0
-      rem[it] = {'remaining': 0.0 if done else max(0.0, need - built), 'per_piece': per, 'done': done,
+      rem[it] = {'remaining': 0.0 if done else max(0.0, need - built), 'per_piece': per, 'done': done, 'pct': pct,
                  'days_planned': sorted(str(d)[:10] for d in (pr['days'] if pr else [])),
-                 'built_basis': ('tablet count' if t.get('count_total') else ('tablet Complete' if t.get('state') == 'done'
-                                 else ('PC' if done else ('earlier shares' if prior_q else 'nothing'))))}
+                 'built_basis': ('tablet count' if t.get('count_total')
+                                 else ('tablet Complete' if (t.get('state') == 'done' and not pc_done.get(None) and not pc_done.get(it))
+                                 else ('PC' if done else (f"tablet {int(pct)}%" if pct else ('earlier shares' if prior_q else 'nothing')))))}
     rem0 = {k: dict(v) for k, v in rem.items()}
     # --- projection: from the first unplanned business day to the end of the week shown
     projection, d, n = [], start, 0
@@ -4173,6 +4258,11 @@ def _agent_propose_impl(plan_date=None, force=False, dry_run=False):
           if t.get('count_total'):
             remaining = max(0.0, need - float(t['count_total']))   # the count is the fact
             m['md_prior'] = float(t['count_total'])
+          elif t.get('pct'):
+            # v1.10: the Assembler app records progress in quarters (assembly_progress);
+            # that is the fact over the prior-share estimate until a Count exists
+            m['md_prior'] = round(need * float(t['pct']) / 100.0, 1)
+            remaining = max(0.0, need - m['md_prior'])
           else:
             remaining = max(0.0, need - m['md_prior'])
           lp = (mp.get('lines') or {}).get(str(m['nx_item_no'])) or {}

@@ -22,8 +22,9 @@ class wo_completed(wo_completedTemplate):
       lk_back         Link        'Plan board' -> ship_plan           - optional
     Optional ones are hasattr-guarded so the form runs before they exist.
 
-    Day basis = earliest of floor Complete and e21 shipped detection
-    (Dave, 2026-09-16). Work-inches = publish-time snapshot, else the day's
+    Day basis (wo-1.2.0, Dave 2026-10-29) = earliest of the Assembler tablet's
+    Complete on the sales order and the Assemble routing step's Complete; the
+    Screen room's taps and the e21 sweep are not assembly work. Work-inches = publish-time snapshot, else the day's
     plan line, else '-' (never invented). Zero-touch shown as Z, not totalled.
   """
 
@@ -93,8 +94,9 @@ class wo_completed(wo_completedTemplate):
       line.append(f"{r.get('n_plan_lines', 0)} plan lines, {t.get('n_planned_done', 0)} of them done")
       if float(r.get('stretch_inches') or 0) > 0:
         line.append(f"If-time {float(r['stretch_inches']):,.0f} in not in the plan figure")
-    line.append(f"{t['n']} work orders done: {t['n_floor']} closed on the floor, "
-                f"{t['n_e21']} by e21 shipment")
+    # wo-1.2.0: done = assembly's word - the Assembler tablet's Complete on the order, or the routing step
+    line.append(f"{t['n']} work orders assembled: {t.get('n_tablet', t['n_floor'])} by the Assembler tablet, "
+                f"{t.get('n_step', 0)} by the routing step")
     self.lbl_plan.text = '  ·  '.join(line)
     foot = [f"On plan {float(t['actual_planned_inches']):,.0f} in",
             f"unplanned {float(t['actual_unplanned_inches']):,.0f} in"]

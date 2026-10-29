@@ -40,7 +40,7 @@ except Exception:                       # module not pasted yet: done_inches sta
 # Migration 069. Shadow mode: the text goes to DAILY_PLAN_LEDGER (Dave).
 # =============================================================================
 
-_LEDGER_VERSION = 'ledger-1.1.0'
+_LEDGER_VERSION = 'ledger-1.2.0'   # 1.2.0 (10-29): done_inches = assembly's Complete (Assembler tablet per order / routing step), not the Screen room's
 _ACTIVE_PLAN = ('Planned', 'Confirmed', 'Proposed')
 
 

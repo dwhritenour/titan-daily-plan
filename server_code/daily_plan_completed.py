@@ -5,7 +5,7 @@ from .daily_ship_plan import (get_connection, _parse_date, serialize_row,
 make_serializable, _line_label)
 
 # =============================================================================
-# COMPLETED WORK ORDERS BY DAY  (wo-1.0.1, 2026-09-16)
+# COMPLETED WORK ORDERS BY DAY  (wo-1.2.0, 2026-10-29; wo-1.0.1 2026-09-16)
 #
 # Server module name: daily_plan_completed. It was first shipped as
 # 'wo_completed', the same name as the client FORM package; Anvil puts
@@ -38,6 +38,24 @@ make_serializable, _line_label)
 #     committed - not the agent's proposal.
 #   * ZERO-TOUCH (Dave's call): shown with a Z marker, excluded from the
 #     running total.
+#
+# wo-1.2.0 (2026-10-29, Dave): DONE = ASSEMBLY work, read from the floor.
+#   ledger 1.1.0 (10-28) had moved the day basis to the first 'Complete' in
+#   work_order_events - but every Complete there is an OP operator: the SE Dept
+#   App closing ITS routing step (the screen / basket), the work order going back
+#   to Released for assembly (10-28: 56 rows, 40 still Released, 2 on the plan).
+#   The Assembler app (Chuck, 120) writes dbo.assembly_so_events PER SALES ORDER
+#   (Start / Stop / Restart / Complete) and work_orders.assembly_progress in
+#   quarters; its Complete stamps the order's work orders 100 / Complete. So a
+#   work order is done at the EARLIEST of
+#     (a) its Assemble routing step completed from the floor
+#         (pc_wo_routing_step_events; none yet - the tablet does not call
+#         sp_pc_complete_step; ready for the day it does)            basis 'step'
+#     (b) the first assembly Complete tap on its sales order after the work
+#         order existed, provided the tap closed it (progress 100 / Complete or
+#         later) and it was not already completed a day or more before the tap
+#         (the e21 sweep's completions on another line of the order)  basis 'tablet'
+#   Event times in these tables are LOCAL (Eastern) - no time-zone shift.
 # Nothing here writes. No migration - it reads tables that already exist.
 # =============================================================================
 
@@ -45,11 +63,39 @@ _DONE_STATUSES = ('Complete', 'Shipped - Verify', 'Invoiced - Verify', 'Closed -
 _ACTIVE_PLAN = ('Planned', 'Confirmed', 'Proposed')
 
 _ROWS_SQL = """
-WITH first_complete AS (
-    SELECT e.work_order_id, MIN(e.event_at) AS first_at
-    FROM   dbo.work_order_events e
-    WHERE  e.event_type = 'Complete'
-    GROUP  BY e.work_order_id
+WITH step_done AS (
+    -- (a) the Assemble routing step closed from the floor (none yet, 10-29)
+    SELECT s.work_order_id, MIN(ev.event_at) AS done_at, MIN(ev.event_by) AS done_by
+    FROM   dbo.pc_wo_routing_step_events ev
+    JOIN   dbo.pc_wo_routing_steps s ON s.wo_step_id = ev.wo_step_id
+    JOIN   dbo.pc_departments d ON d.department_id = s.department_id
+    WHERE  ev.event_type = 'Complete' AND d.department_name = 'Assemble'
+      AND  ev.event_by NOT LIKE 'AUTO%%' AND ev.event_by NOT LIKE 'migration%%'
+    GROUP  BY s.work_order_id
+),
+tablet_done AS (
+    -- (b) the first assembly Complete tap on the work order's sales order (Assembler app)
+    SELECT w.work_order_id, MIN(a.event_time) AS done_at
+    FROM   dbo.work_orders w
+    JOIN   dbo.assembly_so_events a
+      ON   LTRIM(RTRIM(a.sales_order_number)) = LTRIM(RTRIM(w.sales_order_number))
+     AND   a.event_type = 'Complete'
+     AND   (w.created_at IS NULL OR a.event_time >= w.created_at)
+     AND   (w.completed_at IS NULL OR w.completed_at >= DATEADD(hour, -24, a.event_time))
+    WHERE  w.status <> 'Cancelled'
+      AND  (ISNULL(w.assembly_progress, 0) >= 100
+            OR w.status IN ('Complete', 'Shipped - Verify', 'Invoiced - Verify', 'Closed - Verify'))
+    GROUP  BY w.work_order_id
+),
+done AS (
+    SELECT COALESCE(sd.work_order_id, td.work_order_id) AS work_order_id,
+           CASE WHEN sd.done_at IS NOT NULL AND (td.done_at IS NULL OR sd.done_at <= td.done_at)
+                THEN sd.done_at ELSE td.done_at END AS done_at,
+           CASE WHEN sd.done_at IS NOT NULL AND (td.done_at IS NULL OR sd.done_at <= td.done_at)
+                THEN 'step' ELSE 'tablet' END AS basis,
+           sd.done_at AS step_done_at, sd.done_by AS step_done_by, td.done_at AS tablet_done_at
+    FROM   step_done sd
+    FULL OUTER JOIN tablet_done td ON td.work_order_id = sd.work_order_id
 ),
 wo AS (
     SELECT w.work_order_id, w.work_order_number,
@@ -58,20 +104,24 @@ wo AS (
            LTRIM(RTRIM(CAST(w.sales_order_line AS VARCHAR(10)))) AS nx_item_no,
            w.part_number AS nx_sku, w.sku_desc,
            COALESCE(w.wo_override_qty, w.quantity)               AS wo_qty,
-           w.status, w.completed_by, w.assigned_assembler, w.completed_at,
-           fc.first_at AS floor_complete_at,
-           CAST(fc.first_at AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS datetime) AS done_at
-    FROM   first_complete fc
-    JOIN   dbo.work_orders w ON w.work_order_id = fc.work_order_id
-    WHERE  CAST(fc.first_at AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS date) = %s
+           w.status, w.completed_by, w.assigned_assembler, w.completed_at, w.assembly_progress,
+           dn.done_at AS floor_complete_at, dn.done_at, dn.basis, dn.step_done_at, dn.tablet_done_at,
+           COALESCE(dn.step_done_by, tb.operator_code)           AS done_by
+    FROM   done dn
+    JOIN   dbo.work_orders w ON w.work_order_id = dn.work_order_id
+    OUTER APPLY (SELECT TOP 1 a.operator_code FROM dbo.assembly_so_events a
+                 WHERE LTRIM(RTRIM(a.sales_order_number)) = LTRIM(RTRIM(w.sales_order_number))
+                   AND a.event_type = 'Complete' AND a.event_time = dn.tablet_done_at) tb
+    WHERE  CAST(dn.done_at AS date) = %s
 )
 SELECT wo.work_order_id, wo.work_order_number, wo.nx_order_numb, wo.nx_rel_numb, wo.nx_item_no,
        wo.nx_sku, wo.sku_desc,
        COALESCE(so.nx_qty_ordered, snap.qty_open, pl.qty_planned, wo.wo_qty) AS qty,
        COALESCE(so.nx_qty_ordered, snap.qty_open, pl.qty_planned)            AS qty_ordered,
        wo.wo_qty, so.part_type,
-       wo.status, wo.completed_by, wo.assigned_assembler,
+       wo.status, wo.completed_by, wo.assigned_assembler, wo.assembly_progress,
        wo.completed_at, wo.floor_complete_at, CAST(NULL AS datetime) AS shipped_detected_at, wo.done_at,
+       wo.basis, wo.done_by, wo.step_done_at, wo.tablet_done_at,
        snap.load_inches AS snap_load, snap.was_planned, snap.flag_codes, snap.tier AS snap_tier,
        CASE WHEN snap2.load_inches IS NULL THEN NULL
             WHEN ISNULL(snap2.qty_open, 0) > 0
@@ -137,8 +187,9 @@ def _plan_state(r):
 @anvil.server.callable
 def wo_completed_get_day(day):
   """Everything the form needs for ONE day in one round trip: the day's
-  published-plan header, the completed work orders in the order they were
-  done with a running total, and the totals."""
+  published-plan header, the work orders ASSEMBLY finished that day (wo-1.2.0:
+  the Assembler app's Complete on the order, or the Assemble routing step) in
+  the order they were done with a running total, and the totals."""
   day = _parse_date(day)
   conn = get_connection()
   try:
@@ -165,7 +216,7 @@ def wo_completed_get_day(day):
 
   rows, running = [], 0.0
   tot = {'n': 0, 'n_floor': 0, 'n_e21': 0, 'n_zero': 0, 'n_no_estimate': 0,
-         'n_done_floor': 0, 'n_done_no_estimate': 0,
+         'n_done_floor': 0, 'n_done_no_estimate': 0, 'n_tablet': 0, 'n_step': 0,   # wo-1.2.0
          'actual_inches': 0.0, 'actual_planned_inches': 0.0, 'actual_unplanned_inches': 0.0,
          'n_planned_done': 0}
   for r in raw:
@@ -182,10 +233,11 @@ def wo_completed_get_day(day):
     r['was_planned'] = was_planned
     state = _plan_state(r)
     on_plan = state in ('Planned', 'Stretch')
-    basis = 'floor'
+    basis = r.get('basis') or 'tablet'     # wo-1.2.0: 'tablet' (Assembler app, per order) | 'step' (routing)
     tot['n'] += 1
     tot['n_floor'] += 1
     tot['n_done_floor'] += 1
+    tot['n_tablet' if basis == 'tablet' else 'n_step'] += 1
     if on_plan:
       tot['n_planned_done'] += 1
     if zero:
@@ -204,6 +256,7 @@ def wo_completed_get_day(day):
       'plan_state': state,
       'on_plan': on_plan,
       'basis': basis,
+      'done_by': r.get('done_by'),
       'running_inches': round(running, 1),
     })
     rows.append(r)

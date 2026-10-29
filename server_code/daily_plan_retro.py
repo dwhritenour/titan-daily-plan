@@ -66,7 +66,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.8'   # 1.8 (124): every multi-day row says the crew - PC's headcount vs the Supervisor board's assignment (work_order_assemblers); 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.9'   # 1.9 (10-29): the Assembler app's taps are in assembly_so_events, per sales order (not work_order_events) - multi-day state and WORKED read them; 1.8 (124): every multi-day row says the crew - PC's headcount vs the Supervisor board's assignment (work_order_assemblers); 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 # retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
@@ -321,6 +321,52 @@ def _md_tablet(cursor, plan_date, days_back=30):
           t['count_today'] = (t['count_today'] or 0) + n
       if t['state'] is None:
         t['state'] = 'running'          # a count is proof of work even without a Start
+  # retro-1.9 (10-29): the Assembler app (120) writes dbo.assembly_so_events PER SALES
+  # ORDER (Start / Stop / Restart / Complete, auto-stop at clock-out), not
+  # work_order_events - so far the only assembly taps there are. A tap lands on every
+  # work order of the order; a Complete counts for a work order only if it existed
+  # then and the app closed it (assembly_progress 100 / status Complete) - otherwise
+  # it was an earlier release's (588987: 09-14 taps, 140 / 150 still open).
+  cursor.execute("""
+      SELECT LTRIM(RTRIM(wo.sales_order_number)) AS o, wo.sales_order_rel AS rel,
+             CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+             a.event_type, a.event_time AS event_at, a.operator_code,
+             CASE WHEN a.event_type = 'Complete'
+                   AND ((wo.created_at IS NOT NULL AND a.event_time < wo.created_at)
+                        OR NOT (ISNULL(wo.assembly_progress, 0) >= 100 OR wo.status = 'Complete'))
+                  THEN 1 ELSE 0 END AS stale
+      FROM dbo.assembly_so_events a
+      JOIN dbo.work_orders wo ON LTRIM(RTRIM(wo.sales_order_number)) = LTRIM(RTRIM(a.sales_order_number))
+      WHERE wo.status <> 'Cancelled'
+        AND a.event_type IN ('Start', 'Restart', 'Stop', 'Complete')
+        AND a.event_time >= DATEADD(day, -%s, %s)
+        AND a.event_time < DATEADD(day, 1, %s)
+      ORDER BY a.event_time, a.event_id
+  """, (int(days_back), plan_date, plan_date))
+  for e in cursor.fetchall():
+    if e['stale']:
+      continue
+    k = (e['o'], e['rel'] or '', e['item'] or '')
+    t = out.setdefault(k, {'state': None, 'last_tap': None, 'tapped_today': False,
+                           'done_at': None, 'count_today': None, 'count_total': 0,
+                           'first_start': None})
+    at = e['event_at']
+    d = at.date() if isinstance(at, datetime) else at
+    typ = e['event_type']
+    if t['last_tap'] is None or d >= t['last_tap']:
+      t['last_tap'] = d
+    if d == plan_date:
+      t['tapped_today'] = True
+    if typ in ('Start', 'Restart'):
+      if t['state'] != 'done':
+        t['state'] = 'running'
+      t['first_start'] = t['first_start'] or d
+    elif typ == 'Stop':
+      if t['state'] != 'done':
+        t['state'] = 'paused'
+    elif typ == 'Complete':
+      t['state'] = 'done'
+      t['done_at'] = t['done_at'] or at
   return out
 
 
@@ -576,10 +622,11 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
                CAST(wo.sales_order_line AS VARCHAR(10)) AS item, wo.part_number AS s,
                MAX(CASE WHEN wo.status IN ('Complete','Shipped - Verify','Closed - Verify')
                          AND wo.completed_at >= %s THEN 1 ELSE 0 END) AS done_since,
-               MAX(CASE WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END)   AS touched,
+               MAX(CASE WHEN e.event_id IS NOT NULL OR ae.hit = 1 THEN 1 ELSE 0 END)   AS touched,
                -- 1.7.3: which room tapped (OP = Screen / Element kiosk, ASM = Assembly tablet)
                -- 1.7.4: via the ao join - SQL Server refuses a subquery inside MAX (06:30 10-27 failed)
-               MAX(CASE WHEN ao.operator_code IS NOT NULL OR e.note LIKE 'dept=Assembly%%' THEN 2
+               -- 1.9: the Assembler app's own taps (assembly_so_events, per order) count as the tablet
+               MAX(CASE WHEN ao.operator_code IS NOT NULL OR e.note LIKE 'dept=Assembly%%' OR ae.hit = 1 THEN 2
                         WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END) AS touched_by,
                MAX(wo.status) AS wo_status
         FROM dbo.work_orders wo
@@ -589,9 +636,13 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
               AND CAST(e.event_at AS DATE) = %s
         LEFT JOIN dbo.assembly_operators ao
                ON ao.operator_code = e.operator AND ao.department_id = 1
+        OUTER APPLY (SELECT TOP 1 1 AS hit FROM dbo.assembly_so_events a
+                     WHERE LTRIM(RTRIM(a.sales_order_number)) = LTRIM(RTRIM(wo.sales_order_number))
+                       AND a.event_type IN ('Start', 'Restart', 'Stop', 'Complete')
+                       AND CAST(a.event_time AS DATE) = %s) ae
         WHERE wo.status <> 'Cancelled'
         GROUP BY wo.sales_order_number, wo.sales_order_rel, wo.sales_order_line, wo.part_number
-    """, (plan_date, plan_date))
+    """, (plan_date, plan_date, plan_date))
     wos, wos_sku = {}, {}
     for r in cursor.fetchall():
       wos[(r['o'], r['rel'], r['item'])] = r

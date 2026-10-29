@@ -18,7 +18,9 @@ class WoCompletedRow(WoCompletedRowTemplate):
     self.init_components(**properties)
     it = self.item
     self.lbl_time.text = (it.get('done_at') or '')[11:16]
-    self.lbl_time.tooltip = {'floor': 'closed on the floor (Complete event)',
+    self.lbl_time.tooltip = {'tablet': 'the Assembler tablet: Complete tapped on the sales order',
+                             'step': 'the Assemble routing step completed from the floor',
+                             'floor': 'closed on the floor (Complete event)',
                              'e21': 'e21 shows the line shipped (import detection)',
                              'completed_at': 'work order completed_at',
                              'ship': 'shipping clerk pressed Ship in e21',
@@ -35,7 +37,7 @@ class WoCompletedRow(WoCompletedRowTemplate):
         sub += f" of {float(qo):g}"
     if it.get('work_order_number'):
       sub += f"  · {it['work_order_number']}"
-    who = it.get('assigned_assembler') or ''
+    who = it.get('done_by') or it.get('assigned_assembler') or ''   # wo-1.2.0: who tapped Complete
     if who:
       sub += f"  · {who}"
     if it.get('customer'):                       # ship-1.0.0: shipped rows carry the customer
