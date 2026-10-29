@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.10' # v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.10.1' # v1.10.1: crew counted by person, not by work order row (ASM9*+ASM9* on 602392-50); v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2597,15 +2597,21 @@ def _md_crew(cursor, orders):
   orders = [o for o in set(orders or []) if o]
   if not orders:
     return {}
+  # v1.10.1: one person once - a line can have two open work orders (602392-50:
+  # rel 002 built, rel 003 open) with the same lead on both; count operators, not rows
   cursor.execute("""
-      SELECT wo.sales_order_number AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
-             COUNT(a.woa_id) AS n,
-             STRING_AGG(a.operator_code + CASE WHEN a.is_lead = 1 THEN '*' ELSE '' END, '+') AS who
-      FROM dbo.work_orders wo
-      JOIN dbo.work_order_assemblers a ON a.work_order_id = wo.work_order_id AND a.removed_at IS NULL
-      WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
-        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
-      GROUP BY wo.sales_order_number, wo.sales_order_line
+      SELECT p.o, p.item, COUNT(*) AS n,
+             STRING_AGG(p.operator_code + CASE WHEN p.lead = 1 THEN '*' ELSE '' END, '+') AS who
+      FROM (
+          SELECT wo.sales_order_number AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+                 a.operator_code, MAX(CASE WHEN a.is_lead = 1 THEN 1 ELSE 0 END) AS lead
+          FROM dbo.work_orders wo
+          JOIN dbo.work_order_assemblers a ON a.work_order_id = wo.work_order_id AND a.removed_at IS NULL
+          WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
+            AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
+          GROUP BY wo.sales_order_number, CAST(wo.sales_order_line AS VARCHAR(10)), a.operator_code
+      ) p
+      GROUP BY p.o, p.item
   """, (tuple(orders),))
   return {(r['o'], str(r['item'])): {'n': int(r['n'] or 0), 'who': r['who'] or ''} for r in cursor.fetchall()}
 
