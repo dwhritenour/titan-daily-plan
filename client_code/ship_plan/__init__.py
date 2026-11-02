@@ -1136,9 +1136,12 @@ class ship_plan(ship_planTemplate):
                + (f" ({when})" if when else '')
                + (f"   ·   {x['kind']}" if x.get('kind') == 'multi-day' else '')
                + (f"   ·   {x['reason']}" if x.get('reason') else '   ·   no reason given'))
-      pnl.add_component(Label(text=head, bold=True, font_size=13, spacing_above='medium', spacing_below='none'))
-      pnl.add_component(Label(text=facts, font_size=12, spacing_above='none', spacing_below='none'))
-      fp = FlowPanel(align='left', vertical_align='center', spacing_above='none', spacing_below='small')
+      # v1.12.3: tight stack - the three lines of one entry sit together, a gap before the next
+      tight = {'margin': ['0', None, '0', None], 'padding': ['1', '0', '1', '0']}
+      pnl.add_component(Label(text=head, bold=True, font_size=13,
+                              spacing={'margin': ['14', None, '0', None], 'padding': ['1', '0', '1', '0']}))
+      pnl.add_component(Label(text=facts, font_size=12, spacing=tight))
+      fp = FlowPanel(align='left', vertical_align='center', spacing=tight)
       def _open(e=None, d=x.get('plan_date')):
         self.dp_plan_date.date = datetime.strptime(d[:10], '%Y-%m-%d').date()
         self.load_day()
@@ -1155,9 +1158,9 @@ class ship_plan(ship_planTemplate):
           alert(rr.get('message', 'Unsnooze failed'))
         else:
           Notification(rr.get('message') or 'unsnoozed', timeout=5).show()
-      b1 = Link(text='Open', font_size=12, bold=True)
+      b1 = Link(text='Open', font_size=12, bold=True, spacing=tight)
       b1.set_event_handler('click', lambda **e: _open())
-      b2 = Link(text='Unsnooze', font_size=12, bold=True)
+      b2 = Link(text='Unsnooze', font_size=12, bold=True, spacing=tight)
       b2.set_event_handler('click', lambda **e: _un())
       fp.add_component(b1)
       fp.add_component(b2)
