@@ -66,7 +66,7 @@ from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
 make_serializable)
 
-_RETRO_VERSION = 'retro-1.9'   # 1.9 (10-29): the Assembler app's taps are in assembly_so_events, per sales order (not work_order_events) - multi-day state and WORKED read them; 1.8 (124): every multi-day row says the crew - PC's headcount vs the Supervisor board's assignment (work_order_assemblers); 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.9.1'   # 1.9.1: crew counted by person (ASM9*+ASM9*); 1.9 (10-29): the Assembler app's taps are in assembly_so_events, per sales order (not work_order_events) - multi-day state and WORKED read them; 1.8 (124): every multi-day row says the crew - PC's headcount vs the Supervisor board's assignment (work_order_assemblers); 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 # retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
@@ -230,17 +230,22 @@ def _md_crew(cursor, plan_date, lines):
   out = {}
   for r in cursor.fetchall():
     out[(r['nx_order_numb'], str(r['nx_item_no']))] = {'planned': float(r['assemblers_planned']), 'assigned': 0, 'who': ''}
+  # retro-1.9.1: one person once - a line can have two open work orders with the same lead
   cursor.execute("""
-      SELECT wo.sales_order_number AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
-             COUNT(a.woa_id) AS n,
-             STRING_AGG(a.operator_code + CASE WHEN a.is_lead = 1 THEN '*' ELSE '' END, '+') AS who
-      FROM dbo.work_orders wo
-      JOIN dbo.work_order_assemblers a ON a.work_order_id = wo.work_order_id
-      WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
-        AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
-        AND a.assigned_at < DATEADD(day, 1, CAST(%s AS DATE))
-        AND (a.removed_at IS NULL OR a.removed_at >= CAST(%s AS DATE))
-      GROUP BY wo.sales_order_number, wo.sales_order_line
+      SELECT p.o, p.item, COUNT(*) AS n,
+             STRING_AGG(p.operator_code + CASE WHEN p.lead = 1 THEN '*' ELSE '' END, '+') AS who
+      FROM (
+          SELECT wo.sales_order_number AS o, CAST(wo.sales_order_line AS VARCHAR(10)) AS item,
+                 a.operator_code, MAX(CASE WHEN a.is_lead = 1 THEN 1 ELSE 0 END) AS lead
+          FROM dbo.work_orders wo
+          JOIN dbo.work_order_assemblers a ON a.work_order_id = wo.work_order_id
+          WHERE wo.sales_order_number IN %s AND wo.status <> 'Cancelled'
+            AND wo.status NOT LIKE 'Shipped%%' AND wo.status NOT LIKE 'Closed%%' AND wo.status NOT LIKE 'Invoiced%%'
+            AND a.assigned_at < DATEADD(day, 1, CAST(%s AS DATE))
+            AND (a.removed_at IS NULL OR a.removed_at >= CAST(%s AS DATE))
+          GROUP BY wo.sales_order_number, CAST(wo.sales_order_line AS VARCHAR(10)), a.operator_code
+      ) p
+      GROUP BY p.o, p.item
   """, (tuple(orders), plan_date, plan_date))
   for r in cursor.fetchall():
     e = out.setdefault((r['o'], str(r['item'])), {'planned': None, 'assigned': 0, 'who': ''})
