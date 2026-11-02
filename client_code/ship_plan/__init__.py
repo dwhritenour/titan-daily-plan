@@ -1113,25 +1113,40 @@ class ship_plan(ship_planTemplate):
     siblings = [l for l in self._lines
                 if l['nx_order_numb'] == order
                 and l['line_status'] in ('Planned', 'Proposed', 'Confirmed')]
-    tb = TextBox(text=item.get('snooze_suggestion') or '',
-                 placeholder='YYYY-MM-DD')
+    # v1.11.1 (Dave 11-02): a date picker and a reason. A multi-day work order is
+    # PAUSED by the server (no copy of the whole line on the return day), so the
+    # reason is required there - it is what the retro and the page show.
+    is_md = bool(item.get('md'))
+    sug = item.get('snooze_suggestion') or ''
+    try:
+      sug_date = datetime.strptime(sug, '%Y-%m-%d').date() if sug else None
+    except ValueError:
+      sug_date = None
+    dp = DatePicker(date=sug_date, format='%Y-%m-%d', placeholder='pick the day it comes back')
+    tb_why = TextBox(placeholder=('why? (required - a multi-day work order)' if is_md else 'why? (optional)'))
     cb_all = None
-    content = tb
+    content = ColumnPanel()
     if len(siblings) > 1:
       cb_all = CheckBox(text=f'Snooze ALL {len(siblings)} lines of {order} on this plan')
-      content = ColumnPanel()
       content.add_component(cb_all)
-      content.add_component(tb)
+    content.add_component(Label(text='Snooze until'))
+    content.add_component(dp)
+    content.add_component(tb_why)
     if not confirm(f"Snooze {line_label(item)} "
                    "to which day?", content=content):
       return
-    try:
-      to_date = datetime.strptime((tb.text or '').strip(), '%Y-%m-%d').date()
-    except ValueError:
-      alert('Enter a date as YYYY-MM-DD.')
+    to_date = dp.date
+    if not to_date:
+      alert('Pick the day it comes back.')
+      return
+    if hasattr(to_date, 'date'):
+      to_date = to_date.date()
+    reason = (tb_why.text or '').strip()
+    if is_md and not reason:
+      alert('A multi-day work order needs a reason for the snooze - that is what PC sees when it comes back.')
       return
     if cb_all and cb_all.checked:
-      r = anvil.server.call('ship_plan_snooze_order', self.plan_date, order, to_date)
+      r = anvil.server.call('ship_plan_snooze_order', self.plan_date, order, to_date, reason or None)
       if r.get('status') == 'success':
         note = f"{order}: {len(r.get('moved') or [])} line(s) snoozed to {r.get('to_date')}"
         if r.get('skipped'):
@@ -1141,7 +1156,7 @@ class ship_plan(ship_planTemplate):
     else:
       r = anvil.server.call('ship_plan_snooze_line', self.plan_date,
                             order, item['nx_rel_numb'],
-                            item['nx_item_no'], to_date)
+                            item['nx_item_no'], to_date, reason or None)
     if r.get('status') != 'success':
       alert(r.get('message', 'Snooze failed'))
     self.load_day()
