@@ -1129,14 +1129,16 @@ class ship_plan(ship_planTemplate):
     if not rows:
       pnl.add_component(Label(text='Nothing is snoozed right now.'))
     for x in rows:
-      fp = FlowPanel(align='left', vertical_align='center')
+      # v1.12.2 (Dave 11-02): three lines per entry - the line, the facts, the actions
       when = (x.get('at') or '')[:16].replace('T', ' ')
-      txt = (f"{line_label(x)}  →  {(x.get('to_date') or '?')[:10]}"
-             f"   ·   snoozed on {(x.get('plan_date') or '')[:10]} by {x.get('by') or '?'}"
-             + (f" ({when})" if when else '')
-             + (f"   ·   {x['kind']}" if x.get('kind') == 'multi-day' else '')
-             + (f"   ·   {x['reason']}" if x.get('reason') else '   ·   no reason given'))
-      fp.add_component(Label(text=txt, font_size=12))
+      head = f"{line_label(x)}  →  {(x.get('to_date') or '?')[:10]}"
+      facts = (f"snoozed on {(x.get('plan_date') or '')[:10]} by {x.get('by') or '?'}"
+               + (f" ({when})" if when else '')
+               + (f"   ·   {x['kind']}" if x.get('kind') == 'multi-day' else '')
+               + (f"   ·   {x['reason']}" if x.get('reason') else '   ·   no reason given'))
+      pnl.add_component(Label(text=head, bold=True, font_size=13, spacing_above='medium', spacing_below='none'))
+      pnl.add_component(Label(text=facts, font_size=12, spacing_above='none', spacing_below='none'))
+      fp = FlowPanel(align='left', vertical_align='center', spacing_above='none', spacing_below='small')
       def _open(e=None, d=x.get('plan_date')):
         self.dp_plan_date.date = datetime.strptime(d[:10], '%Y-%m-%d').date()
         self.load_day()
