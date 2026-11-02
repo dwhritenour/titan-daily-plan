@@ -1670,6 +1670,125 @@ def ship_plan_remove_line(plan_date, order, rel, item, note=None):
 
 
 @anvil.server.callable
+def ship_plan_unsnooze_line(plan_date, order, rel, item, note=None):
+  """v1.12 (Dave 11-02): take a snooze back. A plain line goes back onto its
+  day (Planned on a published day, Proposed on a draft) and the copy the snooze
+  made on the return day is Removed. A multi-day line (PAUSED) ends its pause
+  the way Resume does: snooze_to_date = yesterday, RESUMED clause, proposed
+  first on the next morning run (today's row keeps its Snoozed status)."""
+  plan_date = _parse_date(plan_date)
+  actor = _current_actor()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT l.nx_sku, l.priority_note, l.snooze_to_date, h.plan_status
+        FROM dbo.pc_ship_plan_line l
+        JOIN dbo.pc_ship_plan h ON h.plan_date = l.plan_date
+        WHERE l.plan_date = %s AND l.nx_order_numb = %s AND l.nx_rel_numb = %s AND l.nx_item_no = %s
+          AND l.line_status = 'Snoozed'
+    """, (plan_date, order, rel, item))
+    l = cursor.fetchone()
+    if not l:
+      return {'status': 'error', 'message': f'{_line_label(order, rel, item)} is not snoozed on {plan_date}.'}
+    pn = l['priority_note'] or ''
+    to_date = l['snooze_to_date']
+    if ' · PAUSED' in pn:
+      new = _MD_PAUSED_RE.sub(f" · RESUMED {date.today().isoformat()}", pn)[:200]
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET snooze_to_date = DATEADD(day, -1, CAST(GETDATE() AS DATE)), priority_note = %s,
+              updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (new, actor, plan_date, order, rel, item))
+      _log_event(cursor, plan_date, order, l['nx_sku'], 'ReasonSet',
+                 old_value=f"paused to {to_date}", new_value='resumed', actor=actor,
+                 note=('RESUMED (multi-day)' + (': ' + note if note else ''))[:400], rel=rel, item=item)
+      msg = f"{_line_label(order, rel, item)} resumed - it is proposed first on the next morning run."
+    else:
+      back = 'Planned' if l['plan_status'] == 'Published' else 'Proposed'
+      cursor.execute("""
+          UPDATE dbo.pc_ship_plan_line
+          SET line_status = %s, snooze_to_date = NULL, updated_by = %s, updated_at = GETDATE()
+          WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+      """, (back, actor, plan_date, order, rel, item))
+      _log_event(cursor, plan_date, order, l['nx_sku'], 'ReasonSet',
+                 old_value=f"snoozed to {to_date}", new_value=f'unsnoozed ({back})', actor=actor,
+                 note=('UNSNOOZED' + (': ' + note if note else ''))[:400], rel=rel, item=item)
+      dropped = 0
+      if to_date is not None:
+        cursor.execute("""
+            UPDATE dbo.pc_ship_plan_line
+            SET line_status = 'Removed', updated_by = %s, updated_at = GETDATE()
+            WHERE plan_date = %s AND nx_order_numb = %s AND nx_rel_numb = %s AND nx_item_no = %s
+              AND line_status IN ('Planned', 'Proposed', 'Confirmed')
+        """, (actor, to_date, order, rel, item))
+        dropped = cursor.rowcount
+        if dropped:
+          _log_event(cursor, to_date, order, l['nx_sku'], 'Removed', actor=actor,
+                     note=f'unsnoozed back to {plan_date}', rel=rel, item=item)
+          _bump_revision(cursor, to_date, actor)
+      msg = (f"{_line_label(order, rel, item)} is back on {plan_date} ({back})"
+             + (f"; its copy on {to_date} was removed." if dropped else '.'))
+    _bump_revision(cursor, plan_date, actor)
+    conn.commit()
+    return {'status': 'success', 'message': msg}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Unsnooze failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
+def ship_plan_snoozed_list():
+  """v1.12 (Dave 11-02): every line snoozed right now, on ANY plan day -
+  for the board's 'Snoozed' link. [{plan_date, nx_order_numb, nx_rel_numb,
+  nx_item_no, nx_sku, to_date, by, at, kind: 'multi-day' | 'line', reason}]."""
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT l.plan_date, l.nx_order_numb, l.nx_rel_numb, l.nx_item_no, l.nx_sku,
+               l.snooze_to_date AS to_date, l.updated_by AS snoozed_by, l.updated_at AS snoozed_at,
+               l.priority_note, l.load_inches,
+               ev.note AS event_note
+        FROM dbo.pc_ship_plan_line l
+        OUTER APPLY (SELECT TOP 1 e.note FROM dbo.pc_plan_line_events e
+                     WHERE e.plan_date = l.plan_date AND e.nx_order_numb = l.nx_order_numb
+                       AND e.nx_rel_numb = l.nx_rel_numb AND e.nx_item_no = l.nx_item_no
+                       AND e.event_type = 'Snoozed'
+                     ORDER BY e.event_time DESC) ev
+        WHERE l.line_status = 'Snoozed'
+          AND ISNULL(l.snooze_to_date, l.plan_date) >= CAST(GETDATE() AS DATE)
+        ORDER BY l.snooze_to_date, l.nx_order_numb, l.nx_rel_numb, l.nx_item_no
+    """)
+    out = []
+    for r in cursor.fetchall():
+      pn = r['priority_note'] or ''
+      pm = _MD_PAUSED_RE.search(pn)
+      reason = (pm.group(4) or '').strip() if pm else ''
+      if not reason:
+        n = (r['event_note'] or '').strip()
+        for pre in ('SNOOZED (multi-day work order): ', 'whole order: ', 'whole order'):
+          if n.startswith(pre):
+            n = n[len(pre):].strip()
+            break
+        reason = n
+      out.append({'plan_date': make_serializable(r['plan_date']), 'nx_order_numb': r['nx_order_numb'],
+                  'nx_rel_numb': r['nx_rel_numb'], 'nx_item_no': r['nx_item_no'], 'nx_sku': r['nx_sku'],
+                  'to_date': make_serializable(r['to_date']), 'by': r['snoozed_by'], 'at': make_serializable(r['snoozed_at']),
+                  'load_inches': float(r['load_inches'] or 0),
+                  'kind': ('multi-day' if (pn.startswith('SPLIT ') or pn.startswith(_MD_DONE_PREFIX)) else 'line'),
+                  'reason': reason})
+    return {'status': 'success', 'rows': out}
+  except Exception as e:
+    return {'status': 'error', 'message': f'Snoozed list failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
 def ship_plan_mark_unplaced(plan_date, order, rel, item, note=None):
   """The explicit queue (DECISION §4) — visible on the day PC tried."""
   plan_date = _parse_date(plan_date)
@@ -2373,7 +2492,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.11.1' # v1.11.1: a multi-day line snoozed from the board is paused (no forward copy of the whole line), the snooze reason rides along; v1.11 (11-02): the shares-as-built estimate yields to evidence - a PC snooze starts the work order over, and since the Assembler app went live (10-26) a share on a day with no tap on the order is not built (588987-130 hidden at 0 in); v1.10.2 (11-02): a multi-day order with a PC headcount takes its share of the pool before the pool-rule orders (602392 got 1 piece behind 588987's screens); v1.10.1: crew counted by person, not by work order row (ASM9*+ASM9* on 602392-50); v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.12' # v1.12 (11-02): a snooze can be taken back (ship_plan_unsnooze_line: plain line back on its day + the forward copy removed; a multi-day pause ends as Resume) and every snoozed line on any day is listed (ship_plan_snoozed_list); v1.11.1: a multi-day line snoozed from the board is paused (no forward copy of the whole line), the snooze reason rides along; v1.11 (11-02): the shares-as-built estimate yields to evidence - a PC snooze starts the work order over, and since the Assembler app went live (10-26) a share on a day with no tap on the order is not built (588987-130 hidden at 0 in); v1.10.2 (11-02): a multi-day order with a PC headcount takes its share of the pool before the pool-rule orders (602392 got 1 piece behind 588987's screens); v1.10.1: crew counted by person, not by work order row (ASM9*+ASM9* on 602392-50); v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 

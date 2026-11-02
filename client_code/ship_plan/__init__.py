@@ -90,6 +90,8 @@ class ship_plan(ship_planTemplate):
     self.lk_history.set_event_handler('click', self._history_click)
     self.lk_params.set_event_handler('click', self._params_click)
     self.lk_overrides.set_event_handler('click', self._overrides_click)
+    if hasattr(self, 'lk_snoozed'):                      # v1.12: every snoozed line, any day
+      self.lk_snoozed.set_event_handler('click', self._snoozed_click)
     self.tb_search.set_event_handler('pressed_enter', self._filters_changed)
     self.dd_bucket.set_event_handler('change', self._filters_changed)
     for cb in (self.cb_due_window, self.cb_special_only,
@@ -712,9 +714,10 @@ class ship_plan(ship_planTemplate):
         it['on_priority'] = self._priority_dialog
         it['on_confirm'] = self._confirm_line
         it['on_resume'] = self._resume_order           # v1.6: paused multi-day order
+        it['on_unsnooze'] = self._unsnooze_line        # v1.12: any snoozed line
       else:
         it['on_recalc'] = it['on_snooze'] = it['on_remove'] = None
-        it['on_priority'] = it['on_confirm'] = it['on_resume'] = None
+        it['on_priority'] = it['on_confirm'] = it['on_resume'] = it['on_unsnooze'] = None
       it['on_multiday'] = self._open_multiday          # v1.7.1: the page (read-only for Sales)
     self.rp_plan_lines.items = shown
 
@@ -1092,6 +1095,73 @@ class ship_plan(ship_planTemplate):
       alert(r.get('message', 'Resume failed'))
     else:
       Notification(r.get('message') or f'{order} resumed', timeout=5).show()
+    self.load_day()
+
+  def _unsnooze_line(self, item):
+    """v1.12 (Dave 11-02): take a snooze back. A paused multi-day work order
+    resumes (the morning run proposes its share); a plain line goes back onto
+    this day and its copy on the return day is removed."""
+    md = item.get('md') or {}
+    if md.get('paused_to'):
+      self._resume_order(item)
+      return
+    to = (item.get('snooze_to_date') or '')[:10]
+    if not confirm(f"Put {line_label(item)} back on {self.plan_date}"
+                   + (f" and drop its copy on {to}?" if to else '?')):
+      return
+    r = anvil.server.call('ship_plan_unsnooze_line', self.plan_date, item['nx_order_numb'],
+                          item['nx_rel_numb'], item['nx_item_no'])
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Unsnooze failed'))
+    else:
+      Notification(r.get('message') or 'unsnoozed', timeout=5).show()
+    self.load_day()
+
+  def _snoozed_click(self, **event_args):
+    """v1.12 (Dave 11-02): every line snoozed right now, whatever day it was
+    snoozed from - with Open (go to that day) and Unsnooze on each row."""
+    r = anvil.server.call('ship_plan_snoozed_list')
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Snoozed list failed'))
+      return
+    rows = r.get('rows') or []
+    pnl = ColumnPanel()
+    if not rows:
+      pnl.add_component(Label(text='Nothing is snoozed right now.'))
+    for x in rows:
+      fp = FlowPanel(align='left', vertical_align='center')
+      when = (x.get('at') or '')[:16].replace('T', ' ')
+      txt = (f"{line_label(x)}  →  {(x.get('to_date') or '?')[:10]}"
+             f"   ·   snoozed on {(x.get('plan_date') or '')[:10]} by {x.get('by') or '?'}"
+             + (f" ({when})" if when else '')
+             + (f"   ·   {x['kind']}" if x.get('kind') == 'multi-day' else '')
+             + (f"   ·   {x['reason']}" if x.get('reason') else '   ·   no reason given'))
+      fp.add_component(Label(text=txt, font_size=12))
+      def _open(e=None, d=x.get('plan_date')):
+        self.dp_plan_date.date = datetime.strptime(d[:10], '%Y-%m-%d').date()
+        self.load_day()
+      def _un(e=None, row=x):
+        if row.get('kind') == 'multi-day':
+          q = f"Resume {line_label(row)} (snoozed to {(row.get('to_date') or '?')[:10]})? It is proposed first on the next morning run."
+        else:
+          q = f"Put {line_label(row)} back on {(row.get('plan_date') or '')[:10]} and drop its copy on {(row.get('to_date') or '?')[:10]}?"
+        if not confirm(q):
+          return
+        rr = anvil.server.call('ship_plan_unsnooze_line', row['plan_date'][:10], row['nx_order_numb'],
+                               row['nx_rel_numb'], row['nx_item_no'])
+        if rr.get('status') != 'success':
+          alert(rr.get('message', 'Unsnooze failed'))
+        else:
+          Notification(rr.get('message') or 'unsnoozed', timeout=5).show()
+      b1 = Link(text='Open', font_size=12, bold=True)
+      b1.set_event_handler('click', lambda **e: _open())
+      b2 = Link(text='Unsnooze', font_size=12, bold=True)
+      b2.set_event_handler('click', lambda **e: _un())
+      fp.add_component(b1)
+      fp.add_component(b2)
+      pnl.add_component(fp)
+    alert(content=pnl, title=f'Snoozed lines — {len(rows)} right now (any plan day)', large=True,
+          buttons=[('Close', None)])
     self.load_day()
 
   def _recalc_line(self, item):

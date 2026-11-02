@@ -168,11 +168,17 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
     # v1.6: a PAUSED multi-day line (Snoozed by the star) offers Resume on
     # the snooze control - the only control a Snoozed row has
     on_resume = item.get('on_resume')
+    on_unsnooze = item.get('on_unsnooze')            # v1.12: any snoozed line can be taken back
     if status == 'Snoozed' and md and md.get('paused_to') and on_resume:
       self.btn_snooze.visible = True
       self.btn_snooze.text = '▶'
       self.btn_snooze.tooltip = 'Resume the snoozed work order'
       self.btn_snooze.set_event_handler('click', lambda **e: on_resume(self.item))
+    elif status == 'Snoozed' and on_unsnooze:
+      self.btn_snooze.visible = True
+      self.btn_snooze.text = '▶'
+      self.btn_snooze.tooltip = ('Unsnooze - back on this day' + (f", the copy on {item['snooze_to_date'][:10]} removed" if item.get('snooze_to_date') else ''))
+      self.btn_snooze.set_event_handler('click', lambda **e: on_unsnooze(self.item))
     if on_remove:
       self.btn_remove.set_event_handler('click',
                                         lambda **e: on_remove(self.item))
