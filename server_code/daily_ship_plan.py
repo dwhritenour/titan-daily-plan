@@ -2348,7 +2348,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.10.2' # v1.10.2 (11-02): a multi-day order with a PC headcount takes its share of the pool before the pool-rule orders (602392 got 1 piece behind 588987's screens); v1.10.1: crew counted by person, not by work order row (ASM9*+ASM9* on 602392-50); v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.11' # v1.11 (11-02): the shares-as-built estimate yields to evidence - a PC snooze starts the work order over, and since the Assembler app went live (10-26) a share on a day with no tap on the order is not built (588987-130 hidden at 0 in); v1.10.2 (11-02): a multi-day order with a PC headcount takes its share of the pool before the pool-rule orders (602392 got 1 piece behind 588987's screens); v1.10.1: crew counted by person, not by work order row (ASM9*+ASM9* on 602392-50); v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
@@ -2548,6 +2548,18 @@ def _md_round(pieces):
   return float(int(float(pieces) / lot) * lot)
 
 
+_MD_TABLET_LIVE_FROM = date(2026, 10, 26)   # v1.11: the Assembler app on every bench since this day
+
+
+def _as_date(v):
+  """date from a DATE / DATETIME column value (or an ISO string)."""
+  if isinstance(v, datetime):
+    return v.date()
+  if isinstance(v, date):
+    return v
+  return _parse_date(v)
+
+
 def _md_prior_shares(cursor, plan_date):
   """Shares already planned for each line on EARLIER published plans:
   {(order, item): {'qty': sum over releases, 'qty_by_rel': {rel: sum},
@@ -2555,7 +2567,39 @@ def _md_prior_shares(cursor, plan_date):
   the engine assumes those shares were built (Dave 2026-10-25). 45-day
   window; a line that shipped is no candidate. v1.8: keyed by item - the
   days and the started state survive an e21 re-release; the quantity is
-  read per release (_md_prior_qty)."""
+  read per release (_md_prior_qty).
+  v1.11 (Dave 11-02): the estimate yields to evidence -
+    * a PC snooze starts the work order over: shares planned on or before the
+      day it was snoozed do not count (588987-130: 372 planned Thu / Fri under
+      the pool rule while PC meant 'not before 11/13');
+    * since the Assembler app went live (_MD_TABLET_LIVE_FROM) a share on a day
+      with no tap on the order (assembly_so_events Start / Restart / Stop /
+      Complete, or an assembly tap in work_order_events) did not happen - it is
+      not built. The safe error: a silently built order is re-planned and PC
+      ticks 'built' on the page; the other error hides a late line at 0 in."""
+  cursor.execute("""
+      SELECT nx_order_numb, nx_item_no, MAX(plan_date) AS snoozed_on
+      FROM dbo.pc_ship_plan_line
+      WHERE line_status = 'Snoozed' AND priority_note LIKE %s
+        AND plan_date < %s AND plan_date >= DATEADD(day, -45, %s)
+      GROUP BY nx_order_numb, nx_item_no
+  """, ('% · PAUSED%', plan_date, plan_date))
+  snoozed_on = {(r['nx_order_numb'], str(r['nx_item_no'])): r['snoozed_on'] for r in cursor.fetchall()}
+  cursor.execute("""
+      SELECT LTRIM(RTRIM(a.sales_order_number)) AS o, CAST(a.event_time AS DATE) AS d
+      FROM dbo.assembly_so_events a
+      WHERE a.event_type IN ('Start', 'Restart', 'Stop', 'Complete')
+        AND a.event_time >= DATEADD(day, -45, %s) AND a.event_time < %s
+      UNION
+      SELECT LTRIM(RTRIM(wo.sales_order_number)) AS o, CAST(e.event_at AS DATE) AS d
+      FROM dbo.work_order_events e
+      JOIN dbo.work_orders wo ON wo.work_order_id = e.work_order_id
+      WHERE e.event_type IN ('Start', 'Restart', 'Stop', 'Complete', 'Count')
+        AND e.event_at >= DATEADD(day, -45, %s) AND e.event_at < %s
+        AND (e.operator IN (SELECT operator_code FROM dbo.assembly_operators WHERE department_id = 1)
+             OR e.note LIKE 'dept=Assembly%%')
+  """, (plan_date, plan_date, plan_date, plan_date))
+  tapped = {(r['o'], _as_date(r['d'])) for r in cursor.fetchall()}
   cursor.execute("""
       SELECT pl.nx_order_numb, pl.nx_rel_numb, pl.nx_item_no, pl.plan_date, pl.qty_planned
       FROM dbo.pc_ship_plan_line pl
@@ -2568,6 +2612,12 @@ def _md_prior_shares(cursor, plan_date):
   out = {}
   for r in cursor.fetchall():
     k = (r['nx_order_numb'], str(r['nx_item_no']))
+    d = _as_date(r['plan_date'])
+    so = snoozed_on.get(k)
+    if so is not None and d <= _as_date(so):
+      continue                                   # v1.11: snoozed since - starts over
+    if d >= _MD_TABLET_LIVE_FROM and (k[0].strip(), d) not in tapped:
+      continue                                   # v1.11: nobody tapped the order that day - not built
     e = out.setdefault(k, {'qty': 0.0, 'qty_by_rel': {}, 'days': set()})
     q = float(r['qty_planned'] or 0)
     e['qty'] += q
