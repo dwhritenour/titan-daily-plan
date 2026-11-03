@@ -156,6 +156,7 @@ class ship_plan(ship_planTemplate):
     # read PLAN_HORIZON_DAYS itself, so a saved change applies on the
     # very next refresh (the old client-cached 10 never updated).
     self._capacity = None
+    self._board = {}
     self._lines = []
 
     # --- click-bounce shield (2026-08-26 tape) ---------------------
@@ -228,6 +229,7 @@ class ship_plan(ship_planTemplate):
         self.dd_flag.selected_value = keep or 'ALL'
     plan = result['plan']
     self._capacity = plan['capacity']
+    self._board = plan.get('board') or {}                 # v1.13: the Supervisor board vs the plan
     self._render_header(plan.get('header'))
     self._render_capacity(plan['planned_inches'],
                           plan.get('stretch_inches', 0))
@@ -507,6 +509,17 @@ class ship_plan(ship_planTemplate):
     self.lbl_capacity_line.text = txt
     self._draw_capacity_bar()
     self.lbl_crew.text = cap.get('capacity_detail', '')
+    # v1.13 (Dave 11-03): the number that says whether the plan is the plan -
+    # how many of the work orders the Supervisor board handed out were on it.
+    bd = getattr(self, '_board', None) or {}
+    def _bt(label, x):
+      if not x or not x.get('assigned'):
+        return f"{label}: nothing assigned yet"
+      pct = round(100.0 * x['on_plan'] / x['assigned'])
+      return f"{label}: {x['on_plan']} of {x['assigned']} work orders assigned were on the plan ({pct}%, {x['asms']} assemblers)"
+    if bd:
+      self.lbl_crew.text += ('  ·  Board ' + _bt((bd.get('prev_date') or 'yesterday')[5:].replace('-', '/'), bd.get('prev'))
+                             + '  ·  ' + _bt('today', bd.get('today')))
     # ALWAYS-ON attendance freshness chip (Dave 2026-08-25): positive
     # confirmation beats an appearing warning — a missing chip would be
     # indistinguishable from "all good". Word + color, never color alone.
