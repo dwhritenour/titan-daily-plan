@@ -55,6 +55,7 @@
           <anvil-component type="Link" name="lk_proposal" prop:spacing='{"margin":["0",null,"0",null]}' prop:bold="true"></anvil-component>
           <anvil-component type="Link" name="lk_accept_all" prop:spacing='{"margin":["0",null,"0",null]}' prop:bold="true"></anvil-component>
           <anvil-component type="Link" name="lk_run_agent" prop:spacing='{"margin":["0",null,"0",null]}' prop:text="Run AI Agent" prop:bold="true"></anvil-component>
+          <anvil-component type="Link" name="lk_discard" prop:spacing='{"margin":["0",null,"0",null]}' prop:text="Discard draft" prop:bold="true" prop:visible="false" prop:tooltip="drop the agent's proposed lines on this unpublished day"></anvil-component>
           <anvil-component type="Link" name="lk_retro" prop:bold="true" prop:spacing='{"margin":["0",null,"0",null]}'></anvil-component>
         </anvil-component>
         <anvil-component type="DataGrid" name="dg_plan_lines" prop:role="tonal-data-grid" prop:auto_header="true" prop:rows_per_page="25" prop:show_page_controls="true" prop:columns='[{"id":"order","title":"Order","data_key":"order","width":"110"},{"id":"item","title":"Item","data_key":"item"},{"id":"qty","title":"Qty","data_key":"qty","width":60},{"id":"ship_by","title":"Ship By","data_key":"ship_by","width":110},{"id":"load","title":"Load","data_key":"load","width":"80"},{"id":"status","title":"Status","data_key":"status","width":110},{"id":"actions","title":"Actions","data_key":"actions","width":"210"}]' container:grid_position="PLNA02,PLNB02" container:full_width_row="true">

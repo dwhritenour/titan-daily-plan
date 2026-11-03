@@ -135,6 +135,10 @@ class ship_plan(ship_planTemplate):
       self.lk_run_agent.text = 'Run agent'      # code owns the label
       self.lk_run_agent.set_event_handler('click', self._run_agent_now)
       self.lk_run_agent.visible = self.is_pc
+    if hasattr(self, 'lk_discard'):             # v1.14: throw an exploratory proposal away
+      self.lk_discard.text = 'Discard draft'
+      self.lk_discard.set_event_handler('click', self._discard_draft)
+      self.lk_discard.visible = False
     if hasattr(self, 'lk_retro'):
       self.lk_retro.text = 'Retro'              # code owns the label
       self.lk_retro.set_event_handler('click', lambda **e: open_form('retro'))
@@ -1424,16 +1428,21 @@ class ship_plan(ship_planTemplate):
     if hasattr(self, 'lk_accept_all'):
       self.lk_accept_all.visible = self.is_pc and n_open > 0
       self.lk_accept_all.text = f'Accept all {n_open} proposed'
+    live = [l for l in (plan.get('lines') or []) if l.get('line_status') in ('Planned', 'Proposed', 'Confirmed')]
     if hasattr(self, 'lk_proposal'):
       p = self._proposal
-      if p:
+      if p and (p.get('status') != 'SUPERSEDED' or live):
         when = (p.get('generated_at') or '')[11:16]
         self.lk_proposal.text = (f"Agent proposal {when} · {p.get('n_lines', 0)} lines · "
                                  f"{p.get('status', '')}")
         self.lk_proposal.visible = True
       else:
+        # v1.14: a superseded proposal on an empty day is history, not a plan
         self.lk_proposal.text = 'No agent proposal yet'
         self.lk_proposal.visible = True
+    if hasattr(self, 'lk_discard'):
+      hdr = plan.get('header') or {}
+      self.lk_discard.visible = (self.is_pc and n_open > 0 and hdr.get('plan_status') != 'Published')
 
   @staticmethod
   def _pline(text, size=15, bold=False, color=None):
@@ -1497,6 +1506,19 @@ class ship_plan(ship_planTemplate):
     r = anvil.server.call('ship_plan_confirm_all_proposed', self.plan_date)
     if r.get('status') != 'success':
       alert(r.get('message', 'Accept-all failed'))
+    self.load_day()
+
+  def _discard_draft(self, **event_args):
+    """v1.14: drop the agent's still-Proposed lines on an unpublished day (an
+    exploratory run for a future day would otherwise hold its orders back)."""
+    if not confirm(f"Discard the agent's proposed lines on {self.plan_date}? "
+                   "Confirmed, snoozed and removed rows stay."):
+      return
+    r = anvil.server.call('ship_plan_discard_draft', self.plan_date)
+    if r.get('status') != 'success':
+      alert(r.get('message', 'Discard failed'))
+    else:
+      Notification(r.get('message') or 'draft discarded', timeout=5).show()
     self.load_day()
 
   def _run_agent_now(self, **event_args):

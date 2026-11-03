@@ -1714,6 +1714,46 @@ def ship_plan_remove_line(plan_date, order, rel, item, note=None):
 
 
 @anvil.server.callable
+def ship_plan_discard_draft(plan_date):
+  """v1.14 (Dave 11-03): throw an exploratory proposal away. On an UNPUBLISHED
+  day, delete the agent's still-Proposed lines (and their source rows) and mark
+  the day's proposals SUPERSEDED. Confirmed / Planned / Snoozed / Removed rows
+  stay (PC's decisions are not the agent's). A line Proposed on a future day
+  blocks its order on earlier days, so a test run for 11/13 must be undone -
+  until now that was a DELETE on Nexus by Cowork."""
+  plan_date = _parse_date(plan_date)
+  actor = _current_actor()
+  conn = get_connection()
+  try:
+    cursor = conn.cursor()
+    cursor.execute("SELECT plan_status FROM dbo.pc_ship_plan WHERE plan_date = %s", (plan_date,))
+    h = cursor.fetchone()
+    if h and h['plan_status'] == 'Published':
+      return {'status': 'error', 'message': f'{plan_date} is published - remove lines one by one instead.'}
+    cursor.execute("""
+        DELETE s FROM dbo.pc_ship_plan_line_source s
+        JOIN dbo.pc_ship_plan_line l ON l.plan_date = s.plan_date AND l.nx_order_numb = s.nx_order_numb
+         AND l.nx_rel_numb = s.nx_rel_numb AND l.nx_item_no = s.nx_item_no
+        WHERE s.plan_date = %s AND l.line_status = 'Proposed'
+    """, (plan_date,))
+    cursor.execute("DELETE FROM dbo.pc_ship_plan_line WHERE plan_date = %s AND line_status = 'Proposed'", (plan_date,))
+    n = cursor.rowcount
+    cursor.execute("""
+        UPDATE dbo.pc_agent_proposal SET status = 'SUPERSEDED', reviewed_by = %s, reviewed_at = GETDATE()
+        WHERE plan_date = %s AND status = 'PROPOSED'
+    """, (('discarded by ' + actor)[:50], plan_date))
+    _log_event(cursor, plan_date, None, None, 'Removed', actor=actor,
+               new_value=f'{n} proposed line(s)', note='DRAFT DISCARDED (agent proposal thrown away)')
+    conn.commit()
+    return {'status': 'success', 'n': n, 'message': f'{n} proposed line(s) dropped from {plan_date}.'}
+  except Exception as e:
+    conn.rollback()
+    return {'status': 'error', 'message': f'Discard failed: {e}'}
+  finally:
+    conn.close()
+
+
+@anvil.server.callable
 def ship_plan_unsnooze_line(plan_date, order, rel, item, note=None):
   """v1.12 (Dave 11-02): take a snooze back. A plain line goes back onto its
   day (Planned on a published day, Proposed on a draft) and the copy the snooze
@@ -2551,7 +2591,7 @@ def ship_plan_get_events(plan_date, limit=100):
 # publishes, approves, or touches e21.
 
 _AGENT_ACTOR = 'agent'
-_AGENT_VERSION = 'v1.13.4' # v1.13.4: a paused multi-day work order leaves the plan alone - its siblings ride on; v1.13.3: a snooze blocks a day only while its return day is AFTER that day - a paused line comes back on its return day (and a run for that day shows it); v1.13.2: ship_plan_get_plan registered again (v1.13 had put two helpers between its decorator and the def - 'No server function matching ship_plan_get_plan'); the board statistic cannot fail the plan load; v1.13 (11-03): the board line - what the Supervisor board assigned against the plan, yesterday and today (ship_plan_get_plan 'board'); v1.12.1: a snooze is not blocked by a Removed row on the return day (a pause ignores it; a plain snooze clears it and writes the fresh copy); v1.12 (11-02): a snooze can be taken back (ship_plan_unsnooze_line: plain line back on its day + the forward copy removed; a multi-day pause ends as Resume) and every snoozed line on any day is listed (ship_plan_snoozed_list); v1.11.1: a multi-day line snoozed from the board is paused (no forward copy of the whole line), the snooze reason rides along; v1.11 (11-02): the shares-as-built estimate yields to evidence - a PC snooze starts the work order over, and since the Assembler app went live (10-26) a share on a day with no tap on the order is not built (588987-130 hidden at 0 in); v1.10.2 (11-02): a multi-day order with a PC headcount takes its share of the pool before the pool-rule orders (602392 got 1 piece behind 588987's screens); v1.10.1: crew counted by person, not by work order row (ASM9*+ASM9* on 602392-50); v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
+_AGENT_VERSION = 'v1.14' # v1.14 (11-03): Discard draft - an exploratory proposal on an unpublished day is thrown away from the board (ship_plan_discard_draft); the board hides a superseded proposal line once the day has no live lines; v1.13.4: a paused multi-day work order leaves the plan alone - its siblings ride on; v1.13.3: a snooze blocks a day only while its return day is AFTER that day - a paused line comes back on its return day (and a run for that day shows it); v1.13.2: ship_plan_get_plan registered again (v1.13 had put two helpers between its decorator and the def - 'No server function matching ship_plan_get_plan'); the board statistic cannot fail the plan load; v1.13 (11-03): the board line - what the Supervisor board assigned against the plan, yesterday and today (ship_plan_get_plan 'board'); v1.12.1: a snooze is not blocked by a Removed row on the return day (a pause ignores it; a plain snooze clears it and writes the fresh copy); v1.12 (11-02): a snooze can be taken back (ship_plan_unsnooze_line: plain line back on its day + the forward copy removed; a multi-day pause ends as Resume) and every snoozed line on any day is listed (ship_plan_snoozed_list); v1.11.1: a multi-day line snoozed from the board is paused (no forward copy of the whole line), the snooze reason rides along; v1.11 (11-02): the shares-as-built estimate yields to evidence - a PC snooze starts the work order over, and since the Assembler app went live (10-26) a share on a day with no tap on the order is not built (588987-130 hidden at 0 in); v1.10.2 (11-02): a multi-day order with a PC headcount takes its share of the pool before the pool-rule orders (602392 got 1 piece behind 588987's screens); v1.10.1: crew counted by person, not by work order row (ASM9*+ASM9* on 602392-50); v1.10 (10-29): the Assembler app speaks - its taps are per SALES ORDER in assembly_so_events (not work_order_events) and its progress is work_orders.assembly_progress in quarters; both are the multi-day fact now (page trail, left = open x (1 - pct), planning share), plus the Assemble routing step when it ever closes from the floor; v1.9.2.1: multiday_get - the crew dict no longer shares a name with the effective-crew float (page was blank: 'float' object has no attribute 'get'); v1.9.2 (124): the Supervisor board's crew (work_order_assemblers, lead * + helpers) beside PC's headcount - note, page items grid, header; v1.9.1: snooze per work order, the order's lines for the page grid, pool % in the reply; v1.9: the page is a week (Mon-Fri, arrows), assemblers per work order PER DAY typed in the grid (blank = carried, 0 = nobody, 122); v1.8: headcount per WORK ORDER (its own share, pool rule for the rest, pool as ceiling), multi-day facts keyed by order + item (survive an e21 re-release), page per work order; v1.7.2: the page grid as rows for a DataGrid (Labels); v1.7.1 (page, step 3): multiday_get fixed (remaining snapshot, projection starts after the last planned day, roster estimate) + the grid; v1.7 (multi-day page, step 2): share = assemblers planned x one assembler-day, pool-capped (pc_multiday_plan, 121); PC share override and done-by-PC; v1.6.3: a line on today's plan does not block a future day; v1.6.2: only ASSEMBLY taps are assembly facts (OP codes are the Screen room kiosk); dry run sees today's lines; set_qty why; v1.6.1: a hand edit keeps the whole multi-day clause (assemblers, partials rule, pause); v1.6 (step 3): partials mode and pause on the star, multi-day on the board and the candidates; v1.5.3: the pool taker is the order that took inches; v1.5.2: a tablet-built line rides at 0 in, no check-the-floor lot; v1.5.1: the tablet (Complete / Start / Count) is the fact for multi-day lines; v1.5: multi-day orders at a day-sized share; v1.4.1: Stretch fits the buffer together; v1.4: shelf decisions ride at zero; v1.3: two orders, one shelf; v1.2: planned-short rule
 
 _DUE_IN_RE = re.compile(r'^Due in (\d{4}-\d{2}-\d{2})')
 
