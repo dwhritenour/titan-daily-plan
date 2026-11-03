@@ -94,7 +94,9 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
                              f"({float(item['surcharge_minutes']):,.0f} surcharge)")
 
     chip_text = status.upper()
-    if status == 'Snoozed' and item.get('snooze_to_date'):
+    if status == 'Snoozed' and ' · RESUMED' in note0:
+      chip_text = '▶ RESUMED · back tomorrow'          # v1.13.3: a resumed row showed '→ yesterday'
+    elif status == 'Snoozed' and item.get('snooze_to_date'):
       chip_text = f"→ {item['snooze_to_date'][:10]}"
     bg, fg = STATUS_COLORS.get(status, STATUS_COLORS['Planned'])
     if status == 'Planned':
