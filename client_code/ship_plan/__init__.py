@@ -517,9 +517,13 @@ class ship_plan(ship_planTemplate):
         return f"{label}: nothing assigned yet"
       pct = round(100.0 * x['on_plan'] / x['assigned'])
       return f"{label}: {x['on_plan']} of {x['assigned']} work orders assigned were on the plan ({pct}%, {x['asms']} assemblers)"
-    if bd:
-      self.lbl_crew.text += ('  ·  Board ' + _bt((bd.get('prev_date') or 'yesterday')[5:].replace('-', '/'), bd.get('prev'))
-                             + '  ·  ' + _bt('today', bd.get('today')))
+    txt = ('Board ' + _bt((bd.get('prev_date') or 'yesterday')[5:].replace('-', '/'), bd.get('prev'))
+           + '  ·  ' + _bt('today', bd.get('today'))) if bd else ''
+    if hasattr(self, 'lbl_board'):                       # v1.13.1: its own label in oc_capacity
+      self.lbl_board.text = txt
+      self.lbl_board.visible = bool(txt)
+    elif txt:
+      self.lbl_crew.text += '  ·  ' + txt
     # ALWAYS-ON attendance freshness chip (Dave 2026-08-25): positive
     # confirmation beats an appearing warning — a missing chip would be
     # indistinguishable from "all good". Word + color, never color alone.
