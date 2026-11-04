@@ -13,6 +13,7 @@ STATUS_COLORS = {
   'Removed':   ('#F7F6F2', '#898781'),   # near-page / muted
   'Proposed':  ('#E3F2FD', '#1565C0'),   # Wk-3: pale blue / medium blue
   'Confirmed': ('#E8F5E9', '#1B5E20'),   # Wk-3
+  'Returning': ('#FFF8E1', '#8D6E00'),   # v1.15: pale amber / dark amber - a paused work order due back today
 }
 
 # A PLANNED line's chip shows its TIER instead — the word 'Planned' says
@@ -94,7 +95,19 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
                              f"({float(item['surcharge_minutes']):,.0f} surcharge)")
 
     chip_text = status.upper()
-    if status == 'Snoozed' and ' · RESUMED' in note0:
+    if status == 'Returning':
+      # v1.15: a paused multi-day work order whose snooze ends today - a commitment,
+      # not a quantity; the 06:30 run proposes the share that morning
+      a = item.get('assemblers')
+      chip_text = ('⏰ RETURNS TODAY' + (f" · {float(a):g} assembler(s)" if a else '')
+                   + ' · share proposed at 06:30')
+      self.lbl_status.tooltip = (f"Snoozed on {item.get('snoozed_on') or '?'} until today"
+                                 + (f": {item['pause_reason']}" if item.get('pause_reason') else '')
+                                 + ". Not counted against the day; the morning run proposes its share"
+                                 + (f" from the {float(a):g} assembler(s) PC typed for today" if a else '') + '.')
+      self.lbl_load.text = '—'
+      self.lbl_load.tooltip = 'share proposed at 06:30'
+    elif status == 'Snoozed' and ' · RESUMED' in note0:
       chip_text = '▶ RESUMED · back tomorrow'          # v1.13.3: a resumed row showed '→ yesterday'
     elif status == 'Snoozed' and item.get('snooze_to_date'):
       chip_text = f"→ {item['snooze_to_date'][:10]}"
@@ -111,7 +124,9 @@ class ShipPlanLineRow(ShipPlanLineRowTemplate):
                                  'Remove it (ship the other complete) or plan a quantity on each '
                                  '(star). Undecided at publish = it leaves the plan.')
     md = item.get('md')                  # v1.6 (step 3): multi-day facts parsed server-side
-    if md:
+    if md and status == 'Returning':
+      chip_text = '⧗ ' + chip_text       # v1.15: keep the RETURNS TODAY words and tooltip
+    elif md:
       chip_text = '⧗ ' + chip_text
       if md.get('built'):
         self.lbl_status.tooltip = ('MULTI-DAY - built on earlier days (tablet Complete or earlier shares); '
