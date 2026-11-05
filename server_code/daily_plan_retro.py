@@ -64,9 +64,10 @@ from datetime import datetime, date, timedelta
 
 from .daily_ship_plan import (get_connection, _parse_date, _current_actor,
 _get_params, _agent_key_ok, serialize_row,
-make_serializable)
+make_serializable,
+                              _MD_PAUSED_RE)
 
-_RETRO_VERSION = 'retro-1.9.1'   # 1.9.1: crew counted by person (ASM9*+ASM9*); 1.9 (10-29): the Assembler app's taps are in assembly_so_events, per sales order (not work_order_events) - multi-day state and WORKED read them; 1.8 (124): every multi-day row says the crew - PC's headcount vs the Supervisor board's assignment (work_order_assemblers); 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
+_RETRO_VERSION = 'retro-1.9.2'   # 1.9.2 (11-05): a sibling PC snoozed reads PAUSED, not PARTIAL_ORDER; 1.9.1: crew counted by person (ASM9*+ASM9*); 1.9 (10-29): the Assembler app's taps are in assembly_so_events, per sales order (not work_order_events) - multi-day state and WORKED read them; 1.8 (124): every multi-day row says the crew - PC's headcount vs the Supervisor board's assignment (work_order_assemblers); 1.7.4: touched_by via a join (subquery in MAX failed); 1.7.3: multi-day reads ASSEMBLY taps only; WORKED names the department; 1.7.2: a PC pause (v1.6 star) reads PAUSED; 1.7.1: Assign is not work; 1.7 (117): multi-day lines from the tablet; 1.6 (097): stall rule, one question per order; 1.5 (067): actual crew/capacity; 1.4 (066): e21-line grain
 _WO_DONE = ('Complete', 'Shipped - Verify', 'Closed - Verify')
 
 # retro-1.7 (2026-10-25, multi-day paper s13 / decisions 1 and 4): a planned
@@ -945,6 +946,16 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
         WHERE plan_date = %s AND event_type = 'PartialAck'
     """, (plan_date,))
     acked = {r['nx_order_numb'] for r in cursor.fetchall()}
+    # retro-1.9.2 (11-05): a sibling PC snoozed (a multi-day pause covering the day)
+    # is a decision, not a line left off - 588987-130 read PARTIAL_ORDER while paused to 11/13
+    cursor.execute("""
+        SELECT nx_order_numb, nx_rel_numb, nx_item_no, snooze_to_date, priority_note
+        FROM dbo.pc_ship_plan_line
+        WHERE line_status = 'Snoozed' AND priority_note LIKE %s
+          AND plan_date <= %s AND ISNULL(snooze_to_date, plan_date) > %s
+    """, ('% · PAUSED%', plan_date, plan_date))
+    paused_sib = {(r['nx_order_numb'], r['nx_rel_numb'] or '', str(r['nx_item_no'] or '')): r
+                  for r in cursor.fetchall()}
     planned_groups = {(s['nx_order_numb'], str(s['ship_by_date'] or '')[:10])
                       for s in planned}
     partial_keys = set()
@@ -956,6 +967,22 @@ def _retro_run_impl(plan_date=None, force=False, actor=None):
       lkey = _lk(s)
       partial_keys.add(lkey)
       load = float(s['load_inches'] or 0)
+      pz = paused_sib.get(lkey)
+      if pz:
+        pm = _MD_PAUSED_RE.search(pz.get('priority_note') or '')
+        why = (pm.group(4) or '').strip() if pm else ''
+        counts['PAUSED'] += 1
+        rows.append({'order': key[0], 'sku': key[1], 'rel': lkey[1], 'item': lkey[2],
+                     'line': _line_txt(s), 'tier': None, 'load': load,
+                     'score': int(s['priority_score'] or 0), 'ship_by': s['ship_by_date'],
+                     'expected': 'ON_PLAN', 'expected_value': float(s['qty_open'] or 0),
+                     'actual_value': None, 'observed': True, 'case': 'PAUSED', 'routed_to': 'PC',
+                     'explanation': (f"sibling of a planned line (order {key[0]}) snoozed by PC until "
+                                     f"{str(pz.get('snooze_to_date'))[:10]}" + (f": {why}" if why else '')
+                                     + f" - {load:,.0f} in off the plan by decision"),
+                     'question': None, 'asked_to': None, 'cause_key': None,
+                     'resolution': 'EXPLAINED', 'removed_by_role': None})
+        continue
       b = _look(book, book_sku, s)
       shipped_anyway = bool(_chg(s, 'SO_Shipped')) or b is None
       knew = key[0] in acked

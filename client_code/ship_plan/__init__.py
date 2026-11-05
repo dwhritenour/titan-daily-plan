@@ -517,11 +517,13 @@ class ship_plan(ship_planTemplate):
     # how many of the work orders the Supervisor board handed out were on it.
     bd = getattr(self, '_board', None) or {}
     def _bt(label, x):
-      if not x or not x.get('assigned'):
-        return f"{label}: nothing assigned yet"
-      pct = round(100.0 * x['on_plan'] / x['assigned'])
-      return f"{label}: {x['on_plan']} of {x['assigned']} work orders assigned were on the plan ({pct}%, {x['asms']} assemblers)"
-    txt = ('Board ' + _bt((bd.get('prev_date') or 'yesterday')[5:].replace('-', '/'), bd.get('prev'))
+      # v1.15.1: coverage - planned work orders with a crew on the Supervisor board
+      if not x or not x.get('plan_wos'):
+        return f"{label}: no planned work orders"
+      pct = round(100.0 * x['covered'] / x['plan_wos'])
+      return (f"{label}: {x['covered']} of {x['plan_wos']} planned work orders have a crew ({pct}%)"
+              f" · {x['active_all']} assigned in all, {x['asms']} assemblers")
+    txt = ('Plan ' + _bt((bd.get('prev_date') or 'yesterday')[5:].replace('-', '/'), bd.get('prev'))
            + '  ·  ' + _bt('today', bd.get('today'))) if bd else ''
     if hasattr(self, 'lbl_board'):                       # v1.13.1: its own label in oc_capacity
       self.lbl_board.text = txt
